@@ -1,0 +1,27 @@
+# Ignore MacOs specific files
+.DS_Store
+# Ignore Python bytecode files
+*.pyc
+.pytest_cache
+__pycache__/
+# Ignore Python egg files and directories
+*.egg-info/
+*.egg
+# Ignore build artifacts
+build/
+dist/
+# Ignore environment settings
+.env
+# Ignore idea stuff
+.idea/
+# Ignore virtual environment
+venv/
+.venv/
+# Ignore runtime artifacts
+/var/
+# Ignore coverage reports
+.coverage
+htmlcov/
+# Ignore type-checker caches
+.mypy_cache/
+.ruff_cache/

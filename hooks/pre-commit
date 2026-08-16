@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+#
+# The quality gate, run before every commit: ruff, shellcheck, mypy twice — once
+# on the interpreter in `.python-version` and once against the floor
+# `requires-python` promises — and the test suite.
+#
+# **This file is byte-identical in every Python repository of the family.** It
+# names no repository and no path that only one of them has, so a fix made here is
+# a fix made everywhere; edit it in little-sister and re-sync. What differs per
+# repository is data — the `[tool.ruff]`, `[tool.mypy]` and `[tool.pytest]` tables
+# in its own `pyproject.toml` — never this shell.
+#
+# It is version-controlled in `hooks/` rather than `.git/hooks/` so it can be
+# shared, and it names nothing under `release/`, because a published repository
+# ships this file and drops that directory. Enable it once per clone:
+#
+#     git config core.hooksPath hooks          # a project with no release/
+#     git config core.hooksPath release/hooks  # a project that publishes
+#
+# `core.hooksPath` is single-valued, so a publishing project points it at
+# `release/hooks`, whose hook runs the release check and then execs this one.
+# There is no forge workflow running any of it as well, deliberately.
+
+set -euo pipefail
+
+# `uv` by name, unless release/hooks/pre-commit already found it somewhere a GUI
+# git client's PATH does not reach and passed it down.
+uv="${UV:-uv}"
+
+echo "pre-commit: ruff check"
+"$uv" run ruff check
+
+# Every tracked shell script, listed by git rather than by hand: a script added
+# without a gate entry is the failure this replaces. `hooks/pre-commit` is named
+# explicitly because it has no extension — this file checks itself.
+scripts="$(git ls-files -- '*.sh' 'hooks/pre-commit' 'release/hooks/pre-commit')"
+if [ -n "$scripts" ]; then
+  echo "pre-commit: shellcheck"
+  # Word splitting is the point: one path per word, and a path with a space in it
+  # would be a mistake this family has no reason to make.
+  # shellcheck disable=SC2086
+  "$uv" run shellcheck $scripts
+fi
+
+echo "pre-commit: mypy"
+"$uv" run mypy
+
+# Against the floor `requires-python` promises, not against the interpreter this is
+# developed on (little-sister ADR-0054). Static and about a second, so it belongs on
+# every commit; the floor *test* run is heavier and rides the release gate instead.
+echo "pre-commit: mypy (floor 3.11)"
+"$uv" run mypy --python-version 3.11
+
+echo "pre-commit: pytest"
+"$uv" run pytest -q
+
+echo "pre-commit: all checks passed"

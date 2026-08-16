@@ -1,0 +1,169 @@
+[project]
+name = "little-sister-aws"
+version = "0.1.0"
+description = "AWS check type for little-sister: CloudWatch alarms, EC2, Lambda, CodePipeline and Batch."
+authors = [
+    { name = "Michael Meyling" }
+]
+readme = {file = "README.md", content-type = "text/markdown"}
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["monitoring", "status", "aws", "cloudwatch", "little-sister"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+# library-floor:begin
+# The **library's floor**, not the interpreter this is developed on
+# (little-sister ADR-0054). Asking for more than the library asks would mean
+# somebody installs little-sister on 3.12 and then cannot install the package
+# that was the reason they came — and metadata is frozen per artifact, so
+# correcting it afterwards costs a version. The classifiers above repeat the
+# same claim for a human reading the index rather than a resolver, which is why
+# they start at the floor and run contiguously; the release check refuses a
+# disagreement between the two.
+# library-floor:end
+requires-python = ">=3.11"
+# A **floor, and never a pin.** A deployment pins little-sister; two plugins that
+# each pinned an exact version could not be installed together at all. The floor
+# names the release that promised the check-authoring surface this module imports
+# (little-sister architecture.md §11) — a statement about that surface, not about
+# a release. The upgrade a floor cannot see, the library moving *past* the
+# surface, is caught by `require_api()` in `__init__.py`.
+#
+# **0.3.12**, the same release the sister packages name, and for the same kind of
+# reason: this module reads `little_sister.spans` (`coarse_span` / `format_span`),
+# which 0.3.11 does not carry. A floor still naming 0.3.11 would let a deployment
+# install this against a library missing a name it imports, and the failure would be
+# an `ImportError` at startup — the one mismatch `require_api()` cannot catch,
+# because an epoch says what was *removed* and nothing about what was added. The
+# epoch is still **1**, correctly: adding names does not move it.
+dependencies = [
+    "little-sister>=0.3.12",
+    # boto3, and the reason this package is the first in the family with a
+    # dependency beyond the library (its ADR-0001 §3). A **floor**, like the one
+    # above: boto3 releases daily and a pin here would fight every consumer.
+    "boto3>=1.40.0",
+]
+
+# public-urls:begin
+# The public home, and the reason it was absent until now: metadata pointing at a
+# URL that does not resolve is worse than metadata that says nothing.
+#
+# `repository` is **load-bearing, not a duplicate of `homepage`**: the release
+# refuses without it, and the published README's absolute links are built from it at
+# build time — `blob/v<version>`, so a link is immutable and cannot outlive the
+# artifact that carries it. Relocating the forge is then an edit to this one line.
+#
+# No `documentation` key: for a package this size the README *is* the documentation,
+# and it arrives with the artifact. A key pointing at a directory that holds one
+# design record would promise a manual that does not exist.
+# public-urls:end
+[project.urls]
+homepage = "https://github.com/m-31/little-sister-aws"
+repository = "https://github.com/m-31/little-sister-aws"
+issues = "https://github.com/m-31/little-sister-aws/issues"
+changelog = "https://github.com/m-31/little-sister-aws/blob/main/CHANGELOG.md"
+
+# The one line that differs from a deployment's pyproject.toml: a plugin is a
+# **built** package, so a consumer can install it from the index.
+[tool.uv]
+package = true
+
+# no-sources-table:begin
+# **No `[tool.uv.sources]`, deliberately.** little-sister is on the index, so the
+# floor above resolves like any other dependency and there is nothing left to
+# redirect. Committing the table is harmful, and worth stating precisely because the
+# imprecise version of this paragraph was wrong in both directions: a consumer
+# installing from an index is **unaffected**, since uv honours a dependency's sources
+# table only when it resolves that dependency from a path or a git checkout — while a
+# consumer that *does* resolve this package that way has it **imposed**, and the
+# install fails on a directory nobody else's disk has. The table also reaches the
+# sdist, where uv rewrites the header, so searching for the table name will not find
+# it (little-sister `plugin-repository.md` §3).
+#
+# To develop against a local library checkout, add the redirect and do not commit
+# it:
+#
+#     [tool.uv.sources]
+#     little-sister = { git = "file:///path/to/little-sister" }
+#
+# It leaves a second trace, and that one arrives by itself: the next `uv run` rewrites
+# the committed `uv.lock` to name the directory, and the pre-commit gate **is** a
+# `uv run`. A lock naming a path outside its own repository resolves on no other
+# machine, so `uv sync --locked` then fails for CI and for every clone laid out
+# differently.
+#
+# **Both traces are refused when a release is condensed** — `check_no_local_sources` —
+# and deliberately not before. The window in which this redirect is the *right* thing to
+# have is a window in which work still has to be committed, so a commit gate that refused
+# it would be refusing the state it prescribes; it stays quiet, and the release refuses,
+# which names the repository being released at the one moment the finding is actionable.
+# This used to end by asking you to restore the two files before committing. Asking was
+# not enough: on 2026-08-16 both were found committed in two plugins at once, with every
+# release check passing. A lock may name exactly one path, `editable = "."`, which is a
+# repository naming itself.
+# no-sources-table:end
+
+[dependency-groups]
+# Floors match little-sister's dev group, so every repository in the family runs
+# one gate and a contributor moving between them meets one set of rules.
+dev = [
+    "mypy>=2.1.0",
+    "pytest>=9.0.3",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.16.1",
+    # ShellCheck as a wheel, so the shell half of the gate runs through `uv run`
+    # like the rest and needs nothing installed on the machine.
+    "shellcheck-py>=0.11.0.1",
+    # Without the per-service extras every boto3 client types as `BaseClient` and
+    # strict mypy checks nothing at all on the one call path that matters. One
+    # extra per service this type reads.
+    "boto3-stubs[batch,cloudwatch,codepipeline,ec2,lambda,logs,sts]>=1.40.0",
+    "types-PyYAML",
+]
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+# ruff-selection:begin
+# One selection for the whole family, so every project lints identically and a
+# fix argued in one of them is a fix in all of them. Beyond ruff's default (E, F):
+# import sorting (I), pyupgrade (UP), bugbear (B), comprehensions (C4) and Ruff's
+# own rules (RUF). Selecting explicitly also pins the gate against ruff's own
+# defaults shifting between releases.
+#
+# The ambiguous-unicode rules are off, and stay off. This family's user-facing
+# text — reasons, subnode titles, chip labels — uses typographic "—", "…", "×" and
+# "·" on purpose, and a rule that flags them would be answered with a `noqa` on
+# every line that has an opinion about punctuation.
+# ruff-selection:end
+select = ["E", "F", "W", "I", "UP", "B", "C4", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.mypy]
+files = ["src"]
+strict = true
+
+[tool.pytest.ini_options]
+# Adapted, not copied: little-sister's own `addopts` names `--cov=little_sister`,
+# which from here would measure somebody else's code.
+addopts = "--cov=little_sister_aws --cov-report=term-missing"
+
+[build-system]
+# uv-build-bound:begin
+# One **major** line, not the `<0.12.0` uv generates: that pins the minor uv shipped
+# with and turns every uv upgrade into a release-blocking edit in every repository of
+# the family. The backend's contract here is one sentence long — a
+# `src/<import package>` layout — so a minor bump has nothing to break, and what
+# would notice one that changed the artifact anyway is not vigilance but the publish
+# step, which opens the wheel and the sdist and refuses anything the release tree
+# drops. Same bound as little-sister, verified there against both minors.
+# uv-build-bound:end
+requires = ["uv_build>=0.11.14,<1.0.0"]
+build-backend = "uv_build"
