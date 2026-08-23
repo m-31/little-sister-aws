@@ -7,9 +7,7 @@ move into this package changed two import lines and nothing else.
 """
 from __future__ import annotations
 
-import subprocess
-import threading
-import time
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -20,6 +18,7 @@ from little_sister.checks import CHECK_TYPES, CheckError, CheckResult
 from little_sister.status import StatusCode
 
 from little_sister_aws import aws as aws_module
+from little_sister_aws import identity as identity_module
 from little_sister_aws.aws import (
     BATCH,
     CLOUDWATCH,
@@ -911,25 +910,100 @@ def test_an_alarm_name_with_markdown_in_it_is_folded_but_the_link_is_not() -> No
     assert "alarm=a%2Ab%20c" in leaf.reason[0].text
 
 
-def test_the_aspect_leaf_carries_its_built_in_display_text() -> None:
+def test_the_aspect_leaf_declares_its_built_in_display_text() -> None:
+    # Declared, not stamped (little-sister ADR-0025, 2026-08-19 update): the text
+    # is resolved by the library and written by the engine per subnode name, so
+    # it is read off the check rather than off the result. The `{pin_note}` token
+    # this package declares beside it has expanded by the time it lands here.
+    labels = _build().subnode_labels[CLOUDWATCH]
+    assert labels["title"] == "CloudWatch alarms"
+    assert "composite alike" in labels["about"]
+    assert "pin the line you are working on" in labels["about"]
+
+
+def test_the_aspect_leaves_hand_over_no_label_of_their_own() -> None:
+    # The other half of the same claim, where it can fail: a result carrying a
+    # label would be reaching past the declaration to a channel that is only for
+    # a child the run *named* — an account, not an aspect.
     leaf = _cloudwatch(_build(), alarms={"eu-central-1": [[_alarm("x")]]})
-    assert leaf.title == "CloudWatch alarms"
-    assert "**live**" in leaf.about and "eu-central-1" in leaf.about
-    assert "pin the line you are working on" in leaf.about
+    assert (leaf.title, leaf.about) == ("", "")
 
 
 def test_a_deployment_can_extend_that_text_rather_than_replace_it() -> None:
     check = _build(subnodes={CLOUDWATCH: {"about": "{default}\n\nAsk #ops first."}})
-    leaf = _cloudwatch(check, alarms={"eu-central-1": [[_alarm("x")]]})
-    assert "Ask #ops first." in leaf.about
-    assert "composite alike" in leaf.about
+    about = check.subnode_labels[CLOUDWATCH]["about"]
+    assert "Ask #ops first." in about
+    assert "composite alike" in about
 
 
-def test_the_about_names_the_account_it_is_under() -> None:
+def test_one_declaration_serves_every_account_s_leaf_of_that_name() -> None:
+    """The claim the reworded prose rests on.
+
+    little-sister resolves a label once per subnode *name* and writes it wherever
+    that name appears, at any depth — so this check's two accounts emit the same
+    five names and share one declaration each. That is why the text can no longer
+    name an account, and why nothing here hands a label back on a result. (The
+    at-any-depth write itself is the library's own claim and is tested there; an
+    engine cannot be started from this package, which has no configuration
+    directory of its own.)
+    """
     check = _build()
     _stub(check, alarms={})
+    accounts = [_child(check.run(), name) for name in ("live", "backup")]
+    names = [tuple(leaf.name for leaf in account.children) for account in accounts]
+    assert names[0] == names[1] == AwsCheck.ASPECTS
+    for account in accounts:
+        for leaf in account.children:
+            assert (leaf.title, leaf.about) == ("", "")
+            assert check.subnode_labels[leaf.name]["about"]
+
+
+def test_the_four_roster_aspects_decline_the_density_trade() -> None:
+    """The claim `nodes.yaml` used to make seventeen times, made once here.
+
+    `show_when_quiet` rides the same declaration as the labels (little-sister
+    ADR-0063), so the library merges it into one per-name map and the engine
+    applies it at any depth — which is what makes one line in this package cover
+    every aspect of every account of every installation. `cloudwatch` is the
+    deliberate absence: `show_healthy: false` is the opposite claim about its own
+    lines, made where it belongs.
+    """
+    check = _build()
+    assert check.subnode_show_when_quiet == {
+        EC2: True, LAMBDA: True, CODEPIPELINE: True, BATCH: True}
+    assert CLOUDWATCH not in check.subnode_show_when_quiet
+
+
+def test_a_deployment_can_still_decline_what_this_package_declares() -> None:
+    """A declaration is a default, not a verdict: the deployment's own
+    `subnodes:` block beats it per name, and `nodes.yaml` beats that per path."""
+    check = _build(subnodes={EC2: {"show_when_quiet": False}})
+    assert check.subnode_show_when_quiet[EC2] is False
+    assert check.subnode_show_when_quiet[BATCH] is True     # untouched
+
+
+def test_no_aspect_result_stamps_the_flag() -> None:
+    """Every name this check emits is one it declared, so nothing rides a result.
+    A stamped value would be a static fact re-shipped on every run, invisible
+    beside the declarations it contradicts."""
+    check = _build()
+    _stub(check, alarms={})
+    for account in (_child(check.run(), name) for name in ("live", "backup")):
+        for leaf in account.children:
+            assert leaf.show_when_quiet is None
+
+
+def test_the_built_in_text_names_no_account_and_the_description_does() -> None:
+    # One label per subnode *name* covers every account's leaf of that name, so
+    # the prose cannot name one. The account is still on the leaf — in the
+    # description, which is written per run and per account — and above it, in
+    # the node the leaf hangs from.
+    check = _build()
+    assert "backup" not in check.subnode_labels[CLOUDWATCH]["about"]
+    _stub(check, alarms={})
     result = check.run()
-    assert "**backup**" in _child(_child(result, "backup"), CLOUDWATCH).about
+    leaf = _child(_child(result, "backup"), CLOUDWATCH)
+    assert leaf.description == "CloudWatch alarms in backup"
 
 
 # --- the narrowed value objects -------------------------------------------
@@ -1075,10 +1149,10 @@ def test_the_ec2_report_is_the_roster_of_names_and_counts() -> None:
     assert leaf.report.splitlines() == ["- jenkins: 2", "- prometheus: 1"]
 
 
-def test_the_ec2_leaf_carries_its_own_display_text() -> None:
-    leaf = _ec2(_build(), instances={"eu-central-1": [[_instance("prometheus")]]})
-    assert leaf.title == "EC2 instances"
-    assert "**live**" in leaf.about and "`Name` tag" in leaf.about
+def test_the_ec2_leaf_declares_its_own_display_text() -> None:
+    labels = _build().subnode_labels[EC2]
+    assert labels["title"] == "EC2 instances"
+    assert "`Name` tag" in labels["about"]
 
 
 def test_a_misspelled_ec2_key_is_refused_by_name() -> None:
@@ -1509,10 +1583,10 @@ def test_the_lambda_report_lists_the_full_names() -> None:
         "?region=eu-central-1#/functions/running-a)"]
 
 
-def test_the_lambda_leaf_carries_its_own_display_text() -> None:
-    leaf = _lambda(_build(), functions=ONE_FUNCTION)
-    assert leaf.title == "Lambda functions"
-    assert "**live**" in leaf.about and "`Errors` metric" in leaf.about
+def test_the_lambda_leaf_declares_its_own_display_text() -> None:
+    labels = _build().subnode_labels[LAMBDA]
+    assert labels["title"] == "Lambda functions"
+    assert "`Errors` metric" in labels["about"]
 
 
 def test_lambda_defaults() -> None:
@@ -1790,11 +1864,10 @@ def test_the_pipeline_report_lists_the_full_names() -> None:
         "/codepipeline/pipelines/running-b/executions?region=eu-central-1)"]
 
 
-def test_the_codepipeline_leaf_carries_its_own_display_text() -> None:
-    leaf = _pipelines(_build(), pipelines=ONE_PIPELINE,
-                      executions={"running-deploy": [_execution()]})
-    assert leaf.title == "CodePipeline"
-    assert "**live**" in leaf.about and "never been executed" in leaf.about
+def test_the_codepipeline_leaf_declares_its_own_display_text() -> None:
+    labels = _build().subnode_labels[CODEPIPELINE]
+    assert labels["title"] == "CodePipeline"
+    assert "never been executed" in labels["about"]
 
 
 def test_codepipeline_defaults_are_the_originals() -> None:
@@ -2165,10 +2238,10 @@ def test_the_config_card_spells_out_a_rule_that_only_strips() -> None:
     assert "-pipeline (dropped)" in summary
 
 
-def test_the_batch_leaf_carries_its_own_display_text() -> None:
-    leaf = _batch(_build(), queues=ONE_QUEUE)
-    assert leaf.title == "AWS Batch"
-    assert "**live**" in leaf.about and "waiting for capacity" in leaf.about
+def test_the_batch_leaf_declares_its_own_display_text() -> None:
+    labels = _build().subnode_labels[BATCH]
+    assert labels["title"] == "AWS Batch"
+    assert "waiting for capacity" in labels["about"]
 
 
 def test_batch_defaults() -> None:
@@ -2489,271 +2562,112 @@ def test_an_unusable_profile_name_is_refused(profile: str) -> None:
         AwsCheck.from_config(_config(profile=profile), Path("."))
 
 
+def test_a_profile_key_that_was_written_and_left_empty_is_refused() -> None:
+    """`profile:` with nothing after it is a typo, not a decision. Reading it as
+    "no profile" is how a check falls back to whatever `AWS_PROFILE` says and
+    then fails to assume a role it was never meant to assume from there — the
+    one failure that looks, on the card, like nothing happened at all."""
+    config = _config()
+    config["profile"] = None
+
+    with pytest.raises(CheckError, match="must not be empty"):
+        AwsCheck.from_config(config, Path("."))
+
+
+def test_an_account_profile_key_left_empty_is_refused_too() -> None:
+    config = _config(accounts=[{"name": "live", "profile": None,
+                                "role_arn": "arn:aws:iam::111:role/monitoring"}])
+
+    with pytest.raises(CheckError, match="'live'"):
+        AwsCheck.from_config(config, Path("."))
+
+
+def test_a_profile_that_is_not_text_is_refused_not_stringified() -> None:
+    """`profile: 123` used to read as the profile name "123" — a line that
+    lost its quoting, stringified into something boto3 and `aws sso login`
+    would then be handed. It is the same typo family as a key written and
+    left empty, and the identity seam's reader refuses it; the words here are
+    this check's own."""
+    with pytest.raises(CheckError, match="aws 'profile' must be text, got int"):
+        AwsCheck.from_config(_config(profile=123), Path("."))
+
+    with pytest.raises(CheckError, match=r"'live'.*must be text, got bool"):
+        AwsCheck.from_config(
+            _config(accounts=[{"name": "live", "profile": True,
+                               "role_arn": "arn:aws:iam::111:role/monitoring"}]),
+            Path("."))
+
+
+def test_a_config_with_no_profile_key_is_the_ambient_chain_as_before() -> None:
+    """The key left out entirely is the case every config written before it
+    existed is in, and it has to stay silent."""
+    assert AwsCheck.from_config(_config(), Path(".")).profile == ""
+
+
+# --- what an ambient chain turns out to be ---------------------------------
+#
+# "ambient credential chain" is honest and unhelpful at the one moment it
+# matters: an `AWS_PROFILE` exported for something else — reading a secret, say —
+# is then quietly deciding which identity assumes these roles, and `role cannot
+# be assumed` is the first anybody hears of it.
+
+def test_the_card_names_the_profile_the_environment_supplies(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AWS_PROFILE", "some-other-thing")
+    check = _build()
+
+    assert ("ambient credential chain (AWS_PROFILE=some-other-thing)"
+            in check.config_summary())
+
+
+def test_the_account_line_names_it_too_where_a_role_is_assumed_from_it(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AWS_PROFILE", "some-other-thing")
+    check = _build()
+    _stub(check)
+
+    assert ("assumed role, from the ambient chain (AWS_PROFILE=some-other-thing)"
+            in _child(check.run(), "live").config)
+
+
+def test_a_configured_profile_says_nothing_about_the_environment(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """The environment is only worth naming where it is what decides. A profile
+    that was written down wins over it, and the card says the written one."""
+    monkeypatch.setenv("AWS_PROFILE", "some-other-thing")
+    check = _build(profile=PRIMARY)
+
+    summary = check.config_summary()
+    assert f"profile {PRIMARY}" in summary
+    assert "AWS_PROFILE" not in summary
+
+
+def test_without_the_variable_the_line_is_what_it_always_was(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    for variable in ("AWS_PROFILE", "AWS_DEFAULT_PROFILE"):
+        monkeypatch.delenv(variable, raising=False)
+
+    assert "ambient credential chain\n" in _build().config_summary() + "\n"
+
+
 def test_a_bad_per_account_profile_names_the_account() -> None:
     with pytest.raises(CheckError, match="'live'"):
         AwsCheck.from_config(
             _config(accounts=[{"name": "live", "profile": ""}]), Path("."))
 
 
-# --- can an `aws sso login` work on this machine at all? ------------------
-#
-# `login_capability` answers in a sentence that ends up on the dashboard, so the
-# tests below are written from the sentence: each one is somebody's machine, and
-# the assertion is what that operator would be told.
-
-def _machine(**overrides: Any) -> dict[str, Any]:
-    """A developer's Mac, logged into an SSO profile, with the CLI installed."""
-    return {"profile": PRIMARY,
-            "profile_config": {"sso_session": "corp"},
-            "aws_cli": "/opt/homebrew/bin/aws",
-            "environ": {},
-            "platform": "darwin",
-            "container": False, **overrides}
-
-
-def test_a_developer_machine_can_log_in() -> None:
-    assert aws_module.login_capability(**_machine()) == ""
-
-
-def test_without_a_profile_there_is_no_named_login_to_renew() -> None:
-    assert "no profile is configured" in aws_module.login_capability(
-        **_machine(profile=""))
-
-
-def test_a_profile_that_is_not_an_sso_profile_is_named_as_such() -> None:
-    problem = aws_module.login_capability(
-        **_machine(profile_config={"region": "eu-central-1"}))
-    assert problem == f"profile {PRIMARY} is not an SSO profile"
-
-
-def test_an_sso_session_and_a_legacy_sso_start_url_both_count() -> None:
-    legacy = {"sso_start_url": "https://example.awsapps.com/start"}
-    assert aws_module.login_capability(**_machine(profile_config=legacy)) == ""
-
-
-def test_without_the_cli_there_is_nothing_to_run() -> None:
-    assert aws_module.login_capability(**_machine(aws_cli=None)) == (
-        "the aws CLI is not on PATH")
-
-
-@pytest.mark.parametrize("marker", aws_module.CLOUD_MARKERS)
-def test_platform_supplied_credentials_are_left_alone(marker: str) -> None:
-    """A task role, an instance profile, a pod identity, a Lambda: no browser
-    will open there, and those credentials renew themselves anyway."""
-    problem = aws_module.login_capability(**_machine(environ={marker: "set"}))
-    assert marker in problem and "platform" in problem
-
-
-def test_a_container_is_not_a_place_a_browser_opens() -> None:
-    assert "container" in aws_module.login_capability(**_machine(container=True))
-
-
-def test_a_headless_linux_box_is_refused_and_a_desktop_one_is_not() -> None:
-    headless = _machine(platform="linux", environ={})
-    assert "no display" in aws_module.login_capability(**headless)
-    assert aws_module.login_capability(
-        **_machine(platform="linux", environ={"DISPLAY": ":0"})) == ""
-    assert aws_module.login_capability(
-        **_machine(platform="linux", environ={"WAYLAND_DISPLAY": "wayland-0"})) == ""
-
-
-def test_macos_and_windows_need_no_display_variable() -> None:
-    assert aws_module.login_capability(**_machine(platform="win32")) == ""
-
-
-# --- which failures are worth renewing over -------------------------------
-
-@pytest.mark.parametrize("code_value", sorted(aws_module.CREDENTIAL_ERROR_CODES))
-def test_a_stale_credential_code_is_a_credential_error(code_value: str) -> None:
-    assert aws_module.is_credential_error(
-        ClientError({"Error": {"Code": code_value, "Message": "x"}}, "Op"))
-
-
-def test_a_refusal_is_not_a_stale_credential() -> None:
-    """The two need opposite answers: renew the one, report the other."""
-    assert not aws_module.is_credential_error(
-        ClientError({"Error": {"Code": "AccessDenied", "Message": "no"}}, "Op"))
-
-
-def test_a_missing_credential_is_a_credential_error_by_its_type() -> None:
-    assert aws_module.is_credential_error(NoCredentialsError())
-    assert not aws_module.is_credential_error(ValueError("unrelated"))
-
-
 # --- the login is the machine's, not the check's --------------------------
+#
+# What the machine's own bookkeeping does is `tests/test_identity.py`; what the
+# *check* does with it is below. The fixture is in both files because the state
+# is one process's, and either file run alone has to start from a machine nobody
+# has logged into.
 
 @pytest.fixture(autouse=True)
 def _forget_logins() -> None:
     """Module state is the point (one browser per machine), so each test starts
     from a machine nobody has logged into yet."""
-    aws_module.SSO_LOGINS.forget()
-
-
-class _Clock:
-    """A hand-wound monotonic clock."""
-
-    def __init__(self) -> None:
-        self.now = 1000.0
-
-    def __call__(self) -> float:
-        return self.now
-
-
-def _recorder(problem: str = "") -> Any:
-    calls: list[tuple[str, int]] = []
-
-    def login(profile: str, timeout: int) -> str:
-        calls.append((profile, timeout))
-        return problem
-
-    login.calls = calls                 # type: ignore[attr-defined]
-    return login
-
-
-def test_a_failed_login_is_not_retried_inside_the_cooldown() -> None:
-    """At `frequency: 60s` an unattended failure would otherwise be a browser
-    window a minute for as long as you are away from the desk."""
-    logins = aws_module.SsoLogins()
-    clock = _Clock()
-    login = _recorder("nobody finished it")
-    first = logins.renew(PRIMARY, timeout=120, cooldown=600,
-                         login=login, clock=clock)
-    clock.now += 599
-    second = logins.renew(PRIMARY, timeout=120, cooldown=600,
-                          login=login, clock=clock)
-    assert first == "nobody finished it"
-    assert "not tried again within 10m" in second
-    assert len(login.calls) == 1
-
-
-def test_past_the_cooldown_it_tries_again() -> None:
-    logins = aws_module.SsoLogins()
-    clock = _Clock()
-    login = _recorder("nobody finished it")
-    logins.renew(PRIMARY, timeout=120, cooldown=600, login=login, clock=clock)
-    clock.now += 601
-    logins.renew(PRIMARY, timeout=120, cooldown=600, login=login, clock=clock)
-    assert len(login.calls) == 2
-
-
-def test_a_second_account_on_one_profile_reuses_the_login_just_made() -> None:
-    """Two accounts of one profile go stale in the same run; the first one's
-    login fixed both, so the second must not open a browser to find that out."""
-    logins = aws_module.SsoLogins()
-    clock = _Clock()
-    login = _recorder()
-    assert logins.renew(PRIMARY, timeout=120, cooldown=600,
-                        login=login, clock=clock) == ""
-    clock.now += 1
-    assert logins.renew(PRIMARY, timeout=120, cooldown=600,
-                        login=login, clock=clock) == ""
-    assert len(login.calls) == 1
-
-
-def test_two_profiles_are_two_logins() -> None:
-    logins = aws_module.SsoLogins()
-    clock = _Clock()
-    login = _recorder()
-    logins.renew(PRIMARY, timeout=120, cooldown=600, login=login, clock=clock)
-    logins.renew(SECONDARY, timeout=120, cooldown=600, login=login, clock=clock)
-    assert [profile for profile, _ in login.calls] == [PRIMARY, SECONDARY]
-
-
-def test_concurrent_renewals_of_one_profile_run_one_login() -> None:
-    """The lock is per profile and the cooldown is read inside it, so the
-    thread that queued behind a login sees the fresh stamp rather than a
-    second browser."""
-    logins = aws_module.SsoLogins()
-    started = threading.Event()
-    calls: list[str] = []
-
-    def slow_login(profile: str, timeout: int) -> str:
-        calls.append(profile)
-        started.set()
-        time.sleep(0.05)
-        return ""
-
-    def renew() -> None:
-        logins.renew(PRIMARY, timeout=120, cooldown=600, login=slow_login)
-
-    threads = [threading.Thread(target=renew) for _ in range(4)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=5)
-    assert calls == [PRIMARY]
-
-
-# --- running the CLI ------------------------------------------------------
-
-class _Completed:
-    def __init__(self, returncode: int, stderr: str = "", stdout: str = "") -> None:
-        self.returncode = returncode
-        self.stderr = stderr
-        self.stdout = stdout
-
-
-def _ran(monkeypatch: pytest.MonkeyPatch, result: Any) -> list[list[str]]:
-    """Replace the subprocess and record the argv it was given."""
-    commands: list[list[str]] = []
-
-    def fake_run(command: list[str], **kwargs: Any) -> Any:
-        commands.append(command)
-        if isinstance(result, BaseException):
-            raise result
-        return result
-
-    monkeypatch.setattr(aws_module.subprocess, "run", fake_run)
-    return commands
-
-
-def test_the_login_command_names_the_profile(
-        monkeypatch: pytest.MonkeyPatch) -> None:
-    commands = _ran(monkeypatch, _Completed(0))
-    assert aws_module.run_sso_login(PRIMARY, 120) == ""
-    assert commands == [["aws", "sso", "login", "--profile", PRIMARY]]
-
-
-def test_without_a_profile_the_cli_is_left_to_pick_one(
-        monkeypatch: pytest.MonkeyPatch) -> None:
-    """`login: always` with no profile is still meaningful — AWS_PROFILE in the
-    environment is a profile the CLI will find and this check never saw."""
-    commands = _ran(monkeypatch, _Completed(0))
-    aws_module.run_sso_login("", 120)
-    assert commands == [["aws", "sso", "login"]]
-
-
-def test_a_failed_login_reports_the_cli_s_last_word(
-        monkeypatch: pytest.MonkeyPatch) -> None:
-    _ran(monkeypatch, _Completed(
-        255, stderr="Attempting to automatically open the SSO page\n"
-                    "Error loading SSO Token: Token has expired"))
-    problem = aws_module.run_sso_login(PRIMARY, 120)
-    assert "Token has expired" in problem
-    assert "Attempting to automatically" not in problem
-
-
-def test_a_login_nobody_completes_is_stopped_and_says_so(
-        monkeypatch: pytest.MonkeyPatch) -> None:
-    """It holds an engine worker thread while it waits, so the bound is the
-    point of the sentence, not decoration."""
-    _ran(monkeypatch, subprocess.TimeoutExpired(cmd="aws", timeout=120))
-    assert "still waiting after 2m" in aws_module.run_sso_login(PRIMARY, 120)
-
-
-def test_a_missing_cli_is_a_reason_not_a_crash(
-        monkeypatch: pytest.MonkeyPatch) -> None:
-    _ran(monkeypatch, FileNotFoundError("aws"))
-    assert aws_module.run_sso_login(PRIMARY, 120) == "the aws CLI is not on PATH"
-
-
-def test_the_cli_s_words_are_escaped_before_they_reach_a_card(
-        monkeypatch: pytest.MonkeyPatch) -> None:
-    """A reason renders as Markdown (little-sister ADR-0018), and the CLI's
-    stderr is captured output like any other."""
-    _ran(monkeypatch, _Completed(1, stderr="see *this* [link](http://x)"))
-    problem = aws_module.run_sso_login(PRIMARY, 120)
-    assert r"\*this\*" in problem and r"\[link\]" in problem
+    identity_module.SSO_LOGINS.forget()
 
 
 # --- the check renews, once, and reads the account on the retry -----------
@@ -2881,10 +2795,10 @@ def test_auto_logs_in_on_a_machine_that_can(
                               "role_arn": "arn:aws:iam::111:role/monitoring"}])
     check._profile_config = lambda profile: {       # type: ignore[method-assign]
         "sso_session": "corp"}
-    monkeypatch.setattr(aws_module.shutil, "which", lambda name: "/usr/bin/aws")
-    monkeypatch.setattr(aws_module.sys, "platform", "darwin")
-    monkeypatch.setattr(aws_module, "in_container", lambda: False)
-    for marker in aws_module.CLOUD_MARKERS:
+    monkeypatch.setattr(identity_module.shutil, "which", lambda name: "/usr/bin/aws")
+    monkeypatch.setattr(identity_module.sys, "platform", "darwin")
+    monkeypatch.setattr(identity_module, "in_container", lambda: False)
+    for marker in identity_module.CLOUD_MARKERS:
         monkeypatch.delenv(marker, raising=False)
     _stub(check, _FakeSts(expire=1))
     attempts = _sso(check)
@@ -2926,7 +2840,7 @@ def test_a_per_account_profile_is_enough_to_get_the_sso_row() -> None:
 
 def test_sso_defaults() -> None:
     settings = _build().sso
-    assert settings.login == aws_module.SSO_LOGIN_AUTO
+    assert settings.login == identity_module.SSO_LOGIN_AUTO
     assert settings.timeout_seconds == 120
     assert settings.cooldown_seconds == 600
 
@@ -2945,3 +2859,130 @@ def test_the_sso_block_is_read_in_the_units_the_rest_of_the_config_uses() -> Non
 def test_bad_sso_settings_are_refused(block: object) -> None:
     with pytest.raises(CheckError):
         AwsCheck.from_config(_config(sso=block), Path("."))
+
+
+# --- what the log says when an account could not be looked at --------------
+#
+# A check that ran and graded badly is *reporting*; a check that could not look
+# at an account at all is a different event, and it used to make no sound. The
+# engine's own line says the check completed — because it did — and the refusal
+# lived only on a card somebody had to go and open. That is how a run whose two
+# accounts were both refused read as `check /team/aws: OK` in a log file.
+
+
+def _unreadable_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [message for message in
+            (record.getMessage() for record in caplog.records
+             if record.levelname == "ERROR")
+            if "could not be read" in message]
+
+
+def test_an_account_that_could_not_be_read_says_so_in_the_log(
+        caplog: pytest.LogCaptureFixture) -> None:
+    check = _build(accounts=[{"name": "live",
+                              "role_arn": "arn:aws:iam::111:role/monitoring"}])
+    _stub(check, _FakeSts(refuse={"arn:aws:iam::111:role/monitoring"}))
+    with caplog.at_level(logging.ERROR, logger="little_sister_aws.aws"):
+        check.run()
+    lines = _unreadable_lines(caplog)
+    assert len(lines) == 2, lines          # the account, then the run summary
+    assert "account 'live'" in lines[0]
+    assert "arn:aws:iam::111:role/monitoring" in lines[0]
+    assert "AccessDenied" in lines[0]
+
+
+def test_the_line_names_who_we_actually_were(
+        caplog: pytest.LogCaptureFixture) -> None:
+    """The fact no configuration can supply, and the one this whole thing is for.
+
+    A check says which profile it *meant* to use; what the ambient chain resolved
+    to on this machine is decided elsewhere, and being wrong about it is
+    invisible — which is exactly how one estate's ambient identity came to be
+    assuming another estate's role with nothing in the log saying so.
+    """
+    check = _build(accounts=[{"name": "live",
+                              "role_arn": "arn:aws:iam::111:role/monitoring"}])
+    _stub(check, _FakeSts(refuse={"arn:aws:iam::111:role/monitoring"}))
+    with caplog.at_level(logging.ERROR, logger="little_sister_aws.aws"):
+        check.run()
+    assert "as 111, arn:aws:iam::111:user/fake" in _unreadable_lines(caplog)[0]
+
+
+def test_the_line_names_the_credentials_the_account_was_read_with(
+        caplog: pytest.LogCaptureFixture) -> None:
+    check = _build(profile=PRIMARY,
+                   accounts=[{"name": "live",
+                              "role_arn": "arn:aws:iam::111:role/monitoring"}])
+    _stub(check, _FakeSts(refuse={"arn:aws:iam::111:role/monitoring"}))
+    with caplog.at_level(logging.ERROR, logger="little_sister_aws.aws"):
+        check.run()
+    assert f"profile {PRIMARY}" in _unreadable_lines(caplog)[0]
+
+
+def test_without_a_profile_the_line_says_ambient(
+        caplog: pytest.LogCaptureFixture) -> None:
+    """`ambient credential chain` is the whole diagnosis when a role in another
+    estate is being assumed from whatever this machine happened to be."""
+    check = _build(accounts=[{"name": "live",
+                              "role_arn": "arn:aws:iam::111:role/monitoring"}])
+    _stub(check, _FakeSts(refuse={"arn:aws:iam::111:role/monitoring"}))
+    with caplog.at_level(logging.ERROR, logger="little_sister_aws.aws"):
+        check.run()
+    assert "the ambient credential chain" in _unreadable_lines(caplog)[0]
+
+
+def test_an_unprovable_identity_still_leaves_the_refusal(
+        caplog: pytest.LogCaptureFixture) -> None:
+    """A diagnostic that replaces the thing it explains is worse than none: if
+    who-we-were cannot be proven, the line drops that clause and keeps the rest."""
+    check = _build(accounts=[{"name": "live",
+                              "role_arn": "arn:aws:iam::111:role/monitoring"}])
+    _stub(check, _FakeSts(refuse={"arn:aws:iam::111:role/monitoring"},
+                          deny_identity=True))
+    with caplog.at_level(logging.ERROR, logger="little_sister_aws.aws"):
+        check.run()
+    line = _unreadable_lines(caplog)[0]
+    assert "AccessDenied" in line
+    assert " as " not in line
+
+
+def test_the_summary_names_how_many_of_how_many(
+        caplog: pytest.LogCaptureFixture) -> None:
+    """`2 of 2` is the shape of a credential problem and `1 of 3` the shape of
+    one account's policy — the count is the diagnosis, so it is on its own line."""
+    check = _build(accounts=[
+        {"name": "live", "role_arn": "arn:aws:iam::111:role/monitoring"},
+        {"name": "backup", "role_arn": "arn:aws:iam::222:role/monitoring"}])
+    _stub(check, _FakeSts(refuse={"arn:aws:iam::111:role/monitoring",
+                                  "arn:aws:iam::222:role/monitoring"}))
+    with caplog.at_level(logging.ERROR, logger="little_sister_aws.aws"):
+        check.run()
+    assert "2 of 2 account(s) could not be read: live, backup" in \
+        _unreadable_lines(caplog)[-1]
+
+
+def test_a_readable_run_logs_nothing_of_the_kind(
+        caplog: pytest.LogCaptureFixture) -> None:
+    """The boundary: a check that could look logs no failure here, whatever it
+    then grades. An alarm in ALARM is a reading, not a check that could not run."""
+    check = _build(accounts=[{"name": "live",
+                              "role_arn": "arn:aws:iam::111:role/monitoring"}])
+    _stub(check, alarms={"eu-central-1": [[_alarm("api-5xx")]]})
+    with caplog.at_level(logging.ERROR, logger="little_sister_aws.aws"):
+        result = check.run()
+    live = _child(result, "live")
+    burning = [entry for child in live.children for entry in child.reason
+               if entry.code is StatusCode.ERROR]
+    assert burning, "the run has to grade something badly, or this proves nothing"
+    assert _unreadable_lines(caplog) == []
+
+
+def test_a_healthy_run_never_asks_who_it_is(
+        caplog: pytest.LogCaptureFixture) -> None:
+    """The identity proof is a call, so it is spent on the failure path only."""
+    check = _build(accounts=[{"name": "live",
+                              "role_arn": "arn:aws:iam::111:role/monitoring"}])
+    sts = _FakeSts()
+    _stub(check, sts)
+    check.run()
+    assert sts.identity_calls == 0

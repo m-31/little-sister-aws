@@ -1,56 +1,16 @@
 # ADR-0001 — The `aws` check type: account nodes, aspect leaves, and boto3
 
 - **Status:** Accepted
-- **Date:** 2026-08-10
-- **Related:** little-sister **ADR-0042** (coded entries), little-sister
-  **ADR-0043** / **ADR-0044** (the coverage reading and the roster), little-sister
-  **ADR-0025** (subnode text),
+- **Date:** 2026-08-23 (the type was accepted 2026-08-10)
+- **Related:** [ADR-0002](0002-aws-secret-references.md) (the secret references the
+  identities on this package's seam are read with), little-sister **ADR-0042**
+  (coded entries), little-sister **ADR-0043** / **ADR-0044** (the coverage reading
+  and the roster), little-sister **ADR-0025** (subnode text),
   **plugin-repository.md** (the lift-out this ADR promised, and which has happened)
 
-> **Update (2026-08-12) — the account's *login*, not just its role.** Decision 2
-> below gave each account a node and its own session; what it did not say was
-> where the session the role is assumed **from** comes from. It came from the
-> ambient chain, one for all accounts, which is right on a server and wrong on the
-> machine this is developed on: one config's roles and another's can live in
-> **different organizations**, reachable only as two different `~/.aws/config`
-> profiles. So:
->
-> - **`profile:` is readable at the check and on an account**, exactly like
->   `regions:`, and it **composes** with `role_arn` rather than replacing it —
->   `profile` says from where, `role_arn` says into what. Unset it changes
->   nothing: boto3 reads the ambient chain, `AWS_PROFILE` included. It is
->   **mutually exclusive with a `secrets:` block**, because a profile *is* a set
->   of credentials and a config naming both has said two things about which
->   estate it watches.
-> - An account with a profile and **no** role spends one `sts:GetCallerIdentity`
->   before its aspects run. Assuming a role was already the proof that the
->   credentials work; without one there was nothing to fail until three aspects
->   failed separately, each in its own words.
-> - **An expired SSO login is renewable, and the check decides whether renewing
->   is even a sensible thing to attempt here.** `sso.login: auto` — the default —
->   runs `aws sso login` only where it can work: an SSO profile, the `aws` CLI on
->   `PATH`, no platform-supplied credentials (`AWS_EXECUTION_ENV`,
->   `ECS_CONTAINER_METADATA_URI`, `AWS_WEB_IDENTITY_TOKEN_FILE`,
->   `KUBERNETES_SERVICE_HOST`, …), not a container, and a machine where a browser
->   opens. `always` skips the question, `never` never shells out. **The decision
->   and its reason are printed on the check's card**, because "auto" without a
->   word on whether auto works here is the reassuring version of saying nothing.
-> - The renewal is bounded twice: a **timeout** (default 2m), because a login
->   holds an engine worker thread while it waits for a human, and a **cooldown**
->   (default 10m) **per profile, in process-wide state**, because the browser and
->   the token cache belong to the machine — two checks on one profile must not
->   both open a login, and at `frequency: 60s` a login nobody completes would
->   otherwise be a browser window a minute for as long as you are away from the
->   desk.
-> - Either way the account carries **two lines**: what expired, and the exact
->   `aws sso login --profile …` that fixes it — except where no profile is
->   configured, since telling a server to open a browser is advice for a machine
->   that is not this one.
->
-> Nothing here is a departure from the decisions below; it is the credential half
-> of decision 2 written down. It travels to `little-sister-aws` with the rest —
-> `subprocess` and `shutil` are stdlib, and the capability test is a pure function
-> of what it is handed.
+> This record was written in the deployment whose AWS checks this type replaced and
+> travelled here with the code: *that codebase* in the Context below is that
+> deployment's, and the checks it names are the ones this type absorbed.
 
 ## Context
 
@@ -61,8 +21,15 @@ thing an operator acts on; and how to reach AWS at all.
 
 The obvious arrangement — a check type per service, each building its own session,
 each returning a flat list tagged with the environment it came from — answers all
-four badly at once, and answers them again for every service added. What follows is
-the arrangement this type uses instead, and why.
+four badly at once, and answers them again for every service added.
+
+A fifth question arrived later, and is answered here rather than in a record of its
+own because the answer turned out to be machinery this type already had: **who else
+in the process opens a session.** For a while, nobody. Then AWS-backed secret
+references had to resolve once at check *construction* — before any check exists,
+out of no check's configuration, on the thread importing the application.
+
+What follows is the arrangement this package uses instead, and why.
 
 ## Decision
 
@@ -96,6 +63,45 @@ finding is what an operator acts on, and each line is a coded `Entry`
 becomes one word on the line (`tag_prefix`) rather than a second node — the account
 is what such a split is usually carrying, and the tree carries the account.
 
+**The credential half of the same decision: from where, into what.** An account has
+its own node and its own session; where the session the role is assumed *from* comes
+from is the other half of that, and the ambient chain — one for all accounts — is
+right on a server and wrong on the machine this is developed on, where one config's
+roles and another's can live in **different organizations**, reachable only as two
+different `~/.aws/config` profiles.
+
+- **`profile:` is readable at the check and on an account**, exactly like
+  `regions:`, and it **composes** with `role_arn` rather than replacing it —
+  `profile` says from where, `role_arn` says into what. Unset it changes
+  nothing: boto3 reads the ambient chain, `AWS_PROFILE` included. It is
+  **mutually exclusive with a `secrets:` block**, because a profile *is* a set
+  of credentials and a config naming both has said two things about which
+  estate it watches.
+- An account with a profile and **no** role spends one `sts:GetCallerIdentity`
+  before its aspects run. Assuming a role was already the proof that the
+  credentials work; without one there was nothing to fail until three aspects
+  failed separately, each in its own words.
+- **An expired SSO login is renewable, and the check decides whether renewing
+  is even a sensible thing to attempt here.** `sso.login: auto` — the default —
+  runs `aws sso login` only where it can work: an SSO profile, the `aws` CLI on
+  `PATH`, no platform-supplied credentials (`AWS_EXECUTION_ENV`,
+  `ECS_CONTAINER_METADATA_URI`, `AWS_WEB_IDENTITY_TOKEN_FILE`,
+  `KUBERNETES_SERVICE_HOST`, …), not a container, and a machine where a browser
+  opens. `always` skips the question, `never` never shells out. **The decision
+  and its reason are printed on the check's card**, because "auto" without a
+  word on whether auto works here is the reassuring version of saying nothing.
+- The renewal is bounded twice: a **timeout** (default 2m), because a login
+  holds an engine worker thread while it waits for a human, and a **cooldown**
+  (default 10m) **per profile, in process-wide state**, because the browser and
+  the token cache belong to the machine — two checks on one profile must not
+  both open a login, and at `frequency: 60s` a login nobody completes would
+  otherwise be a browser window a minute for as long as you are away from the
+  desk.
+- Either way the account carries **two lines**: what expired, and the exact
+  `aws sso login --profile …` that fixes it — except where no profile is
+  configured, since telling a server to open a browser is advice for a machine
+  that is not this one.
+
 ### 3. boto3, not stdlib `urllib`
 
 Every other check type in this family reaches its provider over stdlib `urllib`,
@@ -103,10 +109,10 @@ and each ships with little-sister as its only dependency. This one does not.
 Signing SigV4 for `sts:AssumeRole` and the CloudWatch API by hand is a signing
 implementation plus the test suite that keeps it honest, bought to save a
 dependency that AWS itself maintains, that is already in this deployment's
-transitive world the moment anything talks to AWS, and that the eventual
-`aws-ssm://` secret resolver will want anyway.
+transitive world the moment anything talks to AWS, and that the `aws-ssm://`
+secret resolver — now this package's own — wants anyway.
 
-The cost is named rather than waved away: `little-sister-aws` will be the first
+The cost is named rather than waved away: `little-sister-aws` is the first
 package in the family with a dependency beyond little-sister, and it declares it
 as a **floor**, like its little-sister floor. `boto3-stubs[cloudwatch,sts]` goes
 in the dev group — without the per-service extras every client types as
@@ -130,6 +136,101 @@ check-authoring surface, its tests use no fixture belonging to any installation,
 and it is written to the **library's** Python floor (3.11) rather than to whichever
 interpreter it happens to be developed on.
 
+### 5. `little_sister_aws.identity` is a second public surface
+
+Everything the fifth question needs already lived here, and lived inside
+`AwsCheck`: `_new_session`, the `AssumeRole` with its session name and STS region,
+the `GetCallerIdentity` that proves a profile-only identity, and the `aws sso login`
+renewal with its capability test, timeout and cooldown. It is a surface of its own
+now rather than a check's private half.
+
+1. **What it publishes.** An `Identity` — profile, static keys, role, session name,
+   STS region — plus `base_session()`, `assumed_session()` and `open_session()`,
+   and beside them `login_capability()`, `login_problem()`, `run_sso_login()`,
+   `SsoLogins` and `SSO_LOGINS`. `AwsCheck` composes an `Identity` per account and
+   delegates; its configuration, its per-account layering and its retry-once policy
+   are unchanged, and the tests that pin them did not move.
+
+2. **The rule for that surface: it reads no file, knows no check type's schema, and
+   takes the mapping as an argument from whoever read the file.** Nothing here opens
+   a configuration directory and nothing needs a check to have been built. That is
+   what makes it usable by the callers it was extracted for, and it is the test to
+   apply to anything proposed for it later. `identity.py`'s own docstring says the
+   same, so the two cannot drift apart.
+
+3. **`SSO_LOGINS` is exported rather than reimplemented, and that is the reason the
+   code moved rather than being copied.** One instance per process, keyed by profile,
+   with a per-profile lock and a cooldown: two implementations in one process would
+   each hold half of the machine's history and open two browsers for one expiry. A
+   deployment writing its own would not be a duplication, it would be a defect.
+
+4. **A login's budget belongs to its caller.** `SsoLogins.renew()` takes its timeout
+   and cooldown as arguments and reads no configuration, because a check waiting on an
+   engine worker thread and an application waiting inside its own import can afford
+   very different numbers — the second is a worker that has not finished booting, and
+   a generous timeout there is a failed start rather than a slow one. `open_session()`
+   therefore does not renew anything: whether to try, and at what price, is one call
+   further out.
+
+### 6. The seam carries the readers its callers were each writing privately
+
+The `sso:` block — whether, and how hard, an expired login may be renewed — was
+written in three packages: this check's own configuration, a deployment's identity
+file, and a deployment-resident check type of that deployment's own. Each had grown
+a private parser. The copies' *deliberate* differences — what a bad block costs, and
+what a login may spend — were carried by every copy again, while their wordings
+drifted apart by accident and their suites then pinned the drift. So the reader is
+one function on this surface, `parse_sso_block`, beside the `SsoConfig` it produces
+and the modes and defaults it validates against, with the differences as arguments:
+
+1. **`default=` is the budget, and it is the caller's.** An absent block and
+   absent keys mean the *caller's* numbers — exactly what point 4 above states for
+   `SsoLogins.renew()`. This check passes nothing and keeps its generous window; a
+   boot passes its own short one.
+2. **`allow_cooldown=False` refuses the key rather than ignoring it.** A
+   cooldown answers "how often may an unattended machine re-open a browser",
+   which a caller that reads its secrets once at startup must not be asked.
+3. **A refusal is parts, not a sentence.** `SsoBlockError` carries which key,
+   what was wrong with it and what would have been accepted, and every caller
+   renders its own words and translates to its own type — a check pins itself,
+   an identity file refuses a whole start. The suites on both sides of the seam
+   pin sentences that disagree on purpose, so a wording that lived in the
+   reader would be one of them broken the day anybody harmonized it.
+
+A *parser of configuration* on this surface is exactly what point 2's width is for:
+the block arrives already read, by whoever owns the file it came from.
+
+The `sso:` block was not alone. *An optional string, and a key written and left
+empty is a typo, not a value* — the rule this check learned the hard way about
+`profile:` — had also been written once per package, and two of the three
+copies quietly **stringified** a value that was not text on top: `profile: 123`
+read as the profile name `"123"`, handed to boto3 and to `aws sso login`, and
+no suite anywhere pinned the coercion. So the seam carries a second reader in
+the same shape — `parse_optional_text`, with `OptionalTextError` as its parts —
+and the refusal won: absent means the caller's default, written-and-left-empty
+refuses, and a non-text value refuses as the same typo family. This check's
+`_parse_profile` is that reader plus the one thing that stays the check's own:
+the backtick-and-newline ban on a name that is printed back inside a Markdown
+code span and handed to a subprocess.
+
+### 7. The AWS secret provider lives here too — and what still bounds the package
+
+Decision 4's line is *what is true of the type lives here, what is true of an
+installation lives in its YAML*, and for a while this package registered one check
+type and published one seam beside it. It now also carries the AWS **secret
+resolvers** and the named identities they read secrets with —
+`little_sister_aws.secrets` and `little_sister_aws.identities`, with the `aws`
+configuration aspect declared here and `config/aws.yaml`'s shape owned here.
+[ADR-0002](0002-aws-secret-references.md) is their design record; it travelled with
+them, and registration stays the deployment's own explicit call.
+
+That makes three surfaces rather than one, which is a boundary worth stating so it
+does not keep moving: this package is the home of what is true of **AWS**, and the
+one AWS check type whose subject is a particular organization's own system stays in
+that organization's deployment, by that deployment's own record, forever. The rule
+for `identity.py` is untouched by the arrival — `identities.py` reads a **file**,
+which is exactly why it sits *beside* the seam and never in it.
+
 ## Consequences
 
 - `boto3` is this package's dependency, declared as a **floor** beside the library's
@@ -149,3 +250,6 @@ interpreter it happens to be developed on.
 - Every account gets every aspect. The day an account runs no SageMaker, that
   becomes a per-account `aspects:` list; it is not one today because a list with
   one member in it teaches nobody anything.
+- A process gets one `SSO_LOGINS`, and every caller that may renew a login shares
+  its history — so a check's browser window and a boot's are the same window, and
+  the cooldown that suppresses a second one is machine-wide by construction.

@@ -1,14 +1,21 @@
 [project]
 name = "little-sister-aws"
-version = "0.1.0"
-description = "AWS check type for little-sister: CloudWatch alarms, EC2, Lambda, CodePipeline and Batch."
+version = "0.1.1"
+# **Three surfaces, not one.** The old summary named only the check type, which was
+# true when this package was only that; it now also carries the AWS secret provider
+# and the identity seam both of them open sessions through, and a summary that names
+# one of three sends somebody looking for the other two to a package they already
+# have. Metadata is frozen per artifact — correcting this after a release costs a
+# version — so it says what the package *is* rather than what it was extracted as.
+description = "AWS for little-sister: an aws check type (CloudWatch, EC2, Lambda, CodePipeline, Batch), Secrets Manager and Parameter Store secret references, and the identity seam behind both."
 authors = [
     { name = "Michael Meyling" }
 ]
 readme = {file = "README.md", content-type = "text/markdown"}
 license = "MIT"
 license-files = ["LICENSE"]
-keywords = ["monitoring", "status", "aws", "cloudwatch", "little-sister"]
+keywords = ["monitoring", "status", "aws", "cloudwatch", "secrets-manager",
+            "parameter-store", "boto3", "little-sister"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Programming Language :: Python :: 3",
@@ -35,15 +42,17 @@ requires-python = ">=3.11"
 # a release. The upgrade a floor cannot see, the library moving *past* the
 # surface, is caught by `require_api()` in `__init__.py`.
 #
-# **0.3.12**, the same release the sister packages name, and for the same kind of
-# reason: this module reads `little_sister.spans` (`coarse_span` / `format_span`),
-# which 0.3.11 does not carry. A floor still naming 0.3.11 would let a deployment
-# install this against a library missing a name it imports, and the failure would be
-# an `ImportError` at startup — the one mismatch `require_api()` cannot catch,
-# because an epoch says what was *removed* and nothing about what was added. The
-# epoch is still **1**, correctly: adding names does not move it.
+# **0.3.13**, the release that speaks **check API epoch 2** — the epoch this
+# package now declares. It moved because three names *left* the surface: the
+# library reads the whole `subnodes:` block itself and a type only declares
+# (little-sister ADR-0025, 2026-08-19 update). That is the direction an epoch is
+# for, and the floor has to move with it or a resolver would install a library
+# `require_api()` is about to reject. The floor's other job is unchanged and still
+# needs a real number: this module reads `little_sister.spans`, which 0.3.11 does
+# not carry, and an *added* name is the mismatch an epoch cannot catch — it says
+# what was removed and nothing about what arrived.
 dependencies = [
-    "little-sister>=0.3.12",
+    "little-sister>=0.3.13",
     # boto3, and the reason this package is the first in the family with a
     # dependency beyond the library (its ADR-0001 §3). A **floor**, like the one
     # above: boto3 releases daily and a pin here would fight every consumer.
@@ -122,8 +131,9 @@ dev = [
     "shellcheck-py>=0.11.0.1",
     # Without the per-service extras every boto3 client types as `BaseClient` and
     # strict mypy checks nothing at all on the one call path that matters. One
-    # extra per service this type reads.
-    "boto3-stubs[batch,cloudwatch,codepipeline,ec2,lambda,logs,sts]>=1.40.0",
+    # extra per service this package reads: the check's five aspects, STS, and
+    # the secret provider's two stores.
+    "boto3-stubs[batch,cloudwatch,codepipeline,ec2,lambda,logs,secretsmanager,ssm,sts]>=1.40.0",
     "types-PyYAML",
 ]
 

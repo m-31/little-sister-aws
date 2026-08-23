@@ -31,19 +31,13 @@ saved. Everything imported from little-sister below is part of its check-authori
 surface (``architecture.md`` §11) — including ``little_sister.spans``, which is
 how the library writes a span of time, so the ages on these lines read the way
 the rest of the page does instead of inventing a fourth spelling. That surface is
-what this module will pin with ``require_api(1)`` when it becomes
-``little-sister-aws``.
+what this package pins with ``require_api(2)``.
 """
 from __future__ import annotations
 
 import logging
 import os
 import re
-import shutil
-import subprocess
-import sys
-import threading
-import time
 import urllib.parse
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -51,8 +45,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import boto3
-import botocore.session
 from boto3.session import Session
 from botocore.exceptions import BotoCoreError, ClientError
 from little_sister.checks import (
@@ -64,14 +56,35 @@ from little_sister.checks import (
     config_markdown,
     parse_duration,
     parse_secret_refs,
-    parse_subnodes,
     plain,
     register,
-    resolve_text,
 )
 from little_sister.reasons import slug
 from little_sister.spans import coarse_span, format_span
 from little_sister.status import StatusCode
+
+from little_sister_aws.identity import (
+    DEFAULT_ROLE_SESSION_NAME,
+    DEFAULT_STS_REGION,
+    SSO_LOGIN_ALWAYS,
+    SSO_LOGINS,
+    Identity,
+    OptionalTextError,
+    SsoBlockError,
+    SsoConfig,
+    ambient_profile,
+    base_session,
+    caller_identity,
+    is_credential_error,
+    login_command,
+    login_problem,
+    new_session,
+    open_session,
+    parse_optional_text,
+    parse_sso_block,
+    read_profile_config,
+    run_sso_login,
+)
 
 if TYPE_CHECKING:
     # The service clients, for their **types** only: `boto3-stubs`' per-service
@@ -93,80 +106,6 @@ logger = logging.getLogger(__name__)
 #: rather than a constant now: ``regions`` is a list, and an account may override
 #: it — a backup account living in Ireland is the case that made this necessary.
 DEFAULT_REGIONS = ("eu-central-1",)
-
-#: What the assumed session is called — the string CloudTrail shows beside every
-#: call this check makes. It names *the reader*, which is the useful thing for
-#: somebody reading an audit log, so the default names this package. An
-#: installation that wants its own history in CloudTrail sets ``role_session_name``
-#: and gets it; an estate that wants its own name in CloudTrail sets one, which is
-#: configuration rather than something every installation inherits.
-DEFAULT_ROLE_SESSION_NAME = "little-sister"
-
-#: Where the ``AssumeRole`` call itself is made. STS has a global endpoint, but the
-#: a regional endpoint is the faster and more available of the two.
-DEFAULT_STS_REGION = "eu-central-1"
-
-#: ``sso.login`` — when the check may run ``aws sso login`` itself.
-#: :data:`SSO_LOGIN_AUTO` is the default and asks :func:`login_capability`
-#: first; :data:`SSO_LOGIN_ALWAYS` skips that question (a machine that knows
-#: better than the guess); :data:`SSO_LOGIN_NEVER` never shells out and only
-#: prints the command.
-SSO_LOGIN_AUTO = "auto"
-SSO_LOGIN_ALWAYS = "always"
-SSO_LOGIN_NEVER = "never"
-SSO_LOGIN_MODES = (SSO_LOGIN_AUTO, SSO_LOGIN_ALWAYS, SSO_LOGIN_NEVER)
-
-#: How long ``aws sso login`` may take before it is killed. It is waiting for a
-#: human at a browser, so it is generous — but it is bounded, because it holds
-#: an engine worker thread for as long as it runs.
-DEFAULT_SSO_LOGIN_TIMEOUT_SECONDS = 120
-
-#: How long after an attempt the next one may be made, per profile. This is the
-#: knob that keeps an unattended machine sane: without it a login that nobody
-#: completes is retried on every run, and at ``frequency: 60s`` that is a browser
-#: window a minute for as long as you are away from the desk.
-DEFAULT_SSO_LOGIN_COOLDOWN_SECONDS = 600
-
-#: Environment variables that mean *the platform supplies these credentials* —
-#: a task role, an instance profile, a pod identity, a Lambda. Any of them set
-#: is a machine where no browser will ever open and where credentials renew
-#: themselves anyway, so ``login: auto`` stays out of the way.
-CLOUD_MARKERS = (
-    "AWS_EXECUTION_ENV",
-    "AWS_LAMBDA_FUNCTION_NAME",
-    "ECS_CONTAINER_METADATA_URI",
-    "ECS_CONTAINER_METADATA_URI_V4",
-    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
-    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-    "AWS_WEB_IDENTITY_TOKEN_FILE",
-    "KUBERNETES_SERVICE_HOST",
-)
-
-#: Files that say "inside a container". Docker writes the first, Podman the
-#: second. A container is not automatically a *cloud* instance, but it is a
-#: place where ``aws sso login`` opens a browser that nobody can see.
-CONTAINER_MARKERS = ("/.dockerenv", "/run/.containerenv")
-
-#: Error codes and exception types that mean *the credentials went stale* rather
-#: than *the answer is no*. Taken from ``var/account/s3_copy.py``, which learned
-#: them the long way on cross-account copies that outlive one credential window.
-CREDENTIAL_ERROR_CODES = frozenset({
-    "ExpiredToken",
-    "ExpiredTokenException",
-    "InvalidToken",
-    "TokenRefreshRequired",
-    "RequestExpired",
-    "RequestTimeTooSkewed",
-})
-CREDENTIAL_ERROR_TYPES = frozenset({
-    "CredentialRetrievalError",
-    "NoCredentialsError",
-    "PartialCredentialsError",
-    "TokenRetrievalError",
-    "UnauthorizedSSOTokenError",
-    "SSOTokenLoadError",
-    "SSOError",
-})
 
 #: The aspect names. Each is one string in **four** places: :attr:`AwsCheck.ASPECTS`,
 #: the child's ``name`` (and so its node path), the :data:`SUBNODES` key its
@@ -335,15 +274,44 @@ PIN_NOTE = ("Each line can be put into maintenance on its own — pin the line y
 
 #: Built-in display text for the aspect leaves this check emits — **type-inherent**,
 #: so it is written once here rather than copied into every deployment's config.
-#: `{account}`, `{regions}` and `{pin_note}` expand per node. A check config's
-#: `subnodes:` block replaces one of these, or extends it where it writes
-#: `{default}` into its own text; `nodes.yaml` still wins over both, per path.
-SUBNODES: dict[str, dict[str, str]] = {
+#: **Declared, not applied**: this map is handed to little-sister as
+#: ``subnode_defaults`` and the library resolves it against a deployment's
+#: `subnodes:` block — replacing one of these, or extending it where the config
+#: writes `{default}` — and the engine writes the result per subnode name.
+#: `nodes.yaml` still wins over both, per path. `{pin_note}` is a `label_tokens`
+#: entry, expanded in either text.
+#:
+#: **It says "this account" rather than naming one**, and that is the consequence
+#: of the library reading the block (little-sister ADR-0025, 2026-08-19 update): a
+#: label is resolved once per subnode *name*, and every account's `ec2` leaf is
+#: named `ec2`. Neither fact is lost — the leaf's parent node **is** the account
+#: and its card carries the regions this check reads for it, and each leaf's own
+#: `description` names the account too. A per-account sentence here would have had
+#: to be a per-account *label*, which is the one thing this shape does not have.
+#:
+#: **Four of the five entries also carry ``show_when_quiet``** (little-sister
+#: ADR-0063). Those four report a **roster** rather than a diagnosis: they name
+#: everything they found, every run, whether or not anything is wrong, so the list
+#: is read precisely *because* nothing is — which is what a dense dashboard takes
+#: away by folding a quiet leaf into a chip. That is a fact about the aspect, true
+#: in every installation, so it belongs in this map rather than in one deployment's
+#: `nodes.yaml`, where it took an entry per aspect **per account**; a deployment
+#: that disagrees writes `show_when_quiet: false` in its own `subnodes:` block, or
+#: per path in `nodes.yaml`, and both still win.
+#:
+#: **`cloudwatch` is deliberately absent, and it is the fifth.** It makes the
+#: opposite claim about its own lines: `show_healthy: false` drops the quiet ones
+#: rather than showing them, so what is left of its list already *is* the
+#: diagnosis. A check that has dropped its quiet lines has nothing to declare here.
+#: Four of five is also close to the ceiling of what this is for — dense mode buys
+#: its height back from the quiet nodes, and a fifth declaration would leave the
+#: mechanism nothing to compact.
+SUBNODES: dict[str, dict[str, object]] = {
     CLOUDWATCH: {
         "title": "CloudWatch alarms",
         "about": """\
-Every CloudWatch alarm in the **{account}** account ({regions}), metric and
-composite alike, with the state it is in. Alarms whose name contains one of the
+Every CloudWatch alarm in this account, metric and composite alike, with the
+state it is in. Alarms whose name contains one of the
 check's `ignore_name_patterns` are neither listed nor counted. The first line
 says how many alarms were seen at all, which is the reading that catches a
 credential that has quietly stopped seeing anything.
@@ -354,9 +322,9 @@ credential that has quietly stopped seeing anything.
     EC2: {
         "title": "EC2 instances",
         "about": """\
-The EC2 instances in the **{account}** account ({regions}), grouped by their
-`Name` tag: one line per name, with how many instances carry it and how long the
-**oldest** of them has been up — `prometheus: 1 (12d)`.
+The EC2 instances in this account, grouped by their `Name` tag: one line per
+name, with how many instances carry it and how long the **oldest** of them has
+been up — `prometheus: 1 (12d)`.
 
 Two things turn a line red, and they are different questions. **Age** is the
 security reading: an instance is patched by being replaced, so one that has run
@@ -373,12 +341,15 @@ for about an hour and would report a duplicate that no longer exists.
 
 {pin_note}
 """,
+        # An inventory: one line per instance name, read *because* nothing is
+        # wrong. It keeps its box in a dense view (little-sister ADR-0063).
+        "show_when_quiet": True,
     },
     LAMBDA: {
         "title": "Lambda functions",
         "about": """\
-Every Lambda function in the **{account}** account ({regions}), one line each,
-with how its newest invocation went. Two independent readings meet on that line:
+Every Lambda function in this account, one line each, with how its newest
+invocation went. Two independent readings meet on that line:
 the **`Errors` metric** for the most recent period CloudWatch still has data for,
 and the **status word of the last log event** — `REPORT` for a clean finish,
 `ERROR` for a runtime failure that the metric may not have caught up with yet.
@@ -391,13 +362,15 @@ says.
 
 {pin_note}
 """,
+        # A roster: which functions exist at all, and when each last ran, is the
+        # reading — so it is read while everything is fine (ADR-0063).
+        "show_when_quiet": True,
     },
     CODEPIPELINE: {
         "title": "CodePipeline",
         "about": """\
-Every CodePipeline pipeline in the **{account}** account ({regions}), one line
-each, showing what its **most recent execution** did and when that execution
-started.
+Every CodePipeline pipeline in this account, one line each, showing what its
+**most recent execution** did and when that execution started.
 
 `Succeeded` passes, `InProgress` warns while it is in flight, and everything
 else — `Failed`, `Stopped`, `Stopping`, `Cancelled`, `Superseded` — is an error,
@@ -411,12 +384,15 @@ It has nothing to report, which is itself the report.
 
 {pin_note}
 """,
+        # A roster: every pipeline every run, with what it last did. Which
+        # pipelines exist is half of what a reader came for (ADR-0063).
+        "show_when_quiet": True,
     },
     BATCH: {
         "title": "AWS Batch",
         "about": """\
-The AWS Batch job queues in the **{account}** account ({regions}) and the jobs
-in them, one line per job *name* per queue — jobs are submitted over and over
+The AWS Batch job queues in this account and the jobs in them, one line per job
+*name* per queue — jobs are submitted over and over
 under the same name, so the name is the thing worth watching and a single
 submission is not.
 
@@ -433,6 +409,9 @@ is of the newest ones only.
 
 {pin_note}
 """,
+        # A roster: which job names a queue is carrying, and what each is doing,
+        # is worth a glance while nothing is failing (ADR-0063).
+        "show_when_quiet": True,
     },
 }
 
@@ -718,174 +697,6 @@ class BatchConfig(_Shortened):
         return any(pattern in lowered for pattern in self.ignore_queue_patterns)
 
 
-# --- renewing an expired SSO login ------------------------------------------
-#
-# A named profile is normally an SSO profile, and an SSO login expires — eight
-# hours by default, i.e. once a working day. Everything *inside* that window
-# botocore already handles: the short-lived role credentials behind the profile
-# are refreshed silently, and this check builds a fresh session per run anyway,
-# so it picks them up for free. What is left is the outer window, where the only
-# fix is a human at a browser — and on a developer's machine that is a command
-# this process can run itself. `var/account/s3_copy.py` does exactly this for a
-# long copy; the difference here is that a *check* runs unattended, every minute,
-# possibly on a server, so the same idea needs three guards it does not: a
-# capability test (:func:`login_capability`), a timeout, and a cooldown.
-
-
-@dataclass(frozen=True)
-class SsoConfig:
-    """The ``sso:`` block: whether, and how hard, to renew a login."""
-
-    login: str = SSO_LOGIN_AUTO
-    timeout_seconds: int = DEFAULT_SSO_LOGIN_TIMEOUT_SECONDS
-    cooldown_seconds: int = DEFAULT_SSO_LOGIN_COOLDOWN_SECONDS
-
-
-def is_credential_error(error: BaseException) -> bool:
-    """True when *error* means the credentials went stale rather than that AWS
-    said no. The two need opposite answers: a stale credential is worth renewing
-    and retrying, an ``AccessDenied`` is worth reporting."""
-    if type(error).__name__ in CREDENTIAL_ERROR_TYPES:
-        return True
-    if isinstance(error, ClientError):
-        code_value = error.response.get("Error", {}).get("Code", "")
-        return code_value in CREDENTIAL_ERROR_CODES
-    return False
-
-
-def login_capability(*, profile: str, profile_config: Mapping[str, Any],
-                     aws_cli: str | None, environ: Mapping[str, str],
-                     platform: str, container: bool) -> str:
-    """Why ``aws sso login`` could not work here — or ``""`` when it could.
-
-    This is what ``login: auto`` asks before it shells out, and it is a **pure
-    function of what it looks at** on purpose: the answer is a sentence the
-    dashboard prints, so it is a sentence worth testing directly, and each
-    reason below is somebody's actual machine rather than a hypothetical.
-
-    The order is most-informative first. A missing profile is asked about before
-    anything else, because without one there is no login to renew and no way to
-    tell whether the ambient credentials even come from SSO.
-    """
-    if not profile:
-        return "no profile is configured, so there is no named login to renew"
-    if not (profile_config.get("sso_session") or profile_config.get("sso_start_url")):
-        return f"profile {profile} is not an SSO profile"
-    if not aws_cli:
-        return "the aws CLI is not on PATH"
-    for marker in CLOUD_MARKERS:
-        if environ.get(marker):
-            return (f"{marker} is set, so these credentials come from the "
-                    f"platform and renew themselves")
-    if container:
-        return "this is a container, where nobody would see the browser"
-    if platform not in ("darwin", "win32") and not (
-            environ.get("DISPLAY") or environ.get("WAYLAND_DISPLAY")):
-        return "there is no display here to open a browser on"
-    return ""
-
-
-def in_container() -> bool:
-    """True inside Docker or Podman. Its own function because it is the one
-    machine fact :func:`login_capability` cannot be handed as a string."""
-    return any(Path(marker).exists() for marker in CONTAINER_MARKERS)
-
-
-def login_command(profile: str) -> str:
-    """The command a human would run — printed on the node when we cannot."""
-    return f"aws sso login --profile {profile}" if profile else "aws sso login"
-
-
-def run_sso_login(profile: str, timeout: int) -> str:
-    """Run one ``aws sso login``. ``""`` when it succeeded, else why it did not.
-
-    Never ``shell=True`` and never a composed string: *profile* comes from a
-    config file, and a config file is not a thing to interpolate into a shell.
-    """
-    command = ["aws", "sso", "login"] + (["--profile", profile] if profile else [])
-    logger.info("aws: renewing the SSO login (%s)", login_command(profile))
-    try:
-        completed = subprocess.run(command, capture_output=True, text=True,
-                                   timeout=timeout, check=False)
-    except FileNotFoundError:
-        return "the aws CLI is not on PATH"
-    except OSError as error:
-        return f"`{login_command(profile)}` could not be started: {plain(error)}"
-    except subprocess.TimeoutExpired:
-        return (f"`{login_command(profile)}` was still waiting after "
-                f"{format_span(timeout)} and was stopped")
-    if completed.returncode != 0:
-        lines = (completed.stderr or completed.stdout or "").strip().splitlines()
-        detail = lines[-1].strip() if lines else f"exit {completed.returncode}"
-        # The CLI's own words, folded into a reason that is rendered as Markdown
-        # (little-sister ADR-0018) — escaped like any other captured output.
-        return f"`{login_command(profile)}` failed: {plain(detail[:200])}"
-    logger.info("aws: the SSO login for %s was renewed",
-                profile or "the default profile")
-    return ""
-
-
-@dataclass(frozen=True)
-class _Attempt:
-    """When a login was last tried for a profile, and how it went."""
-
-    at: float
-    problem: str
-
-
-class SsoLogins:
-    """``aws sso login`` bookkeeping, shared by every check in the process.
-
-    The browser and the SSO token cache belong to the **machine**, not to a
-    check. Two checks pointed at one profile must not both open a login, and the
-    cooldown that stops a browser re-opening every minute has to be the same one
-    for both — a per-check attribute would give each of them their own. So this
-    is deliberately module state, one instance (:data:`SSO_LOGINS`) keyed by
-    profile name, and the per-profile lock is what serialises the two accounts
-    of one profile that go stale in the same run.
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._locks: dict[str, threading.Lock] = {}
-        self._last: dict[str, _Attempt] = {}
-
-    def _profile_lock(self, profile: str) -> threading.Lock:
-        with self._lock:
-            return self._locks.setdefault(profile, threading.Lock())
-
-    def forget(self) -> None:
-        """Drop every recorded attempt, so the next call may log in again."""
-        with self._lock:
-            self._last.clear()
-
-    def renew(self, profile: str, *, timeout: int, cooldown: int,
-              login: Callable[[str, int], str] = run_sso_login,
-              clock: Callable[[], float] = time.monotonic) -> str:
-        """Renew *profile*'s login. ``""`` when it is worth retrying AWS now.
-
-        Inside *cooldown* seconds of the previous attempt the previous verdict is
-        returned **without running anything**. That covers both directions: a
-        login that nobody completed is not re-opened a minute later, and a login
-        that just succeeded is not run twice because a second account noticed the
-        same expiry.
-        """
-        with self._profile_lock(profile):
-            previous = self._last.get(profile)
-            if previous is not None and clock() - previous.at < cooldown:
-                if previous.problem:
-                    return (f"{previous.problem} (not tried again within "
-                            f"{format_span(cooldown)})")
-                return ""
-            problem = login(profile, timeout)
-            self._last[profile] = _Attempt(clock(), problem)
-            return problem
-
-
-#: The one instance. Module state, for the reason :class:`SsoLogins` gives.
-SSO_LOGINS = SsoLogins()
-
-
 def _flag(value: object, where: str) -> bool:
     """A configuration boolean that must actually be one.
 
@@ -926,52 +737,81 @@ def _parse_regions(value: object, where: str) -> tuple[str, ...]:
     return regions
 
 
-def _parse_profile(value: object, where: str) -> str:
-    """An ``~/.aws/config`` profile name.
+def _parse_profile(entry: Mapping[str, Any], where: str) -> str:
+    """An ``~/.aws/config`` profile name, or ``""`` where none is written.
 
-    Refused characters, and why there is a rule at all: the name is printed back
-    to the operator **inside a Markdown code span** (``aws sso login --profile
-    …``), and it is passed to a subprocess. A backtick would break out of the
-    first; a newline would make the printed command a different command from the
-    one that runs. Neither is a legal profile name anyway.
+    The optional-string reading is the identity seam's
+    (`identity.parse_optional_text`): a key written and left empty is a typo,
+    not "no profile" — reading it as unset is how a check silently falls back
+    to whatever ``AWS_PROFILE`` happens to say — and a value that is not text
+    is the same typo family, refused rather than stringified.
+
+    What stays here is the **ban**, and why there is one at all: the name is
+    printed back to the operator **inside a Markdown code span** (``aws sso
+    login --profile …``), and it is passed to a subprocess. A backtick would
+    break out of the first; a newline would make the printed command a
+    different command from the one that runs. Neither is a legal profile name
+    anyway.
     """
-    profile = str(value).strip()
-    if not profile:
-        raise CheckError(f"{where} must not be empty")
+    try:
+        profile = parse_optional_text(entry, "profile", where=where)
+    except OptionalTextError as error:
+        if error.kind == "not-text":
+            raise CheckError(f"{where} must be text, got "
+                             f"{type(error.got).__name__}") from error
+        raise CheckError(f"{where} must not be empty") from error
     if any(ch in profile for ch in "`\n\r"):
         raise CheckError(f"{where} must not contain a backtick or a newline")
     return profile
 
 
-def _parse_sso(value: object) -> SsoConfig:
-    """The ``sso:`` block — whether the check may renew an expired login."""
-    if value is None:
-        return SsoConfig()
-    if not isinstance(value, dict):
-        raise CheckError("aws 'sso' must be a mapping")
-    known = {"login", "timeout", "cooldown"}
-    unknown = sorted(str(key) for key in value if str(key) not in known)
-    if unknown:
-        raise CheckError(
-            f"unknown key(s) in 'sso': {', '.join(unknown)} "
-            f"(it takes: {', '.join(sorted(known))})")
-    login = str(value.get("login", SSO_LOGIN_AUTO)).strip().lower()
-    if login not in SSO_LOGIN_MODES:
-        raise CheckError(
-            f"aws 'sso.login' must be one of {', '.join(SSO_LOGIN_MODES)} "
-            f"(got {login!r})")
-    timeout = parse_duration(value.get("timeout"),
-                             DEFAULT_SSO_LOGIN_TIMEOUT_SECONDS)
-    if timeout <= 0:
+#: The subject of every ``sso:`` sentence below, and the ``where`` the shared
+#: reader stamps on its own factual line — one spelling, so the two cannot
+#: disagree about which block they mean.
+_SSO_WHERE = "aws 'sso'"
+
+
+def _sso_message(error: SsoBlockError) -> str:
+    """This check's sentence for one refused ``sso:`` block.
+
+    The block's one reader (`identity.parse_sso_block`) hands back parts; the
+    words are this check's own and stay here, because the other packages that
+    read the same block pin sentences that disagree with these on purpose —
+    a wording that lived in the reader would be somebody's broken suite the
+    day anyone harmonized it.
+    """
+    if error.kind == "not-a-mapping":
+        return f"{_SSO_WHERE} must be a mapping"
+    if error.kind == "unknown-keys":
+        return (f"unknown key(s) in {_SSO_WHERE}: {', '.join(error.unknown)} "
+                f"(it takes: {', '.join(error.accepted)})")
+    if error.kind == "not-a-mode":
+        return (f"{_SSO_WHERE}.login must be one of "
+                f"{', '.join(error.accepted)} (got {error.got!r})")
+    if error.kind == "not-a-duration":
+        return f"{_SSO_WHERE}.{error.key}: {error.problem}"
+    if error.kind == "not-positive":
         # Zero would not mean "no timeout" here, it would mean "kill it before
         # it starts" — and an unbounded login holds an engine worker forever.
-        raise CheckError("aws 'sso.timeout' must be greater than zero")
-    cooldown = parse_duration(value.get("cooldown"),
-                             DEFAULT_SSO_LOGIN_COOLDOWN_SECONDS)
-    if cooldown < 0:
-        raise CheckError("aws 'sso.cooldown' must not be negative")
-    return SsoConfig(login=login, timeout_seconds=timeout,
-                     cooldown_seconds=cooldown)
+        return f"{_SSO_WHERE}.timeout must be greater than zero"
+    if error.kind == "negative":
+        return f"{_SSO_WHERE}.cooldown must not be negative"
+    return str(error)  # a kind this check has no sentence for yet
+
+
+def _parse_sso(value: object) -> SsoConfig:
+    """The ``sso:`` block — whether the check may renew an expired login.
+
+    Reading it is `identity.parse_sso_block`'s job; what stays here is what is
+    the check's alone — its budget (the `SsoConfig` defaults: a generous
+    window and a cooldown, both spent on an engine worker), and its refusals,
+    worded above and raised as the `CheckError` that pins this check and
+    nothing else.
+    """
+    try:
+        return parse_sso_block(value, where=_SSO_WHERE)
+    except SsoBlockError as error:
+        raise CheckError(_sso_message(error)) from error
 
 
 def _parse_accounts(value: object) -> tuple[Account, ...]:
@@ -1000,14 +840,12 @@ def _parse_accounts(value: object) -> tuple[Account, ...]:
                 f"(an account takes: {', '.join(sorted(known))})")
         seen.add(name)
         regions = entry.get("regions")
-        profile = entry.get("profile")
         accounts.append(Account(
             name=name,
             role_arn=str(entry.get("role_arn", "")).strip(),
             regions=(() if regions is None
                      else _parse_regions(regions, f"account {name!r} 'regions'")),
-            profile=("" if profile is None
-                     else _parse_profile(profile, f"account {name!r} 'profile'")),
+            profile=_parse_profile(entry, f"account {name!r} 'profile'"),
             title=str(entry.get("title", "")),
             about=str(entry.get("about", "")),
         ))
@@ -1349,13 +1187,16 @@ class AwsCheck(Check):
                  codepipeline: CodePipelineConfig | None = None,
                  batch: BatchConfig | None = None,
                  shorten: tuple[tuple[str, str], ...] = (),
-                 subnodes: dict[str, dict[str, str]] | None = None,
                  access_key_ref: str = "", secret_key_ref: str = "",
                  **kwargs: Any) -> None:
         # `**kwargs` and nothing spelled out: the fields every check shares grow,
         # and a constructor that names them stops binding when the next one lands
-        # (little-sister ADR-0049).
-        super().__init__(**kwargs)
+        # (little-sister ADR-0049). The two declarations beside it are this type's
+        # half of the `subnodes:` block: it states the text it ships and the token
+        # that text reuses, and little-sister does the reading and the resolving
+        # (its ADR-0025, 2026-08-19 update).
+        super().__init__(subnode_defaults=SUBNODES,
+                         label_tokens={"pin_note": PIN_NOTE}, **kwargs)
         self.accounts = accounts
         self.regions = regions
         self.role_session_name = role_session_name
@@ -1378,7 +1219,6 @@ class AwsCheck(Check):
         # it is what `config_summary()` reports, and reporting the resolved copy
         # from one aspect would name a rule the others might not be using.
         self.shorten = shorten
-        self.subnodes = subnodes or {}
         # Static keys are the exception, not the rule — the ambient chain (an
         # instance profile, a task role, an SSO session) is how this normally runs.
         # Resolved **here**, once, from the reference the config names, never
@@ -1397,7 +1237,6 @@ class AwsCheck(Check):
         if not sts_region:
             raise CheckError("aws 'sts_region' must not be empty")
         regions = config.get("regions")
-        profile = config.get("profile")
         accounts = _parse_accounts(config.get("accounts"))
         # Parsed before the aspects, because each of them inherits it.
         shorten = _parse_shorten(config.get("shorten"))
@@ -1407,8 +1246,7 @@ class AwsCheck(Check):
                         else _parse_regions(regions, "aws 'regions'")),
             "role_session_name": session_name,
             "sts_region": sts_region,
-            "profile": ("" if profile is None
-                        else _parse_profile(profile, "aws 'profile'")),
+            "profile": _parse_profile(config, "aws 'profile'"),
             "sso": _parse_sso(config.get("sso")),
             "cloudwatch": _parse_cloudwatch(config.get("cloudwatch")),
             "ec2": _parse_ec2(config.get("ec2")),
@@ -1417,7 +1255,6 @@ class AwsCheck(Check):
                 config.get("codepipeline"), shorten),
             "batch": _parse_batch(config.get("batch"), shorten),
             "shorten": shorten,
-            "subnodes": parse_subnodes(config),
         }
         blocks = (extra["cloudwatch"], extra["ec2"], extra["lambda_"],
                   extra["codepipeline"], extra["batch"])
@@ -1541,7 +1378,20 @@ class AwsCheck(Check):
         if per_account:
             return "per-account profiles: " + ", ".join(
                 plain(name) for name in per_account)
-        return "configured keys" if self.access_key else "ambient credential chain"
+        if self.access_key:
+            return "configured keys"
+        return f"ambient credential chain{self._ambient_note()}"
+
+    def _ambient_note(self) -> str:
+        """`` (AWS_PROFILE=…)``, where the environment names one — else ``""``.
+
+        A card that says only "ambient credential chain" is honest and unhelpful
+        at the one moment it matters: an `AWS_PROFILE` exported for something else
+        entirely is then quietly deciding which identity assumes these roles, and
+        `role cannot be assumed` is the first anybody hears of it.
+        """
+        variable, profile = ambient_profile(os.environ)
+        return f" ({variable}={plain(profile)})" if profile else ""
 
     def _sso_summary(self) -> str | None:
         """What this check would do about an expired login, decided **now** —
@@ -1563,117 +1413,74 @@ class AwsCheck(Check):
         return (f"`{login_command(profile)}` on expiry, at most once every "
                 f"{format_span(self.sso.cooldown_seconds)}")
 
-    def _meta(self, name: str, account: Account) -> tuple[str, str]:
-        """The (title, about) for aspect ``name`` under ``account``: this type's
-        built-in :data:`SUBNODES` text, which the config's `subnodes:` block
-        replaces — or extends, where it writes `{default}` (ADR-0025)."""
-        default = SUBNODES.get(name, {})
-        configured = self.subnodes.get(name, {})
-        tokens = {"account": account.name,
-                  "regions": ", ".join(self.regions_for(account)),
-                  "pin_note": PIN_NOTE}
-        return (resolve_text(configured.get("title", ""),
-                             default.get("title", ""), tokens),
-                resolve_text(configured.get("about", ""),
-                             default.get("about", ""), tokens))
-
     # --- the session seam -------------------------------------------------
+    #
+    # What a session *is* lives in :mod:`little_sister_aws.identity`, because a
+    # deployment resolving an AWS-backed secret reference opens one before any
+    # check exists. What lives here is the check's own composition: an account's
+    # identity is its own profile over the check's, its own role, and the
+    # check's session name and STS region.
 
     def _new_session(self, *, aws_access_key_id: str = "",
                      aws_secret_access_key: str = "",
                      aws_session_token: str = "",
                      profile_name: str = "") -> Session:
-        """The one place a boto3 session is built — and so the one seam a test
-        replaces. Empty credentials mean the ambient chain; an empty profile
-        means whichever one that chain would pick for itself."""
-        return boto3.Session(
-            aws_access_key_id=aws_access_key_id or None,
-            aws_secret_access_key=aws_secret_access_key or None,
-            aws_session_token=aws_session_token or None,
-            profile_name=profile_name or None)
+        """The one place this check builds a boto3 session — and so the one seam
+        a test replaces. It is a method rather than the module function it calls
+        for exactly that reason: a fake belongs to one check, not to a process."""
+        return new_session(aws_access_key_id=aws_access_key_id,
+                           aws_secret_access_key=aws_secret_access_key,
+                           aws_session_token=aws_session_token,
+                           profile_name=profile_name)
+
+    def identity_for(self, account: Account) -> Identity:
+        """How *account* is read: its profile or the check's, its role if it
+        names one, and the check's session name and STS region.
+
+        Static keys travel with it and lose to a profile, which is what
+        :func:`~little_sister_aws.identity.base_session` decides — a check that
+        configured both cannot exist, because `_extra_from_config` refuses it.
+        """
+        return Identity(profile=self.profile_for(account),
+                        access_key=self.access_key,
+                        secret_key=self.secret_key,
+                        role_arn=account.role_arn,
+                        role_session_name=self.role_session_name,
+                        sts_region=self.sts_region)
 
     def _base_session(self) -> Session:
-        """The session the roles are assumed *from*.
-
-        Three sources, and they are ordered by how specific they are. A profile
-        wins because it is the one that was written down here; static keys are
-        next; the ambient chain is what is left, and is still the normal case on
-        a server. A profile and static keys together cannot reach this method —
-        `_extra_from_config` refuses that config.
-        """
-        if self.profile:
-            return self._new_session(profile_name=self.profile)
-        if self.access_key and self.secret_key:
-            return self._new_session(aws_access_key_id=self.access_key,
-                                     aws_secret_access_key=self.secret_key)
-        return self._new_session()
-
-    def _base_for(self, base: Session, account: Account) -> Session:
-        """The session *this* account is read through: the check's, unless the
-        account named a profile of its own. Building one per account only where
-        an account asked for one keeps the shared case one session, which is
-        what it was before profiles existed."""
-        if account.profile:
-            return self._new_session(profile_name=account.profile)
-        return base
-
-    def _session_for(self, base: Session, account: Account) -> Session:
-        """One account's session, assuming its role when it names one."""
-        if not account.role_arn:
-            return base
-        sts = base.client("sts", region_name=self.sts_region)
-        credentials = sts.assume_role(
-            RoleArn=account.role_arn,
-            RoleSessionName=self.role_session_name)["Credentials"]
-        return self._new_session(
-            aws_access_key_id=credentials["AccessKeyId"],
-            aws_secret_access_key=credentials["SecretAccessKey"],
-            aws_session_token=credentials["SessionToken"])
+        """The session the roles are assumed *from*, built once per run and
+        shared by every account that did not name a profile of its own."""
+        return base_session(
+            Identity(profile=self.profile, access_key=self.access_key,
+                     secret_key=self.secret_key),
+            factory=self._new_session)
 
     def _opened(self, base: Session, account: Account) -> Session:
-        """One account's session with its credentials **proven**.
+        """One account's session with its credentials proven.
 
-        Assuming the role is itself the proof where there is a role: it is a
-        call, and stale credentials fail it. A profile-only account touches AWS
-        nowhere until an aspect does, so one `sts:GetCallerIdentity` is spent
-        here to force the question — which is what makes an expired login *this
-        account's node*, once, instead of three aspects each reporting the same
-        thing in their own words. Nothing is spent where no profile is
-        configured: that path is exactly as it was.
+        *base* is passed only where the account inherits the check's identity.
+        An account with a profile of its own gets a session built for that
+        profile instead — building one per account only where an account asked
+        for one keeps the shared case one session, which is what it was before
+        profiles existed.
         """
-        session = self._session_for(self._base_for(base, account), account)
-        if not account.role_arn and self.profile_for(account):
-            session.client("sts",
-                           region_name=self.sts_region).get_caller_identity()
-        return session
+        return open_session(self.identity_for(account),
+                            base=None if account.profile else base,
+                            factory=self._new_session)
 
     # --- renewing an expired login ----------------------------------------
 
     def _profile_config(self, profile: str) -> Mapping[str, Any]:
-        """What ``~/.aws/config`` says about *profile*, or nothing if it says
-        nothing. Its own seam, so a test can answer for a machine it is not
-        running on."""
-        try:
-            scoped = botocore.session.Session(profile=profile).get_scoped_config()
-        except BotoCoreError:      # ProfileNotFound, an unreadable config file
-            return {}
-        return dict(scoped)
+        """What ``~/.aws/config`` says about *profile*. Its own seam, so a test
+        can answer for a machine it is not running on."""
+        return read_profile_config(profile)
 
     def _login_problem(self, profile: str) -> str:
         """Why an automatic login could not happen for *profile* — ``""`` when
-        it could. The whole environment is read here and nowhere else, so
-        :func:`login_capability` stays a pure function of its arguments."""
-        if self.sso.login == SSO_LOGIN_NEVER:
-            return "automatic login is off (`sso: login: never`)"
-        if self.sso.login == SSO_LOGIN_ALWAYS:
-            return ""
-        return login_capability(
-            profile=profile,
-            profile_config=self._profile_config(profile),
-            aws_cli=shutil.which("aws"),
-            environ=os.environ,
-            platform=sys.platform,
-            container=in_container())
+        it could, this check's `sso:` block deciding."""
+        return login_problem(profile, self.sso,
+                             profile_config=self._profile_config)
 
     def _sso_login(self, profile: str, timeout: int) -> str:
         """The one place a subprocess is started — and so the one seam a test
@@ -1681,7 +1488,12 @@ class AwsCheck(Check):
         return run_sso_login(profile, timeout)
 
     def _renew(self, account: Account) -> str:
-        """Renew this account's login. ``""`` when AWS is worth asking again."""
+        """Renew this account's login. ``""`` when AWS is worth asking again.
+
+        The budget is this check's: a login runs on an engine worker thread, so
+        what it may cost is the check's `sso:` block and not the process's idea
+        of a reasonable wait.
+        """
         profile = self.profile_for(account)
         problem = self._login_problem(profile)
         if problem:
@@ -1819,13 +1631,11 @@ class AwsCheck(Check):
         reason = [*failures, *entries, self._scope_entry(len(found), regions)]
         reason.sort(key=lambda entry: _CODE_RANK.get(
             entry.code or StatusCode.OK, 3))
-        title, about = self._meta(CLOUDWATCH, account)
         # No `code` of its own: the lines carry theirs, and declaring both is
         # refused at construction (little-sister ADR-0042).
         return CheckResult(reason=list(reason), name=CLOUDWATCH,
                            description=f"CloudWatch alarms in {account.name}",
-                           report=self._roster(found, show_region),
-                           title=title, about=about)
+                           report=self._roster(found, show_region))
 
     # --- the ec2 aspect ----------------------------------------------------
 
@@ -1863,12 +1673,10 @@ class AwsCheck(Check):
         reason = [*failures, *entries, self._instance_scope_entry(found, regions)]
         reason.sort(key=lambda entry: _CODE_RANK.get(
             entry.code or StatusCode.OK, 3))
-        title, about = self._meta(EC2, account)
         return CheckResult(reason=list(reason), name=EC2,
                            description=f"EC2 instances in {account.name}",
                            report=self._instance_roster(counts, ages,
-                                                        show_region),
-                           title=title, about=about)
+                                                        show_region))
 
     @staticmethod
     def _oldest(members: list[Instance], now: datetime) -> int | None:
@@ -2089,11 +1897,9 @@ class AwsCheck(Check):
         reason = [*failures, *entries, scope]
         reason.sort(key=lambda entry: _CODE_RANK.get(
             entry.code or StatusCode.OK, 3))
-        title, about = self._meta(LAMBDA, account)
         return CheckResult(reason=list(reason), name=LAMBDA,
                            description=f"Lambda functions in {account.name}",
-                           report=self._function_roster(readings, show_region),
-                           title=title, about=about)
+                           report=self._function_roster(readings, show_region))
 
     @staticmethod
     def _function_scope_entry(found: int, regions: tuple[str, ...]) -> Entry:
@@ -2219,11 +2025,9 @@ class AwsCheck(Check):
                   _scope_line("pipeline", len(readings), regions)]
         reason.sort(key=lambda entry: _CODE_RANK.get(
             entry.code or StatusCode.OK, 3))
-        title, about = self._meta(CODEPIPELINE, account)
         return CheckResult(reason=list(reason), name=CODEPIPELINE,
                            description=f"CodePipeline pipelines in {account.name}",
-                           report=self._pipeline_roster(readings, show_region),
-                           title=title, about=about)
+                           report=self._pipeline_roster(readings, show_region))
 
     @staticmethod
     def _pipeline_roster(readings: list[PipelineReading],
@@ -2473,24 +2277,73 @@ class AwsCheck(Check):
         reason = [*failures, *entries, _scope_line("job queue", queues, regions)]
         reason.sort(key=lambda entry: _CODE_RANK.get(
             entry.code or StatusCode.OK, 3))
-        title, about = self._meta(BATCH, account)
         return CheckResult(reason=list(reason), name=BATCH,
                            description=f"Batch job queues in {account.name}",
-                           report="\n".join(sorted(roster)),
-                           title=title, about=about)
+                           report="\n".join(sorted(roster)))
 
     # --- the tree ---------------------------------------------------------
 
-    def _account_result(self, base: Session, account: Account) -> CheckResult:
-        """One account's node: its aspects, or the reason there are none."""
+    def _credentials_for(self, account: Account) -> str:
+        """Which credentials *this* account was read with, for a log line.
+
+        Not :meth:`_credentials_summary`, which answers the same question for the
+        card: that one is check-wide, and its text is escaped for Markdown
+        because a card renders it. A log line wants one account's answer, and
+        wants it greppable.
+        """
+        profile = self.profile_for(account)
+        if profile:
+            return f"profile {profile}"
+        if self.access_key:
+            return "configured keys"
+        return f"the ambient credential chain{self._ambient_note()}"
+
+    def _log_unreadable(self, base: Session, account: Account,
+                        failure: list[str]) -> None:
+        """Say, in the log, that this account could not be looked at.
+
+        **A check that ran and graded badly is reporting; a check that could not
+        look is a different event**, and until this it made no sound at all — the
+        engine's own line says the check completed, because it did, and the
+        refusal lived only on a card somebody had to go and open.
+
+        The line carries the three facts that identify the problem together, and
+        are useless apart: what was attempted, **who we actually were**, and what
+        AWS said. The middle one is the one no configuration can supply and the
+        one a refusal does not always contain — see
+        :func:`~little_sister_aws.identity.caller_identity`, which is why this
+        spends a call here and nowhere else.
+        """
+        target = (f"assuming {account.role_arn}" if account.role_arn
+                  else f"reading account {account.name!r} directly")
+        proven = caller_identity(base, sts_region=self.sts_region)
+        as_whom = f" as {proven}" if proven else ""
+        logger.error("%s: account %r could not be read — %s with %s%s failed: %s",
+                     self.path, account.name, target,
+                     self._credentials_for(account), as_whom, " ".join(failure))
+
+    def _account_result(self, base: Session, account: Account
+                        ) -> tuple[CheckResult, bool]:
+        """One account's node, and whether it could be **looked at** at all.
+
+        The second half is said rather than inferred. It was briefly read back
+        off the result — an ERROR node with no children — which is true today
+        only because this method builds exactly those two shapes, and a mutation
+        that broke the inference changed no behavior at all: proof that the
+        caller was relying on a coincidence rather than on an answer. The
+        distinction matters too much to rest on that. It is the whole difference
+        between *this check measured and did not like what it saw* and *this
+        check could not measure*.
+        """
         session, failure = self._open(base, account)
         if session is None:
+            self._log_unreadable(base, account, failure)
             # This account's problem, and this account's node. The others keep
             # reporting, which is the whole reason the tree branches here.
             return CheckResult(
                 StatusCode.ERROR, failure,
                 name=account.name, title=account.title, about=account.about,
-                config=self._account_config(account))
+                config=self._account_config(account)), False
         builders = {CLOUDWATCH: self._cloudwatch_aspect,
                     EC2: self._ec2_aspect,
                     LAMBDA: self._lambda_aspect,
@@ -2504,7 +2357,7 @@ class AwsCheck(Check):
         return CheckResult(StatusCode.OK, [], name=account.name,
                            children=children, title=account.title,
                            about=account.about,
-                           config=self._account_config(account))
+                           config=self._account_config(account)), True
 
     def _open(self, base: Session, account: Account
               ) -> tuple[Session | None, list[str]]:
@@ -2573,8 +2426,9 @@ class AwsCheck(Check):
         profile = self.profile_for(account)
         if account.role_arn:
             return (f"assumed role, from profile {plain(profile)}" if profile
-                    else "assumed role")
-        return f"profile {plain(profile)}" if profile else "ambient credential chain"
+                    else f"assumed role, from the ambient chain{self._ambient_note()}")
+        return (f"profile {plain(profile)}" if profile
+                else f"ambient credential chain{self._ambient_note()}")
 
     def _scope_reason(self) -> str:
         pairs = sum(len(self.regions_for(account)) for account in self.accounts)
@@ -2599,10 +2453,22 @@ class AwsCheck(Check):
                 StatusCode.ERROR,
                 [f"no usable AWS credentials: {plain(error)}"],
                 report=self._scope_report())
-        children = tuple(self._account_result(base, account)
-                         for account in self.accounts)
-        logger.info("%s: read %d account(s): %s", self.path, len(children),
+        # An account that could not be looked at at all — not one whose aspects
+        # graded badly, which is an ordinary reading and says so on its own node.
+        # `2 of 2` is the shape of a credential problem and `1 of 3` the shape of
+        # one account's policy, so the count is itself a diagnosis.
+        read = [self._account_result(base, account) for account in self.accounts]
+        children = tuple(result for result, _ in read)
+        unreadable = [result.name for result, looked in read if not looked]
+        # "in scope", not "read": this line is the roster, and directly under a
+        # run where every account was refused, "read 2 account(s)" was a claim
+        # the very next line contradicted.
+        logger.info("%s: %d account(s) in scope: %s", self.path, len(children),
                     ", ".join(account.name for account in self.accounts))
+        if unreadable:
+            logger.error("%s: %d of %d account(s) could not be read: %s",
+                         self.path, len(unreadable), len(children),
+                         ", ".join(unreadable))
         # The root stays OK and says only what is watched: an account that failed
         # is red on its own node and reaches this container by roll-up, so
         # repeating it here would report one fact twice.

@@ -1,0 +1,242 @@
+# The `aws` check: one node per account, one node per aspect beneath it.
+#
+#   /team/aws
+#     /team/aws/live
+#       /team/aws/live/cloudwatch
+#       /team/aws/live/ec2
+#       /team/aws/live/lambda
+#       /team/aws/live/codepipeline
+#       /team/aws/live/batch
+#     /team/aws/backup
+#       …
+#
+# Account first because the account is what you act on as a group: one maintenance
+# pin on /team/aws/live silences a migration, where the same thing on a flat list of
+# alarms would be one pin per alarm.
+#
+# Every value below is a placeholder. This file is the *shape* — every key the type
+# accepts, with a comment saying what it decides — not anybody's configuration.
+type: aws
+path: /team/aws
+title: AWS
+about: |
+  The team's AWS accounts, one node each.
+frequency: 60s
+timeout: 120s
+
+# --- Credentials -------------------------------------------------------------
+# With no `secrets:` block the ambient AWS credential chain is used — an instance
+# profile, a task role, an SSO session, or the AWS_* variables — and each account's
+# role is assumed from it. That is the normal path on a server.
+#
+# secrets:                       # only for static keys; see below
+#   access_key_id: env://AWS_ACCESS_KEY_ID
+#   secret_access_key: env://AWS_SECRET_ACCESS_KEY
+#
+# `profile` names the ~/.aws/config profile the roles are assumed **from**: it says
+# from where and `role_arn` says into what, and the two compose. Unset, nothing
+# moves — boto3 reads the ambient chain, AWS_PROFILE included. It is **mutually
+# exclusive with a `secrets:` block**, because a profile carries its own credentials
+# and a config naming both has said two things about which estate it watches.
+#
+# profile: my-sso-profile
+
+# --- Renewing an expired SSO login -------------------------------------------
+# An SSO login expires about once a working day. Inside that window botocore
+# refreshes the role credentials by itself; outside it the fix is a human at a
+# browser — a command this process can run, but only on a machine where that
+# browser exists. `auto` works that out and says on the card what it decided: it
+# declines on a server, in a container, without the `aws` CLI, on platform-supplied
+# credentials, and where no profile is configured.
+#
+# sso:
+#   login: auto      # auto (default) | always (skip the question) | never
+#   timeout: 2m      # one login is stopped after this — it holds a worker thread
+#   cooldown: 10m    # and not retried for this long, per profile, process-wide
+
+# --- Defaults every account inherits -----------------------------------------
+regions: [eu-central-1]
+# role_session_name: little-sister   # the default; it is what CloudTrail shows
+# sts_region: eu-central-1           # where the AssumeRole call itself is made
+
+# --- The accounts ------------------------------------------------------------
+# `name` is the node's path segment: keep it stable, because every maintenance pin
+# under this check hangs off it. `role_arn` may be omitted for an account reachable
+# with the ambient credentials directly. `regions` and `profile` each **replace**
+# the default rather than adding to it. `title` / `about` are this installation's
+# own words for the account.
+accounts:
+  - name: live
+    role_arn: arn:aws:iam::000000000000:role/application/monitoring-role
+    about: |
+      Everything customer-facing runs here.
+
+  - name: backup
+    role_arn: arn:aws:iam::000000000001:role/application/monitoring-role
+    regions: [eu-west-1]           # replaces the default, does not add to it
+    title: Backup (Ireland)
+
+# --- The aspects -------------------------------------------------------------
+# Each block opens with `enabled:`. Off, the aspect emits no node **and makes no
+# API call** — which is what a role whose policy does not carry that service needs.
+# An aspect that says nothing is on; switching *all* of them off is refused at
+# startup; and the check's card names what is off, because an absent node otherwise
+# reads exactly like a broken check.
+
+cloudwatch:
+  enabled: true
+
+  # Alarm-name **substrings**, case-insensitive — not a regex. An ignored alarm is
+  # out of scope: it leaves the lines and the count.
+  ignore_name_patterns: [targettracking, autoscaling-lifecycle]
+
+  # An alarm whose name starts with this is tagged on its line, with the prefix
+  # itself as the word — `tag_prefix: "sre-"` tags a matching alarm `(sre)`. Empty
+  # by default: an alarm naming convention belongs to the estate being watched,
+  # not to the check type.
+  tag_prefix: ""
+
+  # Composite alarms are read as well and tagged. `describe_alarms` returns only
+  # metric alarms unless asked, which is an easy blind spot to inherit.
+  include_composite: true
+
+  # Healthy alarms are not listed — an OK line per alarm is a hundred lines saying
+  # nothing. The first line still says how many were seen.
+  show_healthy: false
+
+  # Warn when an account sees fewer alarms than this. Cannot be 0: a check that
+  # expects nothing cannot notice that it saw nothing.
+  expect_min_alarms: 1
+
+  # StateValue -> the code that line reports. INSUFFICIENT_DATA warns rather than
+  # passing: an alarm with no data is usually an alarm whose metric stopped
+  # arriving, and OK made that invisible.
+  state_map:
+    ALARM: ERROR
+    INSUFFICIENT_DATA: WARN
+    OK: OK
+
+ec2:
+  enabled: true
+
+  # Not an instance any more. A terminated one lingers in the API for about an
+  # hour, and counting it would report a duplicate that no longer exists. A
+  # **stopped** one is deliberately still counted — it is the leftover being looked
+  # for. Add `stopped` here to disagree.
+  ignore_states: [terminated, shutting-down]
+
+  # Instance-name substrings to skip, case-insensitive. Autoscaled fleets are the
+  # usual reason to fill it.
+  ignore_name_patterns: []
+
+  # How many instances may share a `Name` tag before the line warns.
+  max_per_name: 1
+
+  # How long an instance may run before its line turns **red**. A security reading,
+  # not a tidiness one: an instance is patched by being replaced. It applies to a
+  # single tidy instance too, and outranks the duplicate warning.
+  max_age: 14d
+
+  # More instances than this under one name is not a duplicate — it is a deliberate
+  # fleet, judged by how long it has been up rather than by how many it is...
+  fleet_size: 10
+  # ...and it gets this clock instead of `max_age`. The oldest member decides, so a
+  # rolling fleet cannot reset it.
+  fleet_max_age: 4h
+
+lambda:
+  enabled: true
+
+  # Whole function names to skip — not substrings.
+  ignore: []
+
+  # An error older than this is reported but not graded: by then CloudWatch has
+  # condensed it into a bucket with the successful runs around it, so the count no
+  # longer means "the last run failed".
+  error_max_age: 14d
+
+  # Read the newest log event per function and take its status word (REPORT, END,
+  # ERROR, …). Two API calls per function per run — the expensive half of this
+  # aspect. Set false to grade on the metric alone.
+  read_log_status: true
+
+codepipeline:
+  enabled: true
+
+  ignore_name_patterns: []
+
+  # How long a *successful* run stays evidence that the pipeline still works. Past
+  # this the line warns instead. It only ever downgrades an OK: a month-old failure
+  # is still a failure.
+  max_age: 31d
+
+  # PipelineExecutionStatus -> the code that line reports, matched case-insensitively.
+  # A pipeline that has never been executed warns rather than being left out.
+  state_map:
+    Succeeded: OK
+    InProgress: WARN
+    Failed: ERROR
+    Stopped: ERROR
+    Stopping: ERROR
+    Cancelled: ERROR
+    Superseded: ERROR
+
+batch:
+  enabled: true
+
+  ignore_name_patterns: []
+  ignore_queue_patterns: []
+
+  # Whether a queue holding no jobs at all warns.
+  expect_jobs: true
+
+  # How long a job may RUN before its line warns. A running job is not a fault by
+  # itself, and a permanent yellow is a light people stop reading. The oldest
+  # running job decides, so a queue that keeps starting fresh ones cannot reset it.
+  max_run_time: 2h
+
+  # How long a job may sit RUNNABLE — accepted by the queue, waiting for capacity
+  # that has not appeared — before its line warns. Measured from submission,
+  # because such a job has never started.
+  max_wait_time: 30m
+
+  # How many jobs are read per queue per status, newest first. Reaching this bound
+  # is said out loud on the queue's line rather than silently truncating.
+  max_jobs: 100
+
+# --- Display-name substitutions ----------------------------------------------
+# Applied in order to the names the `lambda`, `codepipeline` and `batch` aspects
+# print — an organization's naming, so it lives here rather than in the type. An
+# aspect that writes its own `shorten:` replaces this list outright; `shorten: []`
+# inside an aspect opts that aspect out. The **slug keeps the full name**, so
+# editing these cannot re-point a maintenance pin.
+shorten:
+  - {from: "-pipeline"}
+  - {from: "-lambda"}
+  - {from: "-reporter", to: "-rp"}
+
+# --- Display text for the aspect leaves (title / about) ----------------------
+# Built into the type, so it is not copied per account. Add a `subnodes:` block
+# only to change one: your text replaces the built-in default, or extends it where
+# you write {default} inside your own. little-sister itself reads this block, so
+# an entry here applies to the leaf of that name under **every** account this
+# check watches — the built-in text names no account for the same reason.
+#
+# subnodes:
+#   batch:
+#     about: |
+#       {default}
+#
+#       Our nightly ETL runs here; a failure before 06:00 is worth a page.
+#
+# The same block carries `show_when_quiet`, and this type already declares it for
+# `ec2`, `lambda`, `batch` and `codepipeline`: those four report a roster — every
+# instance, function, queue or pipeline they found, whether or not anything is
+# wrong — so a dense dashboard must not fold their lines away for being quiet
+# (little-sister ADR-0063). `cloudwatch` deliberately does not declare it: with
+# `show_healthy: false` above it drops its quiet lines instead of showing them.
+# You need write nothing for any of this. To decline one, say so:
+#
+# subnodes:
+#   ec2:
+#     show_when_quiet: false
