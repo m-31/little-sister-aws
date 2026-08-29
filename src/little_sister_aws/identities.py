@@ -17,6 +17,15 @@ secret and never carries a credential:
 
     token: aws-ssm-live:///team/github/token
 
+**Every field is optional except that the entry must say something.** An identity
+that names only a ``region`` is the shape a server wants: read *this* store, in
+*this* region, as whatever this host is already authorized as — an instance role,
+a task role, keys in the environment. It is not the plain schemes wearing a name,
+because the plain schemes read the store the host's environment implies and this
+one does not; and it is what lets a deployment that runs on a laptop and in a
+cloud account commit one reference for both, with only the ``aws.yaml`` differing.
+An entry that names nothing at all — no profile, no role, no region — is refused.
+
 The identity goes in the scheme rather than in the address because no separator
 survives both stores: a cross-account Secrets Manager id is an **ARN**, which
 carries ``:``, while Parameter Store takes a bare name and refuses an ARN
@@ -208,13 +217,26 @@ def _identity(name: str, entry: object, *, path: Path) -> NamedIdentity:
                            or DEFAULT_ROLE_SESSION_NAME),
         sts_region=(_text(entry, "sts_region", where=where)
                     or DEFAULT_STS_REGION))
-    if not identity.profile and not identity.role_arn:
+    region = _text(entry, "region", where=where)
+    # **An identity that names only a region is legal, and it is not the ambient
+    # chain wearing a name.** The region is the difference: the plain schemes read
+    # the store the host's environment implies, and `region:` says which store to
+    # read whatever the host implies — a Parameter Store name in another region is
+    # another parameter (ADR-0002 §9). That is what lets one committed reference
+    # mean *read as this profile* on a laptop and *read as whatever this instance
+    # already is* on a server, which is where the identity **name** earns its keep:
+    # only the `aws.yaml` differs between those two, never the reference.
+    #
+    # What stays refused is an entry that names **nothing at all** — no profile, no
+    # role, no region. That one really is the plain scheme under another name, and
+    # it is almost always a block somebody meant to fill in.
+    if not identity.profile and not identity.role_arn and not region:
         raise IdentityConfigError(
-            f"{where} names neither a profile nor a role, so it is the ambient "
-            "chain under another name — use the plain 'aws-sm://' and "
-            "'aws-ssm://' schemes for that")
-    return NamedIdentity(name=name, identity=identity,
-                         region=_text(entry, "region", where=where),
+            f"{where} names nothing — no profile, no role and no region — so it is "
+            "the ambient chain under another name. Give it a 'region:' if what is "
+            "meant is 'this store, read as whatever this host already is', or use "
+            "the plain 'aws-sm://' and 'aws-ssm://' schemes")
+    return NamedIdentity(name=name, identity=identity, region=region,
                          sso=_sso(entry.get("sso"), where=where))
 
 
@@ -248,7 +270,12 @@ def load_identities(spec: str | Path | None = None) -> dict[str, NamedIdentity]:
 
 
 def declare_aspect() -> None:
-    """Claim ``config/aws.yaml`` before the first configuration scan."""
+    """Claim ``config/aws.yaml`` before anything reads it.
+
+    Not a courtesy: little-sister resolves an aspect through its own table, so a
+    read of an undeclared name raises rather than reporting no file at all
+    (little-sister ADR-0035).
+    """
     register_aspect(ASPECT)
 
 

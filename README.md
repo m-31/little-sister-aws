@@ -248,7 +248,7 @@ uv sync --frozen                     # the environment, from uv.lock
 
 # What the hook runs, in this order:
 uv run ruff check
-uv run shellcheck $(git ls-files -- '*.sh' 'hooks/pre-commit' 'release/hooks/pre-commit')
+uv run shellcheck $(git ls-files -- '*.sh' 'hooks/pre-commit')
 uv run mypy
 uv run mypy --python-version 3.11    # against the floor, not the interpreter you have
 uv run pytest -q
@@ -271,6 +271,10 @@ suite replaces it.
 - [`docs/adr/0002-aws-secret-references.md`](docs/adr/0002-aws-secret-references.md) —
   the secret-reference grammar: the strict stores, JSON Pointer selection, and why
   a reading identity is a scheme rather than part of the address.
+- [`docs/adr/0003-a-graded-threshold-is-a-pair-and-a-rule-owns-names.md`](docs/adr/0003-a-graded-threshold-is-a-pair-and-a-rule-owns-names.md)
+  — how this type grades: a threshold is a warn/error pair with a sentence, a rule
+  owns a set of names and overrides the block's limits for them, and the package
+  ships no thresholds of its own.
 
 ## License
 

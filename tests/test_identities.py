@@ -17,6 +17,7 @@ from little_sister_aws.identities import (
 from little_sister_aws.identity import (
     DEFAULT_ROLE_SESSION_NAME,
     DEFAULT_STS_REGION,
+    login_problem,
 )
 
 ROLE = "arn:aws:iam::000000000000:role/monitoring-role"
@@ -84,12 +85,46 @@ def test_a_profile_alone_is_an_identity(tmp_path: Path) -> None:
     assert identity["local"].identity.role_arn == ""
 
 
-def test_an_identity_that_names_nothing_is_refused(tmp_path: Path) -> None:
-    """Neither a profile nor a role is the ambient chain wearing a name, and a
-    reference through it would read whatever the process happens to be — the
-    exact confusion these identities exist to end."""
-    with pytest.raises(IdentityConfigError, match="ambient chain under another"):
-        load_identities(_root(tmp_path, "live:\n  region: eu-west-1\n"))
+def test_an_identity_may_name_only_the_region_its_store_is_in(
+        tmp_path: Path) -> None:
+    """The shape a server wants: read *this* store, in *this* region, as whatever
+    this host is already authorized as.
+
+    It is not the plain schemes wearing a name, and the region is the whole
+    difference — those read the store the environment implies, and this one says
+    which store to read whatever the environment implies. That is what lets one
+    committed reference mean *as this profile* on a laptop and *as this instance*
+    on a server: only the `aws.yaml` differs, never the reference."""
+    identity = load_identities(_root(tmp_path, "live:\n  region: eu-west-1\n"))
+
+    assert identity["live"].region == "eu-west-1"
+    assert identity["live"].identity.profile == ""
+    assert identity["live"].identity.role_arn == ""
+
+
+def test_an_identity_that_names_nothing_at_all_is_refused(tmp_path: Path) -> None:
+    """No profile, no role and no region really is the ambient chain wearing a
+    name — and far more often it is a block somebody meant to fill in. The
+    refusal says both ways out rather than only what is wrong."""
+    with pytest.raises(IdentityConfigError, match="names nothing") as raised:
+        load_identities(_root(tmp_path, "live: {}\n"))
+
+    assert "region" in str(raised.value)
+    assert "aws-ssm://" in str(raised.value)
+
+
+def test_a_region_only_identity_renews_no_login(tmp_path: Path) -> None:
+    """Its `sso:` block still parses — the shape of the file does not change with
+    the identity's — but there is no named login behind it, so `login: auto`
+    declines rather than shelling out. An ambient chain on a server is not
+    renewed by a browser."""
+    identity = load_identities(_root(
+        tmp_path, "live:\n  region: eu-west-1\n  sso:\n    timeout: 10s\n"))
+
+    assert identity["live"].sso.timeout_seconds == 10
+    assert "no named login to renew" in login_problem(
+        identity["live"].identity.profile, identity["live"].sso,
+        profile_config=lambda _: {})
 
 
 @pytest.mark.parametrize("name", ["Live", "live_one", "1live", "aws sm", ""])

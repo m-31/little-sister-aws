@@ -125,34 +125,97 @@ ec2:
   # for. Add `stopped` here to disagree.
   ignore_states: [terminated, shutting-down]
 
-  # Instance-name substrings to skip, case-insensitive. Autoscaled fleets are the
-  # usual reason to fill it.
-  ignore_name_patterns: []
+  # Every threshold below is a **pair** — a warning level and an error level — and
+  # a level that is not written here is not graded at all. This check ships no
+  # thresholds of its own: what a name may carry and how long a box may run are
+  # facts about an estate, not about the type, so an `ec2:` block that sets none of
+  # them lists instances and colors nothing (and says so once, in the log).
+  #
+  # The comparison is *more than*, so `max_per_name_warn: 1` warns at two — and
+  # `0` is how you ask to hear about any instance under a name at all.
 
-  # How many instances may share a `Name` tag before the line warns.
-  max_per_name: 1
+  # How many instances may share a `Name` tag.
+  max_per_name_warn: 1
+  max_per_name_error: 8
+  # What the line says when one of those levels fires. A number decides the color;
+  # this decides whether a reader knows what to do about it.
+  max_per_name_reason: "A second box under this name is usually a deploy that did not clean up."
 
-  # How long an instance may run before its line turns **red**. A security reading,
-  # not a tidiness one: an instance is patched by being replaced. It applies to a
-  # single tidy instance too, and outranks the duplicate warning.
-  max_age: 14d
+  # How long the oldest instance under a name may have been up. A security reading,
+  # not a tidiness one: an instance is patched by being replaced, so this applies to
+  # a single tidy instance too.
+  max_age_warn: 31d
+  max_age_error: 40d
+  max_age_reason: "The instance is too old to have the latest patch levels."
 
-  # More instances than this under one name is not a duplicate — it is a deliberate
-  # fleet, judged by how long it has been up rather than by how many it is...
-  fleet_size: 10
-  # ...and it gets this clock instead of `max_age`. The oldest member decides, so a
-  # rolling fleet cannot reset it.
-  fleet_max_age: 4h
+  # The levels above are the **net**: what this check says about a name that
+  # matches no rule below. Rules give a set of names its own limits.
+  #
+  # They are consulted in order and the **first** one that matches decides, whole:
+  # an exception is a rule written above the rule it excepts, and there is no
+  # negation key. A judgment a rule does not mention is inherited from the net,
+  # whole — write either level of a pair and the rule owns that pair.
+  #
+  # The limits apply to **each** matching name on its own, never to their sum: two
+  # load tests carrying 10 and 12 boxes are two lines against the levels below,
+  # not 22 against them.
+  rules:
+    # Scratch boxes: neither graded nor listed, and not counted in scope. First,
+    # so nothing below sees them.
+    - name: scratch
+      prefixes: [tmp-, scratch-]
+      ignore: true
+
+    # A fleet is a *name*, now that there is a matcher: many is fine, many for
+    # hours is a load test nobody tore down.
+    - name: load tests
+      prefixes: [loadtest-]
+      regexes: ['^perf-[0-9]{8}$']
+      max_per_name_warn: 15
+      max_age_warn: 2h
+      max_age_error: 4h
+      max_age_reason: "A load test nobody tore down is the expensive kind of leftover."
+
+    # The same count of two, a different finding — which is the whole point of
+    # writing a sentence beside a number.
+    - name: grafana
+      prefixes: [grafana-]
+      max_per_name_warn: 1
+      max_per_name_error: 2
+      max_per_name_reason: "A second one can come from an autostart; two is the most this may ever be."
+      # the age pair is inherited from the net above
+
+    - name: the single-volume boxes
+      names: [licence-server, build-cache]
+      max_per_name_error: 1
+      max_per_name_reason: "This name owns a single block device — a second instance cannot have attached it."
+      # Kept deliberately old: there is no infinity to compare against, only a
+      # comparison that does not happen. The line still shows the age; it is
+      # simply never colored by it.
+      max_age: null
+
+    # The instances nobody named, addressed as what they are rather than by the
+    # placeholder text the card prints for them.
+    - name: unnamed instances
+      unnamed: true
+      max_per_name_error: 1
+      max_per_name_reason: "An instance with no Name tag belongs to nobody."
+
+    # No sentence written yet, so a line this rule colors says `the build agents`
+    # — the rule's name, which at least says where the decision was made.
+    - name: the build agents
+      prefixes: [jenkins-agent]
+      max_per_name_error: 6
 
 lambda:
   enabled: true
 
-  # Whole function names to skip — not substrings.
-  ignore: []
-
   # An error older than this is reported but not graded: by then CloudWatch has
   # condensed it into a bucket with the successful runs around it, so the count no
-  # longer means "the last run failed".
+  # longer means "the last run failed". A **gate**, not a threshold with levels —
+  # it decides whether the newest error is graded at all — and it keeps a default
+  # where the other aspects' clocks have none, because where the window ends is a
+  # fact about CloudWatch rather than about your estate.
   error_max_age: 14d
 
   # Read the newest log event per function and take its status word (REPORT, END,
@@ -160,15 +223,61 @@ lambda:
   # aspect. Set false to grade on the metric alone.
   read_log_status: true
 
+  # Whether a function nobody has invoked in the retention window is a finding.
+  # True for a scheduled job; a rule turns it off for handlers that run when
+  # somebody calls them.
+  expect_invocations: true
+
+  # What a line says when it is graded. `error_reason` when the function is red
+  # for errors, `silent_reason` when it warns for never being invoked.
+  error_reason: "Check the dead-letter queue before retrying."
+  silent_reason: "This runs on a schedule; silence means it did not run."
+
+  # A set of functions with its own answers. Same shape as the rules above:
+  # checked in order, first match decides, a key not named here is inherited, and
+  # `ignore: true` drops those functions entirely — which is what this aspect's
+  # old `ignore:` list of whole names did.
+  rules:
+    - name: retired handlers
+      prefixes: [old-]
+      ignore: true
+
+    - name: on-demand handlers
+      prefixes: [api-]
+      expect_invocations: false    # called by somebody, not by a schedule
+
+    - name: the nightly batch
+      prefixes: [batch-]
+      error_max_age: 30d           # it runs rarely; grade an error for longer
+      read_log_status: false       # and do not pay two API calls for it
+
 codepipeline:
   enabled: true
 
-  ignore_name_patterns: []
+  # How long a *successful* run stays evidence that the pipeline still works, as a
+  # pair of levels with no defaults — how long a success lasts depends on how often
+  # the pipeline is meant to run, which is a fact about your estate. It only ever
+  # downgrades an OK: a month-old failure is already the finding.
+  max_age_warn: 31d
+  max_age_error: 90d
+  max_age_reason: "Nobody has released through this pipeline in months."
 
-  # How long a *successful* run stays evidence that the pipeline still works. Past
-  # this the line warns instead. It only ever downgrades an OK: a month-old failure
-  # is still a failure.
-  max_age: 31d
+  # A set of pipelines with its own clock. Same shape as the `ec2` rules above:
+  # checked in order, first match decides, a level not named here is inherited
+  # from the levels above, and `ignore: true` drops those pipelines entirely
+  # (which is what this aspect's old `ignore_name_patterns` did).
+  rules:
+    - name: sandboxes
+      prefixes: [sandbox-]
+      ignore: true
+
+    - name: nightly builds
+      prefixes: [nightly-]
+      max_age_warn: 36h            # it runs every night; a day and a half is late
+
+    - name: release pipelines
+      prefixes: [release-]
+      max_age: null                # runs when we release, so never stale
 
   # PipelineExecutionStatus -> the code that line reports, matched case-insensitively.
   # A pipeline that has never been executed warns rather than being left out.

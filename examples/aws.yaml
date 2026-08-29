@@ -21,11 +21,14 @@
 # (`AWS_PROFILE`, an SSO session, an instance profile), which is what a deployment
 # did before identities existed.
 #
-# Every key is optional except that an identity must name a `profile:` or a
-# `role_arn:` (both, where a role is assumed *from* a profile). An unknown key, a key
-# written and left empty, or a name that could not be a scheme — anything but
-# lower-case letters, digits and hyphens, starting with a letter — refuses the start
-# rather than quietly reading a credential from somewhere else.
+# Every key is optional except that an identity must name **something** — a
+# `profile:`, a `role_arn:`, a `region:`, or any combination of the three (a profile
+# and a role together, where the role is assumed *from* the profile). An entry that
+# names none of them is refused: with nothing of its own to say it really is the plain
+# scheme wearing a name, and it is far more often a block somebody meant to fill in.
+# An unknown key, a key written and left empty, or a name that could not be a scheme —
+# anything but lower-case letters, digits and hyphens, starting with a letter —
+# refuses the start rather than quietly reading a credential from somewhere else.
 #
 # Every value below is a placeholder. This file is the *shape* — every key, with a
 # comment saying what it decides — not anybody's configuration.
@@ -63,3 +66,18 @@ backup:
   profile: primary-admin
   role_arn: arn:aws:iam::000000000001:role/monitoring-role
   region: eu-west-1
+
+cloud:
+  # An identity may name **only** the region its store is in, and that is the shape a
+  # server wants: read *this* store, in *this* region, as whatever this host is
+  # already authorized as — an instance role, a task role, keys in the environment.
+  # There is nothing to assume and no profile to name, so there is nothing to write.
+  #
+  # It is not the plain schemes wearing a name, and the region is the whole
+  # difference: those read the store the host's environment implies, and this one says
+  # which store to read whatever the environment implies. So it is what lets a
+  # deployment that runs on a laptop and in a cloud account commit **one** set of
+  # references for both — the same `aws-ssm-cloud://…` in every check config, with
+  # only this file differing: a `profile:` here on the laptop, this entry on the
+  # instance whose own role is already exactly right.
+  region: eu-central-1

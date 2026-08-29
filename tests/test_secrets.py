@@ -433,9 +433,12 @@ def test_without_a_region_the_session_decides(
 def test_registration_declares_the_aspect_it_is_about_to_read(
         monkeypatch: pytest.MonkeyPatch, config_root: Path) -> None:
     """`config/aws.yaml` cannot be looked for until the aspect is declared, and
-    the declaration has to happen in this slot — before the first configuration
-    scan (ADR-0035). A registration that read the file without declaring it would
-    work only because something else had already claimed the name."""
+    the declaration has to happen in this slot — before anything reads it, which
+    here is the very next line (little-sister ADR-0035). Undeclared, the lookup
+    does not come back empty: little-sister resolves an aspect through its own
+    table, so the name missing from it raises `KeyError`. A registration that read
+    the file without declaring it would work only because something else had
+    already claimed the name."""
     monkeypatch.setattr(config_dir, "ASPECTS", dict(config_dir.BUILTIN_ASPECTS))
     monkeypatch.setattr(config_dir, "_ASPECT_OWNERS", {})
     _sessions(monkeypatch)

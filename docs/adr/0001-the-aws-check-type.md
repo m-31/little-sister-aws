@@ -1,7 +1,7 @@
 # ADR-0001 — The `aws` check type: account nodes, aspect leaves, and boto3
 
 - **Status:** Accepted
-- **Date:** 2026-08-23 (the type was accepted 2026-08-10)
+- **Date:** 2026-08-23 (the type was accepted 2026-08-09)
 - **Related:** [ADR-0002](0002-aws-secret-references.md) (the secret references the
   identities on this package's seam are read with), little-sister **ADR-0042**
   (coded entries), little-sister **ADR-0043** / **ADR-0044** (the coverage reading

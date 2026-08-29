@@ -332,9 +332,10 @@ def register_aws_secret_resolvers(
     loudly, rather than one check pinned to a puzzle.
     """
     if identities is None:
-        # The aspect has to be declared before anything asks for its file, and
-        # this call *is* the import-before-app slot little-sister ADR-0035 means
-        # by "before the first configuration scan".
+        # The aspect has to be declared before anything asks for its file — the
+        # next line included, which would otherwise raise rather than find nothing
+        # — and this call *is* the import-before-app slot little-sister ADR-0035
+        # means.
         declare_aspect()
         identities = load_identities()
     declared = identities

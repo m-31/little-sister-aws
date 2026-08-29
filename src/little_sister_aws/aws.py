@@ -39,7 +39,7 @@ import logging
 import os
 import re
 import urllib.parse
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -63,6 +63,17 @@ from little_sister.reasons import slug
 from little_sister.spans import coarse_span, format_span
 from little_sister.status import StatusCode
 
+from little_sister_aws._rules import (
+    UNGRADED,
+    Rule,
+    Threshold,
+    parse_pair,
+    parse_rules,
+    resolved,
+    rule_for,
+    sentence_for,
+    threshold_keys,
+)
 from little_sister_aws.identity import (
     DEFAULT_ROLE_SESSION_NAME,
     DEFAULT_STS_REGION,
@@ -166,20 +177,19 @@ DEFAULT_EC2_IGNORE_STATES = ("terminated", "shutting-down")
 #: one line per instance: twenty unnamed boxes are a single fact.
 NO_NAME_TAG = "(no Name tag)"
 
-#: How long an instance may run before its line turns red. An instance is patched
-#: by being replaced, so age *is* the security reading: a box that has not been
-#: rebooted in a fortnight is running a fortnight-old kernel, whatever the
-#: dashboard says about its metrics.
-DEFAULT_MAX_AGE_SECONDS = 14 * 86400
+#: There is no default age, and no default count. An instance is patched by being
+#: replaced, so age *is* the security reading — but how long a box may run before
+#: that reading is a finding is a fact about somebody's estate, and this package has
+#: never seen it. What survives as a default is what is true of **AWS**
+#: (``DEFAULT_EC2_IGNORE_STATES`` above), never what is true of an installation.
 
-#: More instances than this under one name is not a duplicate, it is a **fleet** —
-#: a load test, a batch expansion, something deliberate. A fleet is judged by how
-#: long it has been up rather than by how many it is.
-DEFAULT_FLEET_SIZE = 10
-
-#: How long a fleet may run before its line turns red. Hours, not weeks: a fleet
-#: nobody tore down is the expensive kind of leftover.
-DEFAULT_FLEET_MAX_AGE_SECONDS = 4 * 3600
+#: There is no fleet size and no fleet clock any more. A group larger than some
+#: number used to be read as a deliberate fleet and judged by a shorter clock —
+#: which keyed on the *reading* rather than on the name, and could therefore only
+#: ever be one rule for every estate. A known fleet is a name a rule matches
+#: (`prefixes: [loadtest-]`), and an unknown one is what the block's own levels are
+#: for: they are not "sensible numbers for everything", they are what the check
+#: says about a name nobody has classified.
 
 #: CloudWatch keeps one-minute points for 15 days, five-minute for 63 and hourly
 #: for 455, and returns nothing at all outside the window it is asked for. So a
@@ -220,10 +230,11 @@ DEFAULT_PIPELINE_STATE_MAP = {
     "superseded": StatusCode.ERROR,
 }
 
-#: How long a pipeline may coast on a successful run before that success stops
-#: being evidence that it still works. A month is roughly "nobody has released
-#: since the last release cycle".
-DEFAULT_PIPELINE_MAX_AGE_SECONDS = 31 * 86400
+#: There is no default staleness clock, for the same reason the EC2 aspect has no
+#: default age: how long a successful run stays evidence that a pipeline still
+#: works depends on how often it is meant to run — nightly, at a release, on a
+#: pull request — which is an installation's fact to state and this package's to
+#: grade once stated.
 
 #: How many executions of one pipeline are read to find the newest.
 #: ``list_pipeline_executions`` returns them newest first and caps a page at 100,
@@ -323,18 +334,71 @@ credential that has quietly stopped seeing anything.
         "title": "EC2 instances",
         "about": """\
 The EC2 instances in this account, grouped by their `Name` tag: one line per
-name, with how many instances carry it and how long the **oldest** of them has
-been up — `prometheus: 1 (12d)`.
+name, with how many boxes carry it and how long they have been up —
+`prometheus: 1 (12d)`.
 
-Two things turn a line red, and they are different questions. **Age** is the
-security reading: an instance is patched by being replaced, so one that has run
-past `max_age` is that far behind on kernel fixes — true of a single, perfectly
-tidy instance. **A fleet** — more instances under one name than `fleet_size` — is
-read as deliberate rather than as a duplicate and gets the shorter clock
-`fleet_max_age` instead: many is fine, many for hours is a load test nobody tore
-down. Short of both, a name carried by more instances than `max_per_name` warns,
-because a second box under a name that should be unique is usually a deploy that
-did not clean up after itself.
+Two independent judgments meet on that line, and they are different questions.
+**How many** boxes carry the name: a second one under a name that should be
+unique is usually a deploy that did not clean up after itself. **How old** the
+oldest of them is: an instance is patched by being replaced, so one that has run
+for a fortnight is a fortnight behind on kernel fixes — true of a single,
+perfectly tidy box. Each judgment has a warning level and an error level of its
+own, the worse of the two colors the line, and each may carry a sentence that
+rides on the line when it fires, because a number says how bad and never says
+what is wrong.
+
+```yaml
+max_per_name_warn: 1
+max_per_name_error: 8
+max_per_name_reason: "There should be only one of these."
+max_age_warn: 31d
+max_age_error: 40d
+max_age_reason: "Too old to have the latest patch levels."
+```
+
+**A level that is not configured is not graded, and this check ships none of
+them.** What a name may carry and how long a box may run are facts about your
+estate rather than about EC2, so the aspect lists instances and colors nothing
+until you say what to color; a `null` switches a judgment off again where a rule
+would otherwise supply one. The comparison is *more than*, so
+`max_per_name_warn: 1` warns at two — and `0` is how you ask to hear about any
+instance under a name at all.
+
+**`rules:` gives a set of names its own limits.** A rule owns names — exact
+`names:`, `prefixes:`, `regexes:`, or `unnamed: true` for the boxes nobody named
+— and carries the same keys as the block above it:
+
+```yaml
+rules:
+  - name: load tests
+    prefixes: [loadtest-]
+    max_per_name_warn: 15      # many is fine...
+    max_age_error: 4h          # ...but not for hours
+  - name: scratch
+    prefixes: [tmp-]
+    ignore: true               # neither listed nor counted
+```
+
+The **first** rule that matches a name decides, and only that one — so an
+exception is a rule written above the rule it excepts. A judgment a rule does not
+mention is inherited from the block **whole**, which is what lets a rule loosen
+one limit without restating the others. Its limits are applied to **each**
+matching name on its own, never to their sum: two load tests carrying ten and
+twelve boxes are two lines against the rule's levels, not twenty-two. A judgment
+that fires with no sentence of its own says the **rule's name** instead, which at
+least says which rule to look at.
+
+So a deliberate fleet is a *name* here, not a size — and the block's own levels
+are best read as **what this check says about a name no rule mentions**, rather
+than as sensible numbers for everything.
+
+Where a name carries several boxes, their ages are shown as a **range** whose
+shape follows what the numbers *print as* rather than how many boxes there are:
+boxes that all read alike are one value (`4 (16h)`), exactly two distinct
+readings are both shown (`2 (15h 3m, 15h 4m)` — two values are not an interval),
+and three or more become youngest to oldest (`4 (1m - 16h)`). A name being rolled
+and a name started once and left therefore read differently. The **oldest** is
+what the age is graded on.
 
 Terminated and shutting-down instances are not counted; they linger in the API
 for about an hour and would report a duplicate that no longer exists.
@@ -355,10 +419,36 @@ and the **status word of the last log event** — `REPORT` for a clean finish,
 `ERROR` for a runtime failure that the metric may not have caught up with yet.
 
 A function nobody has invoked in the retention window warns rather than passing:
-a silent scheduled job is not a healthy one. An error older than `error_max_age`
-is reported but not graded, because by then CloudWatch has condensed it into a
-bucket with the successful runs around it and the count no longer means what it
-says.
+a silent scheduled job is not a healthy one. A handler that runs only when
+somebody calls it is not, though, so `expect_invocations: false` — on the block
+or on a rule — says that silence here is fine.
+
+An error older than `error_max_age` is reported but not graded, because by then
+CloudWatch has condensed it into a bucket with the successful runs around it and
+the count no longer means what it says. That is a **gate**, not a threshold with
+levels: it decides whether the newest error is graded at all, and "warn at seven
+days, error at fourteen" is not a sentence about a gate. It keeps its default for
+the same reason — where the clock ends is a fact about CloudWatch rather than
+about your estate.
+
+`error_reason` and `silent_reason` are the sentences those two judgments say
+when they fire, and **`rules:` gives a set of functions its own** — matched by
+exact `names:`, by `prefixes:` or by `regexes:`, first match winning, a key the
+rule does not name inherited from the block:
+
+```yaml
+rules:
+  - name: on-demand handlers
+    prefixes: [api-]
+    expect_invocations: false     # called by somebody, not by a schedule
+  - name: the nightly batch
+    prefixes: [batch-]
+    error_max_age: 30d            # it runs rarely; grade an error for longer
+    read_log_status: false        # and do not pay two API calls for it
+  - name: retired
+    prefixes: [old-]
+    ignore: true                  # neither listed nor counted
+```
 
 {pin_note}
 """,
@@ -374,10 +464,30 @@ Every CodePipeline pipeline in this account, one line each, showing what its
 
 `Succeeded` passes, `InProgress` warns while it is in flight, and everything
 else — `Failed`, `Stopped`, `Stopping`, `Cancelled`, `Superseded` — is an error,
-because the newest thing the pipeline did was not a deployment. A success is
-also only good for so long: past `max_age` the line warns instead, on the
-grounds that a pipeline nobody has run in a month is a pipeline nobody knows
-still works.
+because the newest thing the pipeline did was not a deployment. `state_map:` is
+how an installation disagrees with any of that.
+
+**A success is also only good for so long.** Past `max_age_warn` the line warns
+and past `max_age_error` it burns, on the grounds that a pipeline nobody has run
+in months is a pipeline nobody knows still works; `max_age_reason` is the
+sentence that then rides on the line. Neither level has a default, because how
+long a success stays evidence depends on how often the pipeline is *meant* to run
+— and only a success is judged this way: a failure is already the finding.
+
+**`rules:` gives a set of pipelines its own clock**, matched by exact `names:`,
+by `prefixes:` or by `regexes:`. The first rule that matches decides, a rule that
+sets no level inherits the block's, and `ignore: true` drops those pipelines from
+the lines and from the count:
+
+```yaml
+rules:
+  - name: nightly builds
+    prefixes: [nightly-]
+    max_age_warn: 36h        # it runs every night
+  - name: release pipelines
+    prefixes: [release-]
+    max_age: null            # runs when we release; never stale
+```
 
 A pipeline that has **never been executed** warns rather than being left out.
 It has nothing to report, which is itself the report.
@@ -557,9 +667,61 @@ class _Shortened(_Aspect):
 class LambdaConfig(_Shortened):
     """The `lambda:` block."""
 
-    ignore: tuple[str, ...] = ()
+    #: How recent an error must be to be **graded** rather than merely reported.
+    #: It keeps its default where the other aspects' clocks lost theirs, and the
+    #: line is the one ADR-0003 draws: past this, CloudWatch has condensed the
+    #: count into a bucket with the successful runs around it, so the number no
+    #: longer means what it says. That is a fact about CloudWatch, not an opinion
+    #: about somebody's estate.
     error_max_age_seconds: int = DEFAULT_ERROR_MAX_AGE_SECONDS
     read_log_status: bool = True
+    #: Whether a function nobody has invoked in the retention window is a
+    #: finding. It is, for a scheduled job; it is not for a handler that runs
+    #: when somebody calls it, which is what a rule turns off.
+    expect_invocations: bool = True
+    error_reason: str = ""
+    silent_reason: str = ""
+    rules: tuple[Rule, ...] = ()
+
+    def rule_for(self, name: str) -> Rule | None:
+        return rule_for(self.rules, name)
+
+    def ignored(self, name: str) -> bool:
+        rule = self.rule_for(name)
+        return rule is not None and rule.ignore
+
+    def gate_for(self, rule: Rule | None) -> int:
+        """How recent an error must be to be graded, for this function.
+
+        Narrowed here rather than trusted: a rule's non-graded overrides are
+        carried as ``object``, and the parser is what makes them an ``int`` — so
+        this reads them back the way anything reads untyped configuration, and a
+        value of the wrong shape falls back rather than reaching a comparison.
+        """
+        own = None if rule is None else rule.value("error_max_age")
+        return own if isinstance(own, int) and not isinstance(own, bool) \
+            else self.error_max_age_seconds
+
+    def expects_invocations(self, rule: Rule | None) -> bool:
+        own = None if rule is None else rule.value("expect_invocations")
+        return own if isinstance(own, bool) else self.expect_invocations
+
+    def reads_log(self, rule: Rule | None) -> bool:
+        own = None if rule is None else rule.value("read_log_status")
+        return own if isinstance(own, bool) else self.read_log_status
+
+    def sentence(self, key: str, rule: Rule | None) -> str:
+        """The sentence for one of this aspect's judgments: the rule's, the
+        block's, or the rule's **name** — the same fallback a graded pair has,
+        because a line that says only "3 errors" leaves a reader with the same
+        question either way."""
+        own = None if rule is None else rule.value(key)
+        if isinstance(own, str) and own:
+            return own
+        block = self.error_reason if key == "error_reason" else self.silent_reason
+        if block:
+            return block
+        return rule.name if rule is not None else ""
 
 
 @dataclass(frozen=True)
@@ -567,38 +729,68 @@ class Ec2Config(_Aspect):
     """The `ec2:` block."""
 
     ignore_states: tuple[str, ...] = DEFAULT_EC2_IGNORE_STATES
-    ignore_name_patterns: tuple[str, ...] = ()
-    max_per_name: int = 1
-    max_age_seconds: int = DEFAULT_MAX_AGE_SECONDS
-    fleet_size: int = DEFAULT_FLEET_SIZE
-    fleet_max_age_seconds: int = DEFAULT_FLEET_MAX_AGE_SECONDS
+    per_name: Threshold = UNGRADED
+    age: Threshold = UNGRADED
+    rules: tuple[Rule, ...] = ()
+
+    @property
+    def grades(self) -> bool:
+        """Whether this block can color a line at all. An aspect that grades
+        nothing is a legal **inventory** — which names exist, how many boxes each
+        carries and how old they are, read while everything is fine — so it is not
+        refused; it is announced once, in the log, by the parser."""
+        return (self.per_name.grades or self.age.grades
+                or any(rule.ignore or rule.overrides for rule in self.rules))
+
+    def rule_for(self, name: str | None) -> Rule | None:
+        """The rule that owns this name, or ``None`` for a name nobody
+        classified — which is judged by the block's own levels."""
+        return rule_for(self.rules, name)
+
+    def thresholds_for(self, rule: Rule | None) -> tuple[Threshold, Threshold]:
+        """The count and age judgments in force for a group, after the one
+        matching rule has had its say. Inheritance is **by pair**: a rule that
+        wrote either level of a pair owns that pair whole, and a pair it did not
+        mention is this block's, whole."""
+        return (resolved(rule, "max_per_name", self.per_name),
+                resolved(rule, "max_age", self.age))
 
     def ignored_state(self, state: str) -> bool:
         return state.lower() in self.ignore_states
 
-    def ignored(self, name: str) -> bool:
-        lowered = name.lower()
-        return any(pattern in lowered for pattern in self.ignore_name_patterns)
+    def judge(self, name: str | None, count: int,
+              age: int | None) -> tuple[StatusCode, tuple[str, ...]]:
+        """One group's verdict, and the sentences behind it.
 
-    def code_for(self, count: int, age: int | None) -> StatusCode:
-        """One group's verdict, worst rule first.
+        Two independent judgments meet on one line and the **worse** of them wins,
+        which is how age used to outrank count and now needs no special case: a
+        count is a tidiness reading — something was left behind — while an age is a
+        **security** one, since an instance is patched by being replaced and one
+        that has run for a fortnight is a fortnight behind on kernel fixes, true of
+        a single, perfectly tidy instance.
 
-        Age outranks count because the two say different things. A count is a
-        tidiness reading — something was left behind. An age is a **security**
-        reading: an instance is patched by being replaced, so one that has run
-        for a fortnight is a fortnight behind on kernel fixes, and that is true
-        of a single, perfectly tidy instance.
+        Both judgments contribute their sentence when they fire, count first, so a
+        group that is both duplicated and old says both things rather than leaving
+        the reader to work out which limit the color came from. A judgment whose
+        levels carry no sentence falls back to **the name of the rule** that
+        supplied them: a worse sentence than one somebody wrote, and much better
+        than a bare color, because it says where in the config the decision was
+        made. With no rule there is nothing to name and nothing is added.
 
-        A group larger than ``fleet_size`` is read as a deliberate fleet rather
-        than as a duplicate, and gets the shorter clock: many is fine, many *for
-        hours* is a load test nobody tore down.
+        The limits are this group's alone. A rule matching a hundred names judges
+        each of them on its own count and its own oldest member; it never sums
+        them, because the reading is *this name carries too many boxes*.
         """
+        rule = self.rule_for(name)
+        per_name, aged_by = self.thresholds_for(rule)
+        code = per_name.code_for(count)
+        notes = [sentence_for(per_name, rule)] if code is not StatusCode.OK else []
         if age is not None:
-            limit = (self.fleet_max_age_seconds if count > self.fleet_size
-                     else self.max_age_seconds)
-            if age > limit:
-                return StatusCode.ERROR
-        return StatusCode.OK if count <= self.max_per_name else StatusCode.WARN
+            age_code = aged_by.code_for(age)
+            if age_code is not StatusCode.OK:
+                notes.append(sentence_for(aged_by, rule))
+            code = _worst(code, age_code)
+        return code, tuple(note for note in notes if note)
 
 
 @dataclass(frozen=True)
@@ -620,14 +812,23 @@ class PipelineReading:
 class CodePipelineConfig(_Shortened):
     """The `codepipeline:` block."""
 
-    ignore_name_patterns: tuple[str, ...] = ()
-    max_age_seconds: int = DEFAULT_PIPELINE_MAX_AGE_SECONDS
+    age: Threshold = UNGRADED
+    rules: tuple[Rule, ...] = ()
     state_map: dict[str, StatusCode] = field(
         default_factory=lambda: dict(DEFAULT_PIPELINE_STATE_MAP))
 
+    def rule_for(self, name: str) -> Rule | None:
+        return rule_for(self.rules, name)
+
     def ignored(self, name: str) -> bool:
-        lowered = name.lower()
-        return any(pattern in lowered for pattern in self.ignore_name_patterns)
+        rule = self.rule_for(name)
+        return rule is not None and rule.ignore
+
+    def age_for(self, rule: Rule | None) -> Threshold:
+        """The staleness judgment in force for one pipeline. A pipeline that runs
+        nightly and one that runs at a release are not stale at the same age,
+        which is the whole reason a rule can carry its own."""
+        return resolved(rule, "max_age", self.age)
 
     def code_for(self, status: str) -> StatusCode:
         # An unknown status is not a quiet OK, for the reason the alarm aspect
@@ -899,43 +1100,49 @@ def _parse_cloudwatch(value: object) -> CloudwatchConfig:
     )
 
 
+#: What the `ec2` aspect grades, and whether each is a duration — the argument
+#: the shared rule parser takes, so the vocabulary has one implementation and each
+#: aspect says only what it measures.
+EC2_PAIRS = (("max_per_name", False), ("max_age", True))
+
+
 def _parse_ec2(value: object) -> Ec2Config:
     if value is None:
         return Ec2Config()
     if not isinstance(value, dict):
         raise CheckError("aws 'ec2' must be a mapping")
-    known = {"enabled", "ignore_states", "ignore_name_patterns",
-             "max_per_name", "max_age", "fleet_size", "fleet_max_age"}
+    known = ({"enabled", "ignore_states", "rules", "max_per_name", "max_age"}
+             | threshold_keys("max_per_name") | threshold_keys("max_age"))
     unknown = sorted(str(key) for key in value if str(key) not in known)
     if unknown:
+        # The keys this replaced — `max_per_name`, `max_age`, `fleet_size`,
+        # `fleet_max_age`, `ignore_name_patterns` — arrive here, and they get the
+        # message any typo gets. Deliberate: nothing is owed to a config written
+        # against them, and a hint naming each replacement would be a permanent
+        # line in the parser for a one-time reading of one error.
         raise CheckError(
             f"unknown key(s) in 'ec2': {', '.join(unknown)} "
             f"(it takes: {', '.join(sorted(known))})")
-    maximum = value.get("max_per_name", 1)
-    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 1:
-        raise CheckError("ec2 'max_per_name' must be an integer of at least 1")
-    fleet = value.get("fleet_size", DEFAULT_FLEET_SIZE)
-    if isinstance(fleet, bool) or not isinstance(fleet, int) or fleet < 1:
-        raise CheckError("ec2 'fleet_size' must be an integer of at least 1")
-    max_age = parse_duration(value.get("max_age"), DEFAULT_MAX_AGE_SECONDS)
-    fleet_max_age = parse_duration(value.get("fleet_max_age"),
-                                   DEFAULT_FLEET_MAX_AGE_SECONDS)
-    for label, seconds in (("max_age", max_age),
-                           ("fleet_max_age", fleet_max_age)):
-        if seconds < 1:
-            raise CheckError(f"ec2 '{label}' must be a duration of at least 1s")
-    return Ec2Config(
+    settings = Ec2Config(
         enabled=_flag(value.get("enabled", True), "ec2.enabled"),
         ignore_states=_lowered_list(value.get("ignore_states"),
                                     "ec2 'ignore_states'",
                                     DEFAULT_EC2_IGNORE_STATES),
-        ignore_name_patterns=_lowered_list(
-            value.get("ignore_name_patterns"), "ec2 'ignore_name_patterns'", ()),
-        max_per_name=maximum,
-        max_age_seconds=max_age,
-        fleet_size=fleet,
-        fleet_max_age_seconds=fleet_max_age,
+        per_name=parse_pair(value, "max_per_name", "ec2") or UNGRADED,
+        age=parse_pair(value, "max_age", "ec2", duration=True) or UNGRADED,
+        rules=parse_rules(value.get("rules"), "ec2", EC2_PAIRS,
+                          allow_unnamed=True),
     )
+    if settings.enabled and not settings.grades:
+        # An omission logs; a contradiction refuses. Grading nothing is a coherent
+        # thing to ask for — the roster of names, counts and ages is half of what a
+        # reader came for — but it is more often somebody who has not noticed that
+        # this package ships no thresholds of its own.
+        logger.info("aws 'ec2': the aspect is enabled and grades nothing — no "
+                    "max_per_name_warn/_error or max_age_warn/_error is set, "
+                    "here or in a rule, so instances are listed and never "
+                    "colored")
+    return settings
 
 
 def _parse_shorten(value: object, where: str = "aws 'shorten'"
@@ -977,36 +1184,96 @@ def _inherited_shorten(value: dict[str, Any], where: str,
     return _parse_shorten(value.get("shorten"), where)
 
 
+#: What a `lambda:` block — and a rule inside it — may say beyond matching names.
+#: The aspect has **no graded pair**: `error_max_age` is a *gate* deciding whether
+#: the newest error is graded at all, not a threshold to split into levels, and
+#: "warn at seven days, error at fourteen" is not a sentence about a gate. What it
+#: takes from the vocabulary is the rules and the sentences (ADR-0003).
+LAMBDA_RULE_KEYS = ("error_max_age", "read_log_status", "expect_invocations",
+                    "error_reason", "silent_reason")
+
+
+def _sentence(block: dict[str, Any], key: str, where: str) -> str:
+    """One configured sentence, refused when it is written and empty."""
+    value = block.get(key)
+    if value is None:
+        return ""
+    if not isinstance(value, str) or not value.strip():
+        raise CheckError(f"{where} '{key}' must be a non-empty sentence")
+    return value.strip()
+
+
+def _lambda_rule_extra(item: Mapping[str, Any],
+                       rule_at: str) -> tuple[tuple[str, object], ...]:
+    """The `lambda:` keys a rule may override, read the same way the block reads
+    them — a key that is absent is inherited, which is the whole contract."""
+    values: list[tuple[str, object]] = []
+    if "error_max_age" in item and item["error_max_age"] is not None:
+        seconds = parse_duration(item["error_max_age"], 0)
+        if seconds < 1:
+            raise CheckError(
+                f"{rule_at}: 'error_max_age' must be a duration of at least 1s")
+        values.append(("error_max_age", seconds))
+    for key in ("read_log_status", "expect_invocations"):
+        if key in item and item[key] is not None:
+            values.append((key, _flag(item[key], f"{rule_at}: '{key}'")))
+    for key in ("error_reason", "silent_reason"):
+        sentence = _sentence(dict(item), key, rule_at)
+        if sentence:
+            values.append((key, sentence))
+    expects = dict(values).get("expect_invocations")
+    if dict(values).get("silent_reason") and expects is False:
+        raise CheckError(
+            f"{rule_at}: 'silent_reason' is set but 'expect_invocations' is "
+            f"false, so the sentence could never be shown")
+    return tuple(values)
+
+
 def _parse_lambda(value: object, shorten: tuple[tuple[str, str], ...] = ()
                   ) -> LambdaConfig:
     if value is None:
         return LambdaConfig(shorten=shorten)
     if not isinstance(value, dict):
         raise CheckError("aws 'lambda' must be a mapping")
-    known = {"enabled", "ignore", "error_max_age", "read_log_status",
-             "shorten"}
+    known = {"enabled", "shorten", "rules"} | set(LAMBDA_RULE_KEYS)
     unknown = sorted(str(key) for key in value if str(key) not in known)
     if unknown:
+        # `ignore:` — a list of whole function names — arrives here: ignoring is
+        # a rule action now, and a rule matches by exact name, prefix or regex
+        # rather than by one of those three being the only spelling.
         raise CheckError(
             f"unknown key(s) in 'lambda': {', '.join(unknown)} "
             f"(it takes: {', '.join(sorted(known))})")
-    ignore = value.get("ignore") or []
-    if not isinstance(ignore, list):
-        raise CheckError("lambda 'ignore' must be a list of function names")
     max_age = parse_duration(value.get("error_max_age"),
                              DEFAULT_ERROR_MAX_AGE_SECONDS)
     if max_age < 1:
         raise CheckError("lambda 'error_max_age' must be a duration of at least 1s")
+    expects = _flag(value.get("expect_invocations", True),
+                    "lambda.expect_invocations")
+    silent = _sentence(value, "silent_reason", "lambda")
+    if silent and not expects:
+        raise CheckError(
+            "lambda 'silent_reason' is set but 'expect_invocations' is false, "
+            "so the sentence could never be shown")
     return LambdaConfig(
-        # Whole function names, not substrings: a Lambda name is an identifier
-        # somebody typed once, and a substring would catch its neighbours.
-        ignore=tuple(str(name) for name in ignore),
         error_max_age_seconds=max_age,
         enabled=_flag(value.get("enabled", True), "lambda.enabled"),
         read_log_status=_flag(value.get("read_log_status", True),
                               "lambda.read_log_status"),
+        expect_invocations=expects,
+        error_reason=_sentence(value, "error_reason", "lambda"),
+        silent_reason=silent,
+        rules=parse_rules(value.get("rules"), "lambda", (),
+                          extra_keys=LAMBDA_RULE_KEYS,
+                          parse_extra=_lambda_rule_extra),
         shorten=_inherited_shorten(value, "lambda 'shorten'", shorten),
     )
+
+
+#: What the `codepipeline` aspect grades with a threshold of its own. Its other
+#: judgment — what a status *means* — is `state_map`, which is a mapping rather
+#: than a level and stays as it is.
+PIPELINE_PAIRS = (("max_age", True),)
 
 
 def _parse_codepipeline(value: object,
@@ -1016,18 +1283,15 @@ def _parse_codepipeline(value: object,
         return CodePipelineConfig(shorten=shorten)
     if not isinstance(value, dict):
         raise CheckError("aws 'codepipeline' must be a mapping")
-    known = {"enabled", "ignore_name_patterns", "max_age", "state_map",
-             "shorten"}
+    known = ({"enabled", "state_map", "shorten", "rules", "max_age"}
+             | threshold_keys("max_age"))
     unknown = sorted(str(key) for key in value if str(key) not in known)
     if unknown:
+        # `ignore_name_patterns` arrives here now: ignoring is a rule action, so
+        # this aspect speaks one matcher vocabulary like the EC2 one.
         raise CheckError(
             f"unknown key(s) in 'codepipeline': {', '.join(unknown)} "
             f"(it takes: {', '.join(sorted(known))})")
-    max_age = parse_duration(value.get("max_age"),
-                             DEFAULT_PIPELINE_MAX_AGE_SECONDS)
-    if max_age < 1:
-        raise CheckError(
-            "codepipeline 'max_age' must be a duration of at least 1s")
     state_map = dict(DEFAULT_PIPELINE_STATE_MAP)
     configured = value.get("state_map")
     if configured is not None:
@@ -1040,10 +1304,9 @@ def _parse_codepipeline(value: object,
                           for status, code in configured.items()})
     return CodePipelineConfig(
         enabled=_flag(value.get("enabled", True), "codepipeline.enabled"),
-        ignore_name_patterns=_lowered_list(
-            value.get("ignore_name_patterns"),
-            "codepipeline 'ignore_name_patterns'", ()),
-        max_age_seconds=max_age,
+        age=parse_pair(value, "max_age", "codepipeline",
+                       duration=True) or UNGRADED,
+        rules=parse_rules(value.get("rules"), "codepipeline", PIPELINE_PAIRS),
         state_map=state_map,
         shorten=_inherited_shorten(value, "codepipeline 'shorten'", shorten),
     )
@@ -1146,6 +1409,61 @@ def _queue_link(region: str) -> str:
             f"?region={region}#queues")
 
 
+def _instance_order(key: tuple[str, str | None]) -> tuple[str, bool, str]:
+    """Groups in region order, then by name — with the unnamed group last, since
+    ``None`` cannot be compared with a string and "nobody named these" is the line
+    a reader looks for after the names they know."""
+    region, name = key
+    return region, name is None, name or ""
+
+
+def _age_span(ages: Sequence[int]) -> str:
+    """How old the members of one group are, as one string.
+
+    A group used to report only its oldest member, which is the verdict but a
+    third of the reading: a name whose twenty boxes run from ten minutes to
+    sixteen hours is a fleet being rolled, and a name whose twenty are all the
+    same age is one that was started once and left. Both read identically as
+    ``(16h 10m)``.
+
+    The shape is decided by **how many distinct strings the members render to**,
+    never by how many members there are:
+
+    ==========================  ==========================
+    they render to              the line shows
+    ==========================  ==========================
+    one distinct string         ``1d``
+    exactly two                 ``15h 3m, 15h 4m``
+    three or more               ``10m - 16h 10m``
+    ==========================  ==========================
+
+    ``coarse_span`` is lossy on purpose — its largest one or two units and then it
+    stops, so two boxes forty minutes apart inside one hour both read ``1d 1h`` —
+    and the granularity of the display is the granularity of the fact worth
+    reporting: boxes that all render ``1d 1h`` are the same age as far as this
+    card is concerned, and ``1d 1h - 1d 1h`` would be noise manufactured out of
+    precision the reader was never shown. Two distinct values are not an interval
+    either. An interval says *there is a spread and there are members inside it*;
+    ``15h 3m, 15h 4m`` says *there are two of them, and here they both are*.
+
+    One renderer, because two surfaces show this — the entry line and the roster —
+    and a group whose card and report disagreed about its age would be worse than
+    either. ``batch`` reports the oldest of its running jobs the same way and is
+    the expected second caller.
+    """
+    if not ages:
+        return ""
+    # Distinctness is on the **rendered strings**, never on the seconds: two
+    # instances 25 and 40 hours old are both `1d`, and a set over the seconds
+    # would print `1d - 1d`.
+    rendered = list(dict.fromkeys(coarse_span(age) for age in sorted(ages)))
+    if len(rendered) == 1:
+        return rendered[0]
+    if len(rendered) == 2:
+        return f"{rendered[0]}, {rendered[1]}"
+    return f"{rendered[0]} - {rendered[-1]}"
+
+
 def _worst(first: StatusCode, second: StatusCode) -> StatusCode:
     """The more serious of two codes, on the card's own order."""
     return first if _CODE_RANK.get(first, 3) <= _CODE_RANK.get(second, 3) else second
@@ -1219,6 +1537,17 @@ class AwsCheck(Check):
         # it is what `config_summary()` reports, and reporting the resolved copy
         # from one aspect would name a rule the others might not be using.
         self.shorten = shorten
+        # Which rules matched a name during the current run, per aspect, and what
+        # was last reported about the ones that did not. A rule that matches
+        # nothing is usually a typo, and it is a fact about the **configuration**
+        # rather than about the estate — so it goes to the log and never to a
+        # node, where it would color a card over a mistake in a file and send
+        # somebody hunting through an account where nothing is wrong.
+        #
+        # Keyed by aspect, because two aspects may reasonably name a rule the same
+        # thing: `web` under `ec2:` and `web` under `codepipeline:` are two rules.
+        self._matched_rules: dict[str, set[str]] = {}
+        self._unmatched_rules: dict[str, frozenset[str]] = {}
         # Static keys are the exception, not the rule — the ambient chain (an
         # instance profile, a task role, an SSO session) is how this normally runs.
         # Resolved **here**, once, from the reference the config names, never
@@ -1329,20 +1658,25 @@ class AwsCheck(Check):
                 plain(pattern)
                 for pattern in self.cloudwatch.ignore_name_patterns) or None,
             "healthy alarms listed": "yes" if self.cloudwatch.show_healthy else "no",
-            "instances allowed per name": str(self.ec2.max_per_name),
             # `format_span` here, and `coarse_span` on the lines: a configured
             # threshold is a size, exactly stated, while an age is a bound.
-            "instance age before red": format_span(self.ec2.max_age_seconds),
-            "a fleet is more than": (f"{self.ec2.fleet_size} instances, red after "
-                                     f"{format_span(self.ec2.fleet_max_age_seconds)}"),
+            "instances per name": self._pair_summary(self.ec2.per_name, str),
+            "instance age": self._pair_summary(self.ec2.age, format_span),
+            "instance rules": self._rules_summary(self.ec2.rules,
+                                                  self._ec2_rule_effect),
             "lambda log status read": ("yes" if self.lambda_.read_log_status
                                        else "no"),
-            "lambda functions ignored": ", ".join(
-                plain(name) for name in self.lambda_.ignore) or None,
             "lambda error graded within": format_span(
                 self.lambda_.error_max_age_seconds),
-            "pipeline success stales after": format_span(
-                self.codepipeline.max_age_seconds),
+            "lambda silence is a finding": ("yes" if
+                                            self.lambda_.expect_invocations
+                                            else "no"),
+            "lambda rules": self._rules_summary(self.lambda_.rules,
+                                                self._lambda_rule_effect),
+            "pipeline success stales after": self._pair_summary(
+                self.codepipeline.age, format_span),
+            "pipeline rules": self._rules_summary(
+                self.codepipeline.rules, self._pipeline_rule_effect),
             "batch job running before red": format_span(
                 self.batch.max_run_seconds),
             "batch job waiting before red": format_span(
@@ -1644,8 +1978,10 @@ class AwsCheck(Check):
         regions = self.regions_for(account)
         show_region = len(regions) > 1
         failures: list[Entry] = []
-        groups: dict[tuple[str, str], list[Instance]] = {}
-        found = 0
+        # Keyed on the **raw** name, with ``None`` for the instances nobody named:
+        # a rule asks about the name AWS returned, and the placeholder a card
+        # prints for the unnamed group is display text this package may reword.
+        groups: dict[tuple[str, str | None], list[Instance]] = {}
         now = _utcnow()
         for region in regions:
             try:
@@ -1659,17 +1995,25 @@ class AwsCheck(Check):
             for instance in instances:
                 if settings.ignored_state(instance.state):
                     continue
-                name = instance.name or NO_NAME_TAG
-                if instance.name and settings.ignored(instance.name):
-                    continue
-                found += 1
-                groups.setdefault((region, name), []).append(instance)
-        counts = {key: len(members) for key, members in groups.items()}
-        ages = {key: self._oldest(members, now)
-                for key, members in groups.items()}
+                # An instance with no `Name` tag reads back as an empty name at
+                # the seam; `None` is what the rest of this aspect calls "nobody
+                # named this", and the two must not be two states.
+                groups.setdefault((region, instance.name or None),
+                                  []).append(instance)
+        # Ignoring happens **after** grouping now, because a rule matches a name
+        # and a name is a group. An ignored group leaves no line and is not in
+        # scope, which is what the flat list of substrings did instance by
+        # instance — and it is ordered, so a rule above it can except a name.
+        kept = {key: members for key, members in groups.items()
+                if not self._ignores(key[1])}
+        for key in groups:
+            self._note_rule(EC2, settings.rule_for(key[1]))
+        found = sum(len(members) for members in kept.values())
+        counts = {key: len(members) for key, members in kept.items()}
+        ages = {key: self._ages(members, now) for key, members in kept.items()}
         entries = [self._instance_entry(region, name, counts[(region, name)],
                                         ages[(region, name)], show_region)
-                   for (region, name) in sorted(groups)]
+                   for (region, name) in sorted(kept, key=_instance_order)]
         reason = [*failures, *entries, self._instance_scope_entry(found, regions)]
         reason.sort(key=lambda entry: _CODE_RANK.get(
             entry.code or StatusCode.OK, 3))
@@ -1678,30 +2022,48 @@ class AwsCheck(Check):
                            report=self._instance_roster(counts, ages,
                                                         show_region))
 
-    @staticmethod
-    def _oldest(members: list[Instance], now: datetime) -> int | None:
-        """The age of the oldest instance under a name — the one the group is
-        graded on, because it is the one that has been unpatched longest."""
-        ages = [age for age in (member.age_seconds(now) for member in members)
-                if age is not None]
-        return max(ages) if ages else None
+    def _ignores(self, name: str | None) -> bool:
+        rule = self.ec2.rule_for(name)
+        return rule is not None and rule.ignore
 
-    def _instance_entry(self, region: str, name: str, count: int,
-                        age: int | None, show_region: bool) -> Entry:
+    @staticmethod
+    def _ages(members: list[Instance], now: datetime) -> tuple[int, ...]:
+        """Every age under one name, oldest last.
+
+        All of them, because the line reports a **range** (:func:`_age_span`);
+        the last of them, because the group is *graded* on its oldest member —
+        the one that has been unpatched longest. An instance whose payload
+        carried no launch time contributes nothing rather than a guess.
+        """
+        return tuple(sorted(
+            age for age in (member.age_seconds(now) for member in members)
+            if age is not None))
+
+    def _instance_entry(self, region: str, name: str | None, count: int,
+                        ages: tuple[int, ...], show_region: bool) -> Entry:
         where = f"{plain(region)} / " if show_region else ""
         # The no-name group is not a name, so it is not a console search either.
-        label = (plain(name) if name == NO_NAME_TAG
+        label = (plain(NO_NAME_TAG) if name is None
                  else f"[{plain(name)}]({_instance_link(region, name)})")
         # The age rides on **every** line, healthy ones included: it is the
         # reading, not the exception report, and a line that only shows it when
         # it is bad teaches nobody what normal looks like.
-        # `coarse_span`, not `format_span`: an age is a **bound** on a card
-        # nobody re-renders while it is being read, so it states its largest one
-        # or two units and stops (little-sister's `spans` module). The exact
-        # measurement would be out of date before the sentence ended.
-        suffix = f" ({coarse_span(age)})" if age is not None else ""
-        return Entry(slug(region, name), f"{where}{label}: {count}{suffix}",
-                     self.ec2.code_for(count, age))
+        # `coarse_span` inside `_age_span`, not `format_span`: an age is a
+        # **bound** on a card nobody re-renders while it is being read, so it
+        # states its largest one or two units and stops (little-sister's `spans`
+        # module). The exact measurement would be out of date before the sentence
+        # ended — and the lossiness is what decides the range's shape.
+        span = _age_span(ages)
+        suffix = f" ({span})" if span else ""
+        # The **oldest** member is what the age is graded on, before this change
+        # and after: the range is a reading, and the oldest is the verdict.
+        code, notes = self.ec2.judge(name, count, ages[-1] if ages else None)
+        # The sentences are configuration, so they are escaped like every other
+        # configured text that reaches a line — an instance name gets the same
+        # treatment two lines above.
+        said = f" — {'; '.join(plain(note) for note in notes)}" if notes else ""
+        return Entry(slug(region, name if name is not None else NO_NAME_TAG),
+                     f"{where}{label}: {count}{suffix}{said}", code)
 
     @staticmethod
     def _instance_scope_entry(found: int, regions: tuple[str, ...]) -> Entry:
@@ -1718,16 +2080,17 @@ class AwsCheck(Check):
                      StatusCode.OK)
 
     @staticmethod
-    def _instance_roster(counts: dict[tuple[str, str], int],
-                         ages: dict[tuple[str, str], int | None],
+    def _instance_roster(counts: dict[tuple[str, str | None], int],
+                         ages: dict[tuple[str, str | None], tuple[int, ...]],
                          show_region: bool) -> str:
         lines = []
-        for key in sorted(counts):
+        for key in sorted(counts, key=_instance_order):
             region, name = key
-            age = ages.get(key)
             where = f"{plain(region)} / " if show_region else ""
-            suffix = f" ({coarse_span(age)})" if age is not None else ""
-            lines.append(f"- {where}{plain(name)}: {counts[key]}{suffix}")
+            span = _age_span(ages.get(key, ()))
+            suffix = f" ({span})" if span else ""
+            shown = NO_NAME_TAG if name is None else name
+            lines.append(f"- {where}{plain(shown)}: {counts[key]}{suffix}")
         return "\n".join(lines)
 
     # --- the lambda aspect -------------------------------------------------
@@ -1828,13 +2191,15 @@ class AwsCheck(Check):
                         now: datetime) -> list[FunctionReading]:
         settings = self.lambda_
         names = [name for name in self._list_functions(session, region)
-                 if name not in settings.ignore]
+                 if not settings.ignored(name)]
         errors = self._error_counts(session, region, names, now)
         readings: list[FunctionReading] = []
         for name in sorted(names):
             count, last_run = errors.get(name, (None, None))
             status, note = ("", "")
-            if settings.read_log_status:
+            # Per function, because the log read is two API calls each and the
+            # functions worth paying for are not always the whole account.
+            if settings.reads_log(settings.rule_for(name)):
                 status, note = self._log_reading(session, region, name)
             readings.append(FunctionReading(
                 name=name, region=region, errors=count, last_run=last_run,
@@ -1844,22 +2209,30 @@ class AwsCheck(Check):
     def _function_entry(self, reading: FunctionReading, now: datetime,
                         show_region: bool) -> Entry:
         settings = self.lambda_
+        rule = settings.rule_for(reading.name)
+        self._note_rule(LAMBDA, rule)
         age = (None if reading.last_run is None
                else max(0, int((now - reading.last_run).total_seconds())))
         parts: list[str] = []
+        said = ""
         code = StatusCode.OK
         if reading.errors is None:
             # Not the same as zero errors: CloudWatch had no data point at all in
-            # 455 days. A scheduled job nobody has invoked is not a healthy one.
+            # 455 days. A scheduled job nobody has invoked is not a healthy one —
+            # but a handler that runs when somebody calls it is, which is what a
+            # rule saying `expect_invocations: false` is for.
             parts.append("no recent invocations")
-            code = StatusCode.WARN
+            if settings.expects_invocations(rule):
+                code = StatusCode.WARN
+                said = settings.sentence("silent_reason", rule)
         elif reading.errors == 0:
             parts.append(f"no errors, last run {coarse_span(age or 0)} ago")
-        elif age is not None and age <= settings.error_max_age_seconds:
+        elif age is not None and age <= settings.gate_for(rule):
             parts.append(f"{reading.errors} error"
                          f"{'s' if reading.errors != 1 else ''}, "
                          f"last run {coarse_span(age)} ago")
             code = StatusCode.ERROR
+            said = settings.sentence("error_reason", rule)
         else:
             parts.append(f"{reading.errors} error"
                          f"{'s' if reading.errors != 1 else ''} but the last run "
@@ -1868,7 +2241,10 @@ class AwsCheck(Check):
             parts.append(f"log: {plain(reading.log_status)}")
             if reading.log_status == "ERROR":
                 code = StatusCode.ERROR
+                said = said or settings.sentence("error_reason", rule)
         parts.extend(plain(note) for note in reading.notes)
+        if said:
+            parts.append(plain(said))
         where = f"{plain(reading.region)} / " if show_region else ""
         label = plain(settings.short_name(reading.name))
         return Entry(slug(reading.region, reading.name),
@@ -1975,8 +2351,11 @@ class AwsCheck(Check):
     def _pipeline_entry(self, reading: PipelineReading, now: datetime,
                         show_region: bool) -> Entry:
         settings = self.codepipeline
+        rule = settings.rule_for(reading.name)
+        self._note_rule(CODEPIPELINE, rule)
         age = (None if reading.started is None
                else max(0, int((now - reading.started).total_seconds())))
+        said = ""
         if not reading.status:
             # A pipeline that has never been executed. Reporting nothing for it
             # would make a pipeline created and never triggered indistinguishable
@@ -1988,12 +2367,18 @@ class AwsCheck(Check):
             # and for an `InProgress` run it is the only honest thing to say.
             when = f", started {coarse_span(age)} ago" if age is not None else ""
             phrase = f"{plain(reading.status)}{when}"
-            if (code is StatusCode.OK and age is not None
-                    and age > settings.max_age_seconds):
+            if code is StatusCode.OK and age is not None:
                 # A success this old is not evidence the pipeline still works.
-                code = StatusCode.WARN
-                phrase = (f"{plain(reading.status)}, but that run started "
-                          f"{coarse_span(age)} ago")
+                # Only a success: a failure is already the finding, and telling
+                # somebody it is also stale is noise on the line they act on.
+                stale = settings.age_for(rule)
+                aged = stale.code_for(age)
+                if aged is not StatusCode.OK:
+                    code = aged
+                    phrase = (f"{plain(reading.status)}, but that run started "
+                              f"{coarse_span(age)} ago")
+                    sentence = sentence_for(stale, rule)
+                    said = f" — {plain(sentence)}" if sentence else ""
         where = f"{plain(reading.region)} / " if show_region else ""
         label = plain(settings.short_name(reading.name))
         return Entry(
@@ -2001,7 +2386,7 @@ class AwsCheck(Check):
             # cosmetic `shorten` rule must not be able to re-point a pin.
             slug(reading.region, reading.name),
             f"{where}[{label}]({_pipeline_link(reading.region, reading.name)}): "
-            f"{phrase}",
+            f"{phrase}{said}",
             code)
 
     def _codepipeline_aspect(self, account: Account,
@@ -2409,6 +2794,108 @@ class AwsCheck(Check):
                   if profile else problem)
         return [f"AWS credentials have expired: {plain(error)}", second]
 
+    @staticmethod
+    def _pair_summary(threshold: Threshold,
+                      render: Callable[[int], str]) -> str | None:
+        """One judgment on the card: its levels, and the sentence it says.
+
+        The sentence belongs *with* the levels rather than on a line of its own:
+        two entries would read as two settings, and an entry saying what is said
+        about an instance that is too old, with no threshold above it, would be a
+        sentence nobody can trigger.
+        """
+        levels = threshold.summary(render)
+        if levels is None:
+            return None
+        return (f"{levels} — {plain(threshold.reason)}" if threshold.reason
+                else levels)
+
+    @staticmethod
+    def _rules_summary(rules: tuple[Rule, ...],
+                       effect: Callable[[Rule], str]) -> str | None:
+        """One aspect's rules, as a nested list under one label.
+
+        In the order they are consulted, which is the order they decide in: a card
+        that listed them any other way would be describing a different config. And
+        each shown **effective** rather than as written — a rule that names one
+        level inherits the rest, and what a reader needs from this card is what the
+        check will actually do to those names.
+        """
+        if not rules:
+            return None
+        lines = [f"  - **{plain(rule.name)}** — {effect(rule)}" for rule in rules]
+        return "checked in order, first match wins\n" + "\n".join(lines)
+
+    def _lambda_rule_effect(self, rule: Rule) -> str:
+        if rule.ignore:
+            return "neither listed nor counted"
+        settings = self.lambda_
+        parts = [f"errors graded within "
+                 f"{format_span(settings.gate_for(rule))}"]
+        if not settings.expects_invocations(rule):
+            parts.append("silence is fine")
+        if not settings.reads_log(rule):
+            parts.append("log status not read")
+        return ", ".join(parts)
+
+    def _pipeline_rule_effect(self, rule: Rule) -> str:
+        if rule.ignore:
+            return "neither listed nor counted"
+        stale = self.codepipeline.age_for(rule)
+        summary = stale.summary(format_span)
+        return f"success stales after {summary}" if summary else "not graded"
+
+    def _ec2_rule_effect(self, rule: Rule) -> str:
+        if rule.ignore:
+            return "neither listed nor counted"
+        count, aged = self.ec2.thresholds_for(rule)
+        # Each half is labelled: "warn above 15, warn above 2h" would read as one
+        # judgment with two warning levels, which is not a thing.
+        # Levels only, no sentences: a rule's sentence is shown where it is
+        # useful — on the line it colors — and six rules quoting two sentences
+        # each would bury the numbers this card exists to show.
+        parts = [f"{label} {summary}"
+                 for label, summary in (("per name:", count.summary(str)),
+                                        ("age:", aged.summary(format_span)))
+                 if summary]
+        return "; ".join(parts) or "not graded"
+
+    def _note_rule(self, aspect: str, rule: Rule | None) -> None:
+        """Remember that this rule matched something in this run."""
+        if rule is not None:
+            self._matched_rules.setdefault(aspect, set()).add(rule.name)
+
+    def _rule_lists(self) -> tuple[tuple[str, tuple[Rule, ...]], ...]:
+        """The aspects that take rules, with theirs."""
+        return ((EC2, self.ec2.rules), (CODEPIPELINE, self.codepipeline.rules),
+                (LAMBDA, self.lambda_.rules))
+
+    def _report_unmatched_rules(self) -> None:
+        """Say, once per aspect, which rules matched no name in this whole run.
+
+        **Only when the set changes**, this run's first included: at
+        `frequency: 60s` an unconditional line is fourteen hundred identical
+        records a day about a typo that was true at breakfast, where a line on
+        change turns a lasting mistake into one record and its fix into one more.
+        The set is the run's, not an account's — a rule may legitimately match in
+        one account and not in another.
+        """
+        for aspect, rules in self._rule_lists():
+            if not rules:
+                continue
+            matched = self._matched_rules.get(aspect, set())
+            unmatched = frozenset(rule.name for rule in rules
+                                  if rule.name not in matched)
+            if unmatched == self._unmatched_rules.get(aspect):
+                continue
+            if unmatched:
+                logger.info("%s: %d %s rule(s) matched no name: %s", self.path,
+                            len(unmatched), aspect, ", ".join(sorted(unmatched)))
+            elif self._unmatched_rules.get(aspect):
+                logger.info("%s: every %s rule now matches a name",
+                            self.path, aspect)
+            self._unmatched_rules[aspect] = unmatched
+
     def _account_config(self, account: Account) -> str:
         return config_markdown({
             "regions": ", ".join(plain(region)
@@ -2457,6 +2944,7 @@ class AwsCheck(Check):
         # graded badly, which is an ordinary reading and says so on its own node.
         # `2 of 2` is the shape of a credential problem and `1 of 3` the shape of
         # one account's policy, so the count is itself a diagnosis.
+        self._matched_rules = {}
         read = [self._account_result(base, account) for account in self.accounts]
         children = tuple(result for result, _ in read)
         unreadable = [result.name for result, looked in read if not looked]
@@ -2469,6 +2957,7 @@ class AwsCheck(Check):
             logger.error("%s: %d of %d account(s) could not be read: %s",
                          self.path, len(unreadable), len(children),
                          ", ".join(unreadable))
+        self._report_unmatched_rules()
         # The root stays OK and says only what is watched: an account that failed
         # is red on its own node and reaches this container by roll-up, so
         # repeating it here would report one fact twice.

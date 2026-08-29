@@ -1,6 +1,6 @@
 [project]
 name = "little-sister-aws"
-version = "0.1.1"
+version = "0.1.2"
 # **Three surfaces, not one.** The old summary named only the check type, which was
 # true when this package was only that; it now also carries the AWS secret provider
 # and the identity seam both of them open sessions through, and a summary that names
