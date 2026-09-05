@@ -6,6 +6,124 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-05
+
+### Added
+
+- **The S3 keeper: this instance's state, in a bucket.** little-sister keeps what
+  a restart needs as files under `var/state/` — the maintenance pins, the event log
+  behind every node's history — and takes a **keeper** to carry that directory
+  somewhere durable. This is one, and with it a deployment redeployed onto a fresh
+  machine — one terminated without a stop, too — comes up as the instance that
+  stopped on the old one. Turn it on with a `config/aws-keeper.yaml` naming a
+  `bucket` (plus optional `prefix`, `identity` from `config/aws.yaml`, the bucket's
+  `region`, and `lapse_after`) and a `little_sister_aws.keeper.register_s3_keeper()`
+  call in the same import-before-app block as the secret provider — **the keeper
+  registers nothing on import**, as the provider does not. No file means no keeper,
+  which is what a second configuration root for a laptop wants; a file that cannot
+  be read refuses the start.
+
+  **One prefix, one instance, held by a lease.** One object under the prefix says
+  who may write there; the holder re-writes it every `state_interval` — a heartbeat
+  — and writes the state files behind it, unconditionally. A second instance on the
+  same prefix restores the state like any other (reading needs no lease), then
+  **stands by**: it monitors, keeps its state locally, sends nothing, reads the lease
+  once per interval, and takes over when the lease lapses (`lapse_after` heartbeats
+  missed, three by default) or is given up. A holder whose heartbeat is refused, or
+  whose bucket does not answer for `lapse_after` intervals, demotes itself before it
+  writes anything and takes the lease back when it is free. Nothing latches and
+  nothing needs a restart. Liveness is measured inside one S3 answer — `Date`
+  against `LastModified` against the `ttl_seconds` the holder wrote — so no
+  machine's clock enters it; a graceful stop gives the lease up with a heartbeat of
+  zero, so the next standby takes it at once rather than waiting.
+
+  **What it says, by the library's loss principle**, on its child
+  `/little-sister/aws-keeper`, each line under its own slug there and every line a
+  claim: `standby`, `demoted` and `unreachable` are WARN, because nothing is
+  lost while they stand — a standby's pins are local, and its line says so. Nothing
+  this keeper reports is ERROR. What the keeper merely knows — who holds the lease
+  and on what terms, whom it was taken from and how, the last transitions — is the
+  child's **report**, on its page and never on a card. Every instant in a line is shown in the
+  `timezone` and `time_format` of `settings.yaml`, and every instant in the lease is
+  ISO 8601 UTC.
+
+  **Versioning off**, and checked once at startup: with a heartbeat a minute,
+  versioning is tens of thousands of versions a month of a file nobody reads, so the
+  keeper asks `GetBucketVersioning` on its first call and carries
+  `versioning` at WARN while it finds versioning enabled — suspended is
+  fine. That needs `s3:GetBucketVersioning`; without it the report says it could
+  not ask. The identity wants `s3:GetObject`, `s3:PutObject` and
+  `s3:DeleteObject` under the prefix and `s3:ListBucket` on the bucket — the lease
+  and the keeper's other objects live under the same prefix, so they need no policy
+  of their own ([ADR-0004](docs/adr/0004-the-s3-keeper.md)).
+
+  **Authority follows the lease.** Whoever holds it wrote the truth up to the moment
+  it lapsed, so a standby that takes over continues with the *store's* state and not
+  its own: the keeper remembers the ETag of every file it loaded or saved and answers
+  little-sister's `changed_since_sync()` at the takeover from one listing; the
+  library adopts those files before the first save and keeps what they replaced as
+  `.bak` on `/little-sister/state`. The order is *take the lease, then adopt, then
+  save*. A takeover that changed something is `takeover` at WARN for ten
+  minutes and in the report after; the successor of a holder that died before anybody wrote
+  again takes over silently, with its own state. (little-sister ADR-0077; ADR-0004
+  decision 4.)
+
+  **Two actions on `/little-sister/aws-keeper`**, admin-only, through the library's
+  action seam: **Take over** writes the lease onto this instance regardless of who
+  holds it — the holder demotes itself at its next heartbeat, within one interval,
+  and both pages say it was an operator's (the lease carries `how`); the adoption
+  and the first save follow in the same click, since the library flushes the state
+  layer after every action, and on the holder itself the action is that flush —
+  and **Release** gives it up now, as a clean stop
+  would. A released instance does not take the lease back on its own — a coin toss
+  against the standby the button was pressed for — and carries `released`
+  at WARN until another instance takes the lease, since nothing of its state reaches
+  the store meanwhile; *take over* takes it back, and once another instance has held
+  the lease it is an ordinary standby again. The manual unlock from a shell is gone
+  with the reason for it.
+
+  **The holder sees who stands by, and the prefix keeps a log.** A standby writes
+  `.little-sister-standby-<key>.json` beside the lease every interval — its mark
+  percent-encoded in the key, the mark and since when in the body, with its own
+  `ttl_seconds` — and the holder lists once per interval, carrying
+  `standbys` at WARN while anybody is there. Whoever lists deletes a
+  presence file older than its ttl and writes that instance's *stood by* into
+  `.little-sister-instances.json`: one entry per transition — took the lease (from
+  whom, how), released it, stood by from when to when — the last hundred, newest
+  first, never restored, the one object a non-holder writes and so the one with a
+  conditional `PUT`; the report shows the last three. Everything under
+  the prefix that starts with `.little-sister-` is the keeper's and is never offered
+  to the library as a state file.
+
+  **Two clocks.** Every stamp written into the bucket is on S3's clock, and every
+  line shows a store stamp in host time: the offset between the two is measured on
+  every answer from its `Date` header and the reader converts with its own. Past 5 s
+  the offset is `clock` at WARN, cleared under 3 s.
+
+  The client is bounded in seconds (2 s connect, 5 s read, two attempts) because
+  both the save and the tick run on the scheduler tick, and the session is re-opened
+  once on a credential error, which is what an assumed role's hour-long credentials
+  need from a process that runs for weeks.
+
+- **`docs/architecture.md` ships with the package** — what is built, the three
+  surfaces and the rules that bind them, with the record named beside each. It is
+  written for somebody working on this package rather than installing it, and it is
+  here because the records already ship and a description of the seams is less than
+  their arguments.
+
+### Requires
+
+- **little-sister >= 0.3.15**, up from 0.3.13: the release that carries the keeper
+  seam (`little_sister.keeper`) this version fills — with the `tick` and `close` the
+  lease needs, which that release's seam grew for it, and the `changed_since_sync()`
+  the takeover answers (its ADR-0077) — the action seam the two buttons go through
+  (its ADR-0076), and `little_sister.spans.local_time`, which the keeper's lines
+  render instants with.
+  An *added* name is the mismatch a check API epoch cannot catch — an epoch says
+  what was removed — so the floor is what keeps an older library from meeting
+  `register_s3_keeper()` with an `ImportError`. The check API epoch itself did not
+  move: a keeper is not a check.
+
 ## [0.1.2] - 2026-08-29
 
 ### Removed
@@ -62,8 +180,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Three things come with the move: one matcher vocabulary for the whole aspect,
   ordering (a rule *above* an ignore rule excepts names from it — "ignore `tmp-`
   except `tmp-db`", which a flat list could not say), and the same non-listing,
-  non-counting behavior as before. The other four aspects keep their
-  `ignore_name_patterns` for now.
+  non-counting behavior as before. `cloudwatch` and `batch` keep their
+  `ignore_name_patterns` for now; `codepipeline` and `lambda` lose theirs below.
 
 - **The `codepipeline` aspect's `max_age`, its default month, and its
   `ignore_name_patterns`.** The staleness clock is a pair now
@@ -133,8 +251,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   This is what a deployment that runs on a laptop *and* in a cloud account needs:
   only the `aws.yaml` differs between the two, never a reference. An entry that
   names nothing at all — no profile, no role, no region — is still refused, and the
-  refusal now says both ways out rather than only what is wrong. See ADR-0002 §6's
-  update note.
+  refusal now says both ways out rather than only what is wrong (ADR-0002 §6).
 
 - **Two levels on every EC2 threshold**, so both readings can warn *and* burn:
   `max_per_name_warn` / `max_per_name_error` and `max_age_warn` /
@@ -234,7 +351,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **An `ec2:` rule that matches no instance name is reported in the log**, at
   `INFO`, naming the rules — and only when that set changes, this run's first
   included. It is never reported on a node: a regex with a typo in it is a fact
-  about your configuration, and colouring a card over it would send somebody
+  about your configuration, and coloring a card over it would send somebody
   hunting through an account where nothing is wrong.
 
 ## [0.1.1] - 2026-08-23
@@ -279,7 +396,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   budget. **Nothing registers on import**: a deployment installs the provider
   with one explicit call, `register_aws_secret_resolvers()`, in its
   import-before-app slot
-  ([ADR-0002](docs/adr/0002-aws-secret-references.md), travelled here with the
+  ([ADR-0002](docs/adr/0002-aws-secret-references.md), traveled here with the
   code and closed with the move).
 
 ### Changed
@@ -333,7 +450,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Breaking: this package speaks check API epoch 2 and needs `little-sister >=
   0.3.13`.** little-sister now reads the whole `subnodes:` block itself, for every check
-  type, and a type only **declares** what it ships (its ADR-0025). So this check no
+  type, and a type only **declares** what it ships (little-sister ADR-0025). So this check no
   longer parses that block, no longer layers its own defaults, and no longer hands a
   `title` / `about` back on an aspect result: it declares `SUBNODES` and the
   `{pin_note}` token, and the library resolves and applies them. Nothing changes in
@@ -379,6 +496,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   profile*, at the check and on an account. Silently, it meant falling back to
   whatever `AWS_PROFILE` happened to say and then failing to assume a role that was
   never trusted from there — with a card that said nothing was configured.
+
+### Requires
+
+- **`little-sister >= 0.3.13`** — the release that speaks check API epoch 2, which
+  this package speaks since this version (the entry under *Changed* says what moved).
 
 ## [0.1.0] - 2026-08-16
 

@@ -25,3 +25,9 @@ htmlcov/
 # Ignore type-checker caches
 .mypy_cache/
 .ruff_cache/
+
+# The handover note: what is true in *this* checkout that the tree does not say.
+# Untracked on purpose. A fresh clone has nothing in flight, and a tracked copy could
+# not carry "uncommitted on <sha>" without contradicting itself the moment it landed —
+# it would also make every note a commit, and stand between a dirty tree and `prep`.
+/docs/handover.md

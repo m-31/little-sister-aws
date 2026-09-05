@@ -5,11 +5,11 @@
 - **Related:** [ADR-0002](0002-aws-secret-references.md) (the secret references the
   identities on this package's seam are read with), little-sister **ADR-0042**
   (coded entries), little-sister **ADR-0043** / **ADR-0044** (the coverage reading
-  and the roster), little-sister **ADR-0025** (subnode text),
-  **plugin-repository.md** (the lift-out this ADR promised, and which has happened)
+  and the roster), little-sister **ADR-0025** (subnode text); the lift-out this
+  record promised has happened, and this package is the result
 
 > This record was written in the deployment whose AWS checks this type replaced and
-> travelled here with the code: *that codebase* in the Context below is that
+> traveled here with the code: *that codebase* in the Context below is that
 > deployment's, and the checks it names are the ones this type absorbed.
 
 ## Context
@@ -52,8 +52,8 @@ in each line. Three reasons, in the order they mattered:
   alarms that nobody pinned.
 - **A failure needs an owner.** An account whose role cannot be assumed reddens
   *its* node and the others keep reporting. Flat, that failure has nowhere to live
-  except the root, where it either colours everything or is lost among the lines.
-- **A tag on every line is a tree that was not available.** Labelling each result
+  except the root, where it either colors everything or is lost among the lines.
+- **A tag on every line is a tree that was not available.** Labeling each result
   with the environment it came from is what a flat list does when it cannot branch.
   This one can, so the label becomes the node.
 
@@ -114,8 +114,9 @@ secret resolver — now this package's own — wants anyway.
 
 The cost is named rather than waved away: `little-sister-aws` is the first
 package in the family with a dependency beyond little-sister, and it declares it
-as a **floor**, like its little-sister floor. `boto3-stubs[cloudwatch,sts]` goes
-in the dev group — without the per-service extras every client types as
+as a **floor**, like its little-sister floor. `boto3-stubs` with one extra per
+service this package calls goes in the dev group — without the per-service extras
+every client types as
 `BaseClient` and strict mypy checks nothing at all on the one call path that
 matters. Payloads are narrowed into this module's own frozen `Alarm` at the read
 seam, so nothing downstream touches a boto3 response and the tests need no
@@ -221,7 +222,7 @@ type and published one seam beside it. It now also carries the AWS **secret
 resolvers** and the named identities they read secrets with —
 `little_sister_aws.secrets` and `little_sister_aws.identities`, with the `aws`
 configuration aspect declared here and `config/aws.yaml`'s shape owned here.
-[ADR-0002](0002-aws-secret-references.md) is their design record; it travelled with
+[ADR-0002](0002-aws-secret-references.md) is their design record; it traveled with
 them, and registration stays the deployment's own explicit call.
 
 That makes three surfaces rather than one, which is a boundary worth stating so it
@@ -247,9 +248,10 @@ which is exactly why it sits *beside* the seam and never in it.
   returns only metric alarms unless asked and a blind spot is easy to inherit
   without deciding to. Both are one `state_map` / `include_composite` line away from
   the other answer, which is the point of them being configuration.
-- Every account gets every aspect. The day an account runs no SageMaker, that
-  becomes a per-account `aspects:` list; it is not one today because a list with
-  one member in it teaches nobody anything.
+- Every account gets every aspect (`cloudwatch`, `ec2`, `lambda`, `codepipeline`,
+  `batch`); an aspect is switched off per check with `enabled: false`. The day one
+  account differs from the rest, that becomes a per-account `aspects:` list; it is
+  not one today because a list with one member in it teaches nobody anything.
 - A process gets one `SSO_LOGINS`, and every caller that may renew a login shares
   its history — so a check's browser window and a boot's are the same window, and
   the cooldown that suppresses a second one is machine-wide by construction.

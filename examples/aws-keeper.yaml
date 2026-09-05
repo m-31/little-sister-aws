@@ -1,0 +1,80 @@
+# Where this instance's state is kept: `config/aws-keeper.yaml`.
+#
+# little-sister keeps what a restart needs as files under `var/state/` — the
+# maintenance pins somebody set, the event log every node's history is derived from
+# — and those files live on whichever disk the process happens to be running on. A
+# **keeper** carries that directory somewhere durable, so an instance redeployed
+# onto a fresh machine comes up as the instance that stopped on the old one. This
+# file turns on the S3 one (docs/adr/0004-the-s3-keeper.md).
+#
+# **Its own file, not a block in `config/aws.yaml`.** That file is a mapping of
+# identity *names*, so a reserved key in it would be a name nobody may declare.
+# The two are read together all the same: `identity:` below names an entry there.
+#
+# **No file at all means no keeper**, which is a supported shape rather than a
+# missing piece: an installation with one `wsgi.py` and two configuration roots —
+# a laptop's and a cloud account's — puts this file in one of them, and the other
+# keeps its state on its own disk. What is refused is a file that exists and cannot
+# be read: an unknown key, a key written and left empty, or no `bucket:`.
+#
+# **What the bucket wants**, decided once when it is created rather than here:
+# versioning **off** (or suspended, which is all a bucket that once had it on can
+# do). The keeper writes a small lease object every interval — a heartbeat — and
+# with versioning on that is about 43,000 versions a month of a file nobody reads,
+# bounded by a lifecycle rule and never prevented by one. The keeper asks the bucket
+# once at startup and says so on `/little-sister/aws-keeper` if it finds versioning
+# on; that needs `s3:GetBucketVersioning`, and without the permission it says it
+# could not ask. The prefix holds the current state of one instance and nothing
+# else — a mirror of a bounded memory, not a history — so nothing here wants
+# versions.
+#
+# **One prefix, one instance, held by a lease.** The lease is one object under the
+# prefix, renewed every interval by the instance that holds it. Another instance
+# started on the same prefix restores the state like any other — reading needs no
+# lease — then stands by: it monitors, keeps its state on its own disk, writes a
+# small presence file so the holder can say who is standing by, and says so at
+# WARN. When the lease lapses (the holder died) or is given up (the holder stopped
+# cleanly) it takes over — with the store's state, not its own: whoever held the
+# lease wrote the truth up to the moment it lapsed, and what the standby had is
+# kept beside each file as `.bak`. Nothing needs a restart, and nothing is red.
+# Beside the lease the keeper keeps an instance log of who held the prefix when,
+# never restored, the last hundred transitions.
+#
+# The identity needs `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on the
+# keys under the prefix — the delete for a stale presence file of a killed standby
+# — and `s3:ListBucket` on the bucket for the prefix.
+#
+# Every value below is a placeholder. This file is the *shape* — every key, with a
+# comment saying what it decides — not anybody's configuration.
+
+# **Required.** The bucket the state is kept in. Nothing else in this file is.
+bucket: example-monitoring-state
+
+# Where in the bucket. Optional: with no prefix the state files sit at the bucket's
+# root, which is fine for a bucket that holds nothing else. A leading `/` is
+# dropped and a trailing one is added, so `instances/prod` and `/instances/prod/`
+# name the same place.
+#
+# **One instance per prefix**, held by the lease described above, which lives under
+# this prefix so it needs no permission of its own.
+prefix: instances/prod
+
+# Which identity from `config/aws.yaml` opens the session — its profile, its role.
+# Optional: with none, the keeper reads and writes as whatever the host already is,
+# which is what an instance with a role wants and what a laptop with an SSO session
+# has. An identity named here but not declared there refuses the start.
+identity: live
+
+# The **bucket's** region, which is not necessarily the identity's: an identity's
+# `region:` says where its secrets are read, and a deployment may keep its state
+# somewhere else. Optional; empty means the region the profile or the environment
+# implies.
+region: eu-central-1
+
+# How many heartbeats may be missed before the lease is dead — the failover, in
+# intervals of `state_interval` (`settings.yaml`, default 60 s). The holder writes
+# `lapse_after × interval` into the lease, so an instance standing by needs nothing
+# but the object to know when it may take over. Optional; the default is 3, a
+# three-minute failover at the default interval. A shorter interval buys a shorter
+# failover at the same price per heartbeat.
+# lapse_after: 3

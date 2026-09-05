@@ -126,6 +126,9 @@ lambda = [
 logs = [
     { name = "mypy-boto3-logs" },
 ]
+s3 = [
+    { name = "mypy-boto3-s3" },
+]
 secretsmanager = [
     { name = "mypy-boto3-secretsmanager" },
 ]
@@ -494,7 +497,7 @@ wheels = [
 
 [[package]]
 name = "little-sister"
-version = "0.3.13"
+version = "0.3.15"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "flask" },
@@ -503,14 +506,14 @@ dependencies = [
     { name = "pyyaml" },
     { name = "tzdata" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/fa/0d/d424cec105ae1e216924388381ea5a235c7d90ab94a8c803b7e63bacd011/little_sister-0.3.13.tar.gz", hash = "sha256:65badd16f35bdc623f20836f8b0d93abfe97113f5f68b4b15071ab659eae4ae5", size = 387623, upload-time = "2026-08-23T08:36:58.221Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a9/15/ed7b922213e0c3d0cd3b9e458c9173aeb2dc34903bd7503f397200ace429/little_sister-0.3.15.tar.gz", hash = "sha256:ee9a570c414e3281df932882a00a6489e25b357067213b5d8a1813555115cc16", size = 472110, upload-time = "2026-09-05T20:07:27.685Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f0/29/50a1d57b7e4babcd061f95d6af89db233c089490d4c31996b3e2d6c05dff/little_sister-0.3.13-py3-none-any.whl", hash = "sha256:3f4632dfd059495d84068ec8980a3e887840155915c359c641c2289f95cc3900", size = 465389, upload-time = "2026-08-23T08:36:48.933Z" },
+    { url = "https://files.pythonhosted.org/packages/aa/7c/2a86178667981b06166c3633db884990b04b49dc9e39767a2eb10dbece8a/little_sister-0.3.15-py3-none-any.whl", hash = "sha256:79a39fbe3f6f71b1ef110f058af06ead25c010f07e7d849c9d8cb8ab1e322e67", size = 560649, upload-time = "2026-09-05T20:07:25.597Z" },
 ]
 
 [[package]]
 name = "little-sister-aws"
-version = "0.1.2"
+version = "0.1.3"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },
@@ -519,7 +522,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "boto3-stubs", extra = ["batch", "cloudwatch", "codepipeline", "ec2", "lambda", "logs", "secretsmanager", "ssm", "sts"] },
+    { name = "boto3-stubs", extra = ["batch", "cloudwatch", "codepipeline", "ec2", "lambda", "logs", "s3", "secretsmanager", "ssm", "sts"] },
     { name = "mypy" },
     { name = "pytest" },
     { name = "pytest-cov" },
@@ -531,12 +534,12 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "boto3", specifier = ">=1.40.0" },
-    { name = "little-sister", specifier = ">=0.3.13" },
+    { name = "little-sister", specifier = ">=0.3.15" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "boto3-stubs", extras = ["batch", "cloudwatch", "codepipeline", "ec2", "lambda", "logs", "secretsmanager", "ssm", "sts"], specifier = ">=1.40.0" },
+    { name = "boto3-stubs", extras = ["batch", "cloudwatch", "codepipeline", "ec2", "lambda", "logs", "s3", "secretsmanager", "ssm", "sts"], specifier = ">=1.40.0" },
     { name = "mypy", specifier = ">=2.1.0" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "pytest-cov", specifier = ">=7.1.0" },
@@ -775,6 +778,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/68/68/b38579032bd79e64bf7b1cad37741f29be258c1836a1302788491bd7ac2f/mypy_boto3_logs-1.43.66.tar.gz", hash = "sha256:7d1b3cee56f703099a24c7a877a6ea9e5b336faaa36934551c2f149b01eae772", size = 55884, upload-time = "2026-08-07T00:17:32.035Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/15/d0/1c3ea018831303d5fde9e4bf6651f71fdbf158d51680fed707161f3d1c60/mypy_boto3_logs-1.43.66-py3-none-any.whl", hash = "sha256:d90055f5fd07993a6b7c3ba993e85b4cacd6b6e8d1a3f55c45026d409ae6ed03", size = 63364, upload-time = "2026-08-07T00:17:29.26Z" },
+]
+
+[[package]]
+name = "mypy-boto3-s3"
+version = "1.43.66"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "typing-extensions", marker = "python_full_version < '3.12'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5f/b4/d9af4054a80a46e27bfec10ead824ac1d39a974179b47db4ad9844bc5658/mypy_boto3_s3-1.43.66.tar.gz", hash = "sha256:b2f74763e373b3f3d64cfcd2f00cdb1c10c8a4cefe6d4cdbc1ed4a6ade085c07", size = 78866, upload-time = "2026-08-07T00:17:38.354Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/73/bc/8ed7dad2bc1506732cc503ccbbc0fd48786d85900bb2c6577a26a634843b/mypy_boto3_s3-1.43.66-py3-none-any.whl", hash = "sha256:f9385e190d423690dbc161260dac02439e3b6c9841e992ba6a92d15c1050b3af", size = 86296, upload-time = "2026-08-07T00:17:36.388Z" },
 ]
 
 [[package]]

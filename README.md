@@ -1,16 +1,22 @@
 # little-sister-aws
 
-**AWS for [little-sister](https://github.com/m-31/little-sister)**, in three parts:
+**AWS for [little-sister](https://github.com/m-31/little-sister)**, in four parts:
 the **`aws` check type** — one or more AWS accounts on the status tree, with a node
 per account and a node per aspect beneath it — the **secret provider** behind
-`aws-sm://` and `aws-ssm://` references, and the **identity seam** both of them open
-their sessions through, which a deployment may also use on its own.
+`aws-sm://` and `aws-ssm://` references, the **S3 keeper** that carries this
+instance's `var/state/` into a bucket, and the **identity seam** all three open their
+sessions through, which a deployment may also use on its own.
 
-- **Needs little-sister ≥ 0.3.13** (a floor, never a pin), and **boto3**.
+- **Needs little-sister ≥ 0.3.15** (a floor, never a pin), and **boto3**.
 - **Registers one check type: `aws`.**
 - **Ships the AWS secret provider** — `aws-sm://` and `aws-ssm://` secret
   references, with named reading identities — which a deployment installs by an
   explicit call, never by import (see *Resolving secrets from AWS*).
+- **Ships an S3 keeper** — `little_sister_aws.keeper`: little-sister's `var/state/`
+  in a bucket, so an instance redeployed onto a fresh machine comes up as the one
+  that stopped on the old one; one lease per prefix, so a second instance on the
+  same prefix stands by, says so, and takes over when the first is gone. Installed
+  by an explicit call, like the provider (see *Keeping the state in a bucket*).
 - **Ships the identity seam** — `little_sister_aws.identity`: a session opened from
   a profile, static keys or an assumed role, with the SSO login beside it — for code
   that needs one where no check exists (see *Opening a session without a check*).
@@ -134,16 +140,19 @@ region the account is watched in:
 | `batch` | `batch:DescribeJobQueues`, `batch:ListJobs` |
 
 The deployment's own identity needs `sts:AssumeRole` on each role, and
-`sts:GetCallerIdentity` is spent once per profile-only account.
+`sts:GetCallerIdentity` is spent once per profile-only account. The **keeper**, if
+one is configured, needs its own: `s3:GetObject` and `s3:PutObject` on the keys
+under its prefix, `s3:ListBucket` on the bucket, and — optionally, for the check
+that says whether versioning is on — `s3:GetBucketVersioning`.
 
 ## Resolving secrets from AWS
 
 This package also carries the AWS secret provider: little-sister secret
 references that read AWS Secrets Manager and SSM Parameter Store, resolved once
 at startup, before any check exists. A deployment installs it with one call in
-its import-before-app slot — **nothing registers on import**, because which
-stores an installation reads its credentials from is a decision, and a decision
-should be readable at the place it is taken:
+its import-before-app slot — **the provider registers nothing on import**, because
+which stores an installation reads its credentials from is a decision, and a
+decision should be readable at the place it is taken:
 
 ```python
 from little_sister_aws.secrets import register_aws_secret_resolvers
@@ -195,6 +204,168 @@ The stores need `secretsmanager:GetSecretValue` and `ssm:GetParameter` on
 whatever identity reads them, beside the `sts:AssumeRole` a role-bearing
 identity spends. The design record is
 [`docs/adr/0002-aws-secret-references.md`](docs/adr/0002-aws-secret-references.md).
+
+## Keeping the state in a bucket
+
+little-sister keeps what a restart needs as files under `var/state/` — the
+maintenance pins somebody set, the event log behind every node's history — and takes
+a **keeper** to carry that directory somewhere durable. This package has one, so a
+deployment redeployed onto a fresh machine comes up as the instance that stopped on
+the old one.
+
+Two things turn it on. A `config/aws-keeper.yaml`:
+
+```yaml
+bucket: example-monitoring-state   # required; nothing else is
+prefix: instances/prod             # default: the bucket's root. One instance per prefix.
+identity: live                     # default: none — read as whatever the host already is
+region: eu-central-1               # default: what the profile or the environment implies
+lapse_after: 3                     # default: 3 — missed heartbeats before the lease is dead
+```
+
+and a call in the same import-before-app block as the secret provider, because
+**the keeper registers nothing on import** either:
+
+```python
+from little_sister_aws.keeper import register_s3_keeper
+
+register_s3_keeper()               # returns None where no aws-keeper.yaml declares one
+```
+
+`identity:` names an entry in `config/aws.yaml` (above); one that was never declared
+refuses the start, as does an unknown key, a key left empty, a missing `bucket:`, or
+a `lapse_after` that is not a positive integer. **No file at all means no keeper** —
+which is what a second configuration root for a laptop wants — and the session is
+opened lazily, at the first call, so an unreachable bucket is a line on
+`/little-sister` rather than a start that fails.
+
+**One prefix, one instance, held by a lease.** One object under the prefix says
+who may write here, and the instance that holds it re-writes it every
+`state_interval` — a heartbeat — and writes the state files behind it. A second
+instance started on the same prefix restores the state like any other (reading
+needs no lease), then **stands by**: it monitors, keeps its state on its own disk,
+sends nothing to the bucket, reads the lease once per interval, and says so on its
+child `/little-sister/aws-keeper` at WARN. When the lease lapses — `lapse_after` heartbeats missed,
+three by default — or is given up, it takes over and writes on. A holder whose
+heartbeat is refused, or whose bucket does not answer for `lapse_after` intervals,
+demotes itself to standby *before* it writes anything, and takes the lease back
+when it is free. Nothing here needs a restart, and nothing here is red. The
+keeper's lines are the entries of `/little-sister/aws-keeper`, each under its own
+slug there (a pin holds against that path and slug), and every line is a claim:
+
+```
+standby       the lease on s3://…/instances/prod is held by
+              web-2:1:20260904T173000Z:9f3ac180, last heartbeat 40 s ago and
+              lapsing in 2m 20s; this instance keeps its state locally only, and
+              a pin set here does not survive it
+```
+
+`standby`, `demoted` and `unreachable` are WARN, by the library's own rule that
+what *would* be lost at a restart is WARN and only what *is* lost is ERROR — and a
+standby loses nothing while it stands. What it costs, said plainly: **a pin set on a
+standby is local**. What the keeper merely *knows* is the child's **report**, on its
+page and never on a card: who holds the lease and on what terms, whom it was taken
+from and how, the last transitions. A quiet holder's card therefore says nothing —
+the report does:
+
+```
+This instance (web-1:1:20260905T081500Z:2b7de044) holds the lease on
+s3://…/instances/prod: a heartbeat every 1m, lapsing after 3 missed.
+
+Took over s3://…/instances/prod from web-2:1:…, lapsed 12 s before (1 earlier
+claim, the most recent at …).
+```
+
+**Authority follows the lease.** Whoever holds it wrote the truth up to the moment
+it lapsed, so when a standby takes over it continues with the *store's* state and
+not its own: the keeper remembers the ETag of every file it loaded or saved, and at
+the takeover names the files the store changed since; little-sister adopts them
+before the first save and keeps what they replaced beside each file as `.bak`, listed
+on `/little-sister/state`, where **take the backups** swaps them back. A takeover
+that changed something says so on the keeper's child for ten minutes at WARN, then
+in its report; the successor of a holder that died before anybody wrote again takes
+over silently, with its own state.
+
+```
+takeover      took over s3://…/instances/prod: the store had changed for 2 files
+              (events.json, maintenance.json) since this instance last synced
+              with it at 09:12; what they replaced is on /little-sister/state
+standbys      1 instance is standing by on s3://…/instances/prod: web-2:1:…
+              since 09:14. In a rollout this clears within minutes; a second
+              instance that stays is a misconfiguration
+```
+
+and, in the report, the instance log's last transitions: *web-1:1:… took the lease
+from web-2:1:… (lapsed) at 09:20; web-2 stood by from 09:14 to 09:17; …*
+
+**The holder sees who stands by.** A standby writes a small presence file beside
+the lease every interval, with its own `ttl_seconds`; the holder lists the prefix
+once per interval — about the price of its heartbeat — and carries `standbys` at WARN
+while anybody is there. Whoever lists deletes a presence file older than its ttl, so
+a killed standby is gone from the page within one ttl of its death, and writes that
+instance's *stood by from … to …* into the **instance log**, `.little-sister-
+instances.json` beside the lease: one entry per transition — who took the lease from
+whom and how, who released it, who stood by from when to when — the last hundred,
+never restored, the last three shown in the keeper's report. It is the one record of the
+deployment that outlives every instance in it.
+
+**Two actions, for an operator who knows what they are doing**, on
+`/little-sister/aws-keeper`, admin-only: **Take over** writes the lease onto this
+instance regardless of who holds it — the holder demotes itself at its next
+heartbeat, within one interval, and until then both pages say *holds*, which is safe
+because no save runs behind a refused heartbeat; the taker's `predecessor` says it
+was an operator's and how fresh the holder's last heartbeat was, the holder's
+`demoted` says the same, and this instance adopts what the store changed and saves
+in the same click, since every action is followed by a flush; pressed on the holder
+itself it is that flush, the state written now — and **Release** gives the lease up
+now, as a clean stop would. A released instance
+does *not* take the lease back on its own — that would be a coin toss against the
+standby the button was pressed for — and says so at WARN (`released`: nothing of its
+state reaches the store until an instance takes the lease); *take over* takes it
+back, and once another instance has held the lease it is an ordinary standby again.
+
+**Two clocks.** Every stamp in the bucket is S3's clock, and every page shows a store
+stamp in the host's time — the offset is measured on every answer from the `Date`
+header — so a standby's *since* and the log's intervals line up with the local
+times beside them. A host more than 5 s off shows `clock` at WARN (cleared under
+3 s); past fifteen minutes S3 refuses every request, and that already shows as a
+lost lease.
+
+**Liveness is S3's clock, not anybody's.** Whether a lease is alive is the answer's
+`Date` against the object's `LastModified`, compared with the `ttl_seconds` the
+holder wrote — every term from S3, so two instances on two machines read the same
+thing. A **graceful stop** (`stop.sh`, SIGTERM) gives the lease up with a heartbeat
+of zero, so the next standby takes it on its next read instead of waiting; an
+instance terminated without a stop — an auto-scaling group's — is the case the
+lease is designed for, and the wait is `lapse_after × state_interval`.
+
+The mark is little-sister's — one per process, `<name>:<pid>:<started>:<tag>`, where
+the name is yours from `instance:` in `settings.yaml` and the hostname otherwise —
+and `/system` shows you the same mark for the instance you are looking at. Every
+instant in the lease is ISO 8601 UTC, and every instant in a line is shown in the
+`timezone` and `time_format` of `settings.yaml`, like the rest of the page.
+
+**What the bucket wants: versioning off.** The heartbeat is a `PUT` a minute, so
+versioning would be about 43,000 versions a month of a 463-byte object for a history
+nobody reads; a lifecycle rule bounds that and does not prevent it. The keeper asks
+`GetBucketVersioning` **once at startup** and carries a WARN line while it finds
+versioning enabled (suspended is fine; a bucket that once had it on can do no
+better). That needs `s3:GetBucketVersioning`; without it the keeper says in its
+report that it could not ask. The prefix holds the current state of one instance — a mirror of a
+bounded memory — and there is nothing in it worth a version.
+
+**What one instance costs**, eu-central-1, at the default interval: about **$0.50 a
+month** for the holder — 43,200 heartbeats and as many listings at the `PUT` price,
+the state files only when they change, the instance log only on transitions — and
+about **$0.25** for a standby, its presence heartbeats plus its reads. A shorter
+`state_interval` buys a shorter failover at the same rate per heartbeat.
+
+The identity needs `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on the keys
+under the prefix, `s3:ListBucket` on the bucket, and optionally
+`s3:GetBucketVersioning`.
+The design record is
+[`docs/adr/0004-the-s3-keeper.md`](docs/adr/0004-the-s3-keeper.md); the annotated
+file is [`examples/aws-keeper.yaml`](examples/aws-keeper.yaml).
 
 ## Opening a session without a check
 
@@ -258,12 +429,15 @@ git config core.hooksPath hooks
 ```
 
 [`hooks/pre-commit`](hooks/pre-commit) runs exactly the five commands under that
-comment and is **byte-identical in every project of the family**, so a fix to the gate is a fix everywhere. The tests
+comment and is **byte-identical in every Python project of the family**, so a fix to the gate is a fix everywhere. The tests
 never call AWS: every boto3 client is built behind one seam per service, and the
 suite replaces it.
 
 ## Documentation
 
+- [`docs/architecture.md`](docs/architecture.md) — what is built: the surfaces above
+  and the rules that bind them, with the record named beside each. Written for
+  somebody working **in** this package rather than installing it.
 - [`docs/adr/0001-the-aws-check-type.md`](docs/adr/0001-the-aws-check-type.md) — why
   one type with aspects rather than one type per service, why the tree is account
   first, and why this package uses boto3 where the rest of the family uses stdlib
@@ -275,6 +449,10 @@ suite replaces it.
   — how this type grades: a threshold is a warn/error pair with a sentence, a rule
   owns a set of names and overrides the block's limits for them, and the package
   ships no thresholds of its own.
+- [`docs/adr/0004-the-s3-keeper.md`](docs/adr/0004-the-s3-keeper.md) — the keeper: its
+  own configuration aspect, why every write is conditional and a refused one is
+  reported rather than merged away, and why the session is re-opened at call time
+  instead of the frozen identity seam growing a refresh.
 
 ## License
 

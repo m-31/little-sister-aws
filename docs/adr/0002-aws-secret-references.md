@@ -1,7 +1,7 @@
 # ADR-0002 — AWS secret references: strict stores, JSON Pointer selection, identity schemes
 
 - **Status:** Accepted
-- **Date:** 2026-08-23 (the reference grammar was accepted 2026-08-16)
+- **Date:** 2026-08-29 (the reference grammar was accepted 2026-08-16)
 - **Related:** [ADR-0001](0001-the-aws-check-type.md) (the identity seam these
   resolvers open sessions through), little-sister **ADR-0023** (the
   secret-reference seam and its failure semantics), little-sister **ADR-0035**
@@ -9,7 +9,7 @@
   claimed by exactly one package)
 
 > The reference grammar below was written in the deployment that first needed the
-> resolvers and travelled here with the code, renumbered into this repository's
+> resolvers and traveled here with the code, renumbered into this repository's
 > sequence — the same road this package's check type took. Every committed
 > reference and every refusal wording survived that move verbatim, and the suites
 > that pin them moved with it.
@@ -92,22 +92,18 @@ check file. They did.
    somewhere to point. How that identity authenticates stays installation
    configuration, outside the reference grammar.
 
-   > **Update, 2026-08-28.** An identity that names **only a `region`** is legal,
-   > and the original wording read it as illegal — an entry with no `profile` and
-   > no `role_arn` was refused as *the ambient chain under another name*. That
-   > reading missed what §9 below already says: the region belongs to the
-   > identity, so `live: {region: eu-west-1}` says something the plain schemes
-   > cannot — *read this store in eu-west-1 whatever this host's environment
-   > implies*. It is also the shape a server wants, where the ambient chain is an
-   > instance or task role that is already exactly right and there is nothing to
-   > assume. And it is what keeps this section's own promise for a deployment that
-   > runs in more than one place: with it, only the `aws.yaml` differs between a
-   > laptop and a cloud account, and every committed reference stays identical;
-   > without it, the *reference* had to change per environment, which is the
-   > credential re-entering the address that §5 forbids. What stays refused is an
-   > entry that names nothing at all — no profile, no role, no region — which
-   > really is the plain scheme wearing a name and is usually a block somebody
-   > meant to fill in.
+   An identity that names **only a `region`** is legal. The region belongs to the
+   identity (§9), so `live: {region: eu-west-1}` says something the plain schemes
+   cannot — *read this store in eu-west-1 whatever this host's environment implies*.
+   It is the shape a server wants, where the ambient chain is an instance or task
+   role that is already exactly right and there is nothing to assume, and it is what
+   keeps this section's promise for a deployment that runs in more than one place:
+   only the `aws.yaml` differs between a laptop and a cloud account, and every
+   committed reference stays identical — otherwise the *reference* would change per
+   environment, which is the credential re-entering the address that §5 forbids.
+   What stays refused is an entry that names nothing at all — no profile, no role, no
+   region — which really is the plain scheme wearing a name and is usually a block
+   somebody meant to fill in.
 
 7. **The identity goes in the scheme because no separator survives both stores.** A
    cross-account Secrets Manager read requires a full **ARN** as the secret id, and an

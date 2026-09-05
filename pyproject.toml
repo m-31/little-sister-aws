@@ -1,13 +1,14 @@
 [project]
 name = "little-sister-aws"
-version = "0.1.2"
-# **Three surfaces, not one.** The old summary named only the check type, which was
-# true when this package was only that; it now also carries the AWS secret provider
-# and the identity seam both of them open sessions through, and a summary that names
-# one of three sends somebody looking for the other two to a package they already
-# have. Metadata is frozen per artifact — correcting this after a release costs a
-# version — so it says what the package *is* rather than what it was extracted as.
-description = "AWS for little-sister: an aws check type (CloudWatch, EC2, Lambda, CodePipeline, Batch), Secrets Manager and Parameter Store secret references, and the identity seam behind both."
+version = "0.1.3"
+# **Every surface, not one.** The old summary named only the check type, which was
+# true when this package was only that; it now also carries the AWS secret provider,
+# the S3 keeper and the identity seam all three open sessions through, and a summary
+# that names some of them sends somebody looking for the rest to a package they
+# already have. Metadata is frozen per artifact — correcting this after a release
+# costs a version — so it is extended in the release that adds a surface, and it says
+# what the package *is* rather than what it was extracted as.
+description = "AWS for little-sister: an aws check type (CloudWatch, EC2, Lambda, CodePipeline, Batch), Secrets Manager and Parameter Store secret references, an S3 keeper for the instance state, and the identity seam behind all three."
 authors = [
     { name = "Michael Meyling" }
 ]
@@ -42,19 +43,24 @@ requires-python = ">=3.11"
 # a release. The upgrade a floor cannot see, the library moving *past* the
 # surface, is caught by `require_api()` in `__init__.py`.
 #
-# **0.3.13**, the release that speaks **check API epoch 2** — the epoch this
-# package now declares. It moved because three names *left* the surface: the
-# library reads the whole `subnodes:` block itself and a type only declares
-# (little-sister ADR-0025, 2026-08-19 update). That is the direction an epoch is
-# for, and the floor has to move with it or a resolver would install a library
-# `require_api()` is about to reject. The floor's other job is unchanged and still
-# needs a real number: this module reads `little_sister.spans`, which 0.3.11 does
-# not carry, and an *added* name is the mismatch an epoch cannot catch — it says
-# what was removed and nothing about what arrived.
+# **0.3.15**, the release that carries the **keeper seam** this package now fills
+# (`little_sister.keeper`, little-sister architecture.md §11 and its ADR-0071 §5) —
+# and, from the same release, `little_sister.instance`, the mark this package writes
+# into a bucket and used to invent for itself (its ADR-0074). Two added names, one
+# floor: they went out together, so there is nothing to tell apart.
+# An *added* name is exactly the mismatch `require_api()` cannot catch — an epoch
+# says what was **removed** and nothing about what arrived — so the floor is the
+# only thing standing between an older library and an `ImportError` at the
+# deployment's registration call. The check API epoch did not move with it: a
+# keeper is not a check, and nothing left the check-authoring surface.
+#
+# It was **0.3.13** before, for epoch 2, when three names left that surface
+# (little-sister ADR-0025); the reasoning is kept because it is the other half of
+# what a floor is for, and both halves still apply.
 dependencies = [
-    "little-sister>=0.3.13",
+    "little-sister>=0.3.15",
     # boto3, and the reason this package is the first in the family with a
-    # dependency beyond the library (its ADR-0001 §3). A **floor**, like the one
+    # dependency beyond the library (ADR-0001 §3). A **floor**, like the one
     # above: boto3 releases daily and a pin here would fight every consumer.
     "boto3>=1.40.0",
 ]
@@ -84,38 +90,41 @@ changelog = "https://github.com/m-31/little-sister-aws/blob/main/CHANGELOG.md"
 package = true
 
 # no-sources-table:begin
-# **No `[tool.uv.sources]`, deliberately.** little-sister is on the index, so the
-# floor above resolves like any other dependency and there is nothing left to
-# redirect. Committing the table is harmful, and worth stating precisely because the
-# imprecise version of this paragraph was wrong in both directions: a consumer
-# installing from an index is **unaffected**, since uv honours a dependency's sources
-# table only when it resolves that dependency from a path or a git checkout — while a
-# consumer that *does* resolve this package that way has it **imposed**, and the
-# install fails on a directory nobody else's disk has. The table also reaches the
-# sdist, where uv rewrites the header, so searching for the table name will not find
-# it (little-sister `plugin-repository.md` §3).
-#
-# To develop against a local library checkout, add the redirect and do not commit
-# it:
+# **No `[tool.uv.sources]` in a release, and one in the meantime is allowed.**
+# little-sister is on the index, so the floor above resolves like any other dependency
+# and a released tree needs no redirect at all. Developing against an **unreleased**
+# library is the case that does — this package cannot import a name the index does not
+# carry yet — and the redirect is how:
 #
 #     [tool.uv.sources]
 #     little-sister = { git = "file:///path/to/little-sister" }
 #
-# It leaves a second trace, and that one arrives by itself: the next `uv run` rewrites
-# the committed `uv.lock` to name the directory, and the pre-commit gate **is** a
-# `uv run`. A lock naming a path outside its own repository resolves on no other
-# machine, so `uv sync --locked` then fails for CI and for every clone laid out
-# differently.
+# `release/local.sh on` writes it and re-locks. It leaves a second trace, and that one
+# arrives by itself: the next `uv run` rewrites the committed `uv.lock` to name the
+# directory, and the pre-commit gate **is** a `uv run`. **Committing both is the
+# ordinary state of that window**, and the commit gate stays quiet on purpose — a
+# window in which work still has to be committed is not one a gate can refuse without
+# refusing the state it prescribes.
 #
-# **Both traces are refused when a release is condensed** — `check_no_local_sources` —
-# and deliberately not before. The window in which this redirect is the *right* thing to
-# have is a window in which work still has to be committed, so a commit gate that refused
-# it would be refusing the state it prescribes; it stays quiet, and the release refuses,
-# which names the repository being released at the one moment the finding is actionable.
-# This used to end by asking you to restore the two files before committing. Asking was
-# not enough: on 2026-08-16 both were found committed in two plugins at once, with every
-# release check passing. A lock may name exactly one path, `editable = "."`, which is a
-# repository naming itself.
+# What it costs while it stands, measured rather than assumed: a lock naming a path
+# outside its own repository resolves on no other machine, so `uv sync --locked` fails
+# for CI and for every clone laid out differently. A lock may name exactly one path,
+# `editable = "."`, which is a repository naming itself.
+#
+# **What must never happen is either trace reaching a published artifact**, and that is
+# where they are refused — `check_no_local_sources`, when a release is condensed, which
+# names the repository being released at the one moment the finding is actionable. The
+# costs there are the ones worth stating precisely, because the imprecise version of
+# this paragraph was wrong in both directions: a consumer installing from an index is
+# **unaffected**, since uv honors a dependency's sources table only when it resolves
+# that dependency from a path or a git checkout — while a consumer that *does* resolve
+# this package that way has it **imposed**, and the install fails on a directory nobody
+# else's disk has. The table also reaches the sdist, where uv rewrites the header, so
+# searching for the table name will not find it (little-sister
+# `plugin-repository.md` §3). This paragraph used to ask an author to restore the two
+# files before committing, and asking was not enough: on 2026-08-16 both were found
+# committed in two plugins at once, with every release check passing. The release is
+# what catches it, and asking has stopped.
 # no-sources-table:end
 
 [dependency-groups]
@@ -131,9 +140,9 @@ dev = [
     "shellcheck-py>=0.11.0.1",
     # Without the per-service extras every boto3 client types as `BaseClient` and
     # strict mypy checks nothing at all on the one call path that matters. One
-    # extra per service this package reads: the check's five aspects, STS, and
-    # the secret provider's two stores.
-    "boto3-stubs[batch,cloudwatch,codepipeline,ec2,lambda,logs,secretsmanager,ssm,sts]>=1.40.0",
+    # extra per service this package reads: the check's five aspects, STS, the
+    # secret provider's two stores, and S3 for the keeper.
+    "boto3-stubs[batch,cloudwatch,codepipeline,ec2,lambda,logs,s3,secretsmanager,ssm,sts]>=1.40.0",
     "types-PyYAML",
 ]
 

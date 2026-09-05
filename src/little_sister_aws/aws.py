@@ -217,7 +217,7 @@ DEFAULT_ERROR_MAX_AGE_SECONDS = 14 * 86400
 #: ``PipelineExecutionStatus`` → the code that line reports, keyed in lower case
 #: because CodePipeline spells its statuses in mixed case where CloudWatch shouts
 #: them. ``InProgress`` is a warning and
-#: *everything* that is not ``Succeeded`` is an error — a stopped, cancelled or
+#: *everything* that is not ``Succeeded`` is an error — a stopped, canceled or
 #: superseded run still means the newest thing this pipeline did was not a
 #: deployment.
 DEFAULT_PIPELINE_STATE_MAP = {
@@ -293,7 +293,7 @@ PIN_NOTE = ("Each line can be put into maintenance on its own — pin the line y
 #: entry, expanded in either text.
 #:
 #: **It says "this account" rather than naming one**, and that is the consequence
-#: of the library reading the block (little-sister ADR-0025, 2026-08-19 update): a
+#: of the library reading the block (little-sister ADR-0025): a
 #: label is resolved once per subnode *name*, and every account's `ec2` leaf is
 #: named `ec2`. Neither fact is lost — the leaf's parent node **is** the account
 #: and its card carries the regions this check reads for it, and each leaf's own
@@ -1355,17 +1355,40 @@ def _parse_batch(value: object, shorten: tuple[tuple[str, str], ...] = ()
     )
 
 
+def _console_url(region: str, path: str, fragment: str = "") -> str:
+    """One console address: ``https://<region>.console.aws.amazon.com/<path>``,
+    with the region repeated as a query parameter and an optional fragment.
+
+    Every link this type emits is that shape — the five ``<service>/home#…``
+    pages and CodePipeline's path-addressed one, whose query simply lands after a
+    longer path. They were six string templates that agreed about the host, the
+    scheme and the duplicated region by being written the same way six times,
+    which is the agreement that stops holding the day one of them is edited.
+
+    The **caller quotes what it interpolates**, because only the caller knows
+    which part is a name: a fragment is assembled from literal syntax
+    (``s=Alarms&alarm=``) and one untrusted value, and quoting the whole of it
+    would escape the syntax as well.
+    """
+    address = f"https://{region}.console.aws.amazon.com/{path}?region={region}"
+    return f"{address}#{fragment}" if fragment else address
+
+
+def _quoted(value: str) -> str:
+    """One name, escaped for a URL — :func:`urllib.parse.quote`'s defaults, which
+    leave ``/`` alone because the console's own fragments carry it."""
+    return urllib.parse.quote(value)
+
+
 def _function_link(region: str, name: str) -> str:
-    return (f"https://{region}.console.aws.amazon.com/lambda/home?region={region}"
-            f"#/functions/{urllib.parse.quote(name)}")
+    return _console_url(region, "lambda/home", f"/functions/{_quoted(name)}")
 
 
 def _console_link(alarm: Alarm) -> str:
     """The alarm in the console. The older ``#s=Alarms`` fragment, which the
     console still redirects, works for both alarm kinds."""
-    quoted = urllib.parse.quote(alarm.name)
-    return (f"https://{alarm.region}.console.aws.amazon.com/cloudwatch/home"
-            f"?region={alarm.region}#s=Alarms&alarm={quoted}")
+    return _console_url(alarm.region, "cloudwatch/home",
+                        f"s=Alarms&alarm={_quoted(alarm.name)}")
 
 
 def _utcnow() -> datetime:
@@ -1375,8 +1398,7 @@ def _utcnow() -> datetime:
 
 def _instance_link(region: str, name: str) -> str:
     """The console, filtered to the instances carrying this name."""
-    return (f"https://{region}.console.aws.amazon.com/ec2/home?region={region}"
-            f"#Instances:search={urllib.parse.quote(name)}")
+    return _console_url(region, "ec2/home", f"Instances:search={_quoted(name)}")
 
 
 def _state_phrase(state: str) -> str:
@@ -1386,9 +1408,11 @@ def _state_phrase(state: str) -> str:
 
 
 def _pipeline_link(region: str, name: str) -> str:
-    """The pipeline's execution history in the console."""
-    return (f"https://{region}.console.aws.amazon.com/codesuite/codepipeline"
-            f"/pipelines/{urllib.parse.quote(name)}/executions?region={region}")
+    """The pipeline's execution history in the console — the one address of the
+    six that is a **path** rather than a fragment, which is why the shared builder
+    takes the path and not just a service name."""
+    return _console_url(
+        region, f"codesuite/codepipeline/pipelines/{_quoted(name)}/executions")
 
 
 def _job_link(region: str, job_id: str) -> str:
@@ -1398,15 +1422,13 @@ def _job_link(region: str, job_id: str) -> str:
     carries the account number, which is exactly the string ADR-0006 keeps out
     of a line somebody may bookmark or paste into a ticket.
     """
-    return (f"https://{region}.console.aws.amazon.com/batch/home?region={region}"
-            f"#jobs/detail/{urllib.parse.quote(job_id)}")
+    return _console_url(region, "batch/home", f"jobs/detail/{_quoted(job_id)}")
 
 
 def _queue_link(region: str) -> str:
     """The queue list, for the same reason: the per-queue page is addressed by
     ARN and the list is not."""
-    return (f"https://{region}.console.aws.amazon.com/batch/home"
-            f"?region={region}#queues")
+    return _console_url(region, "batch/home", "queues")
 
 
 def _instance_order(key: tuple[str, str | None]) -> tuple[str, bool, str]:
@@ -1469,21 +1491,32 @@ def _worst(first: StatusCode, second: StatusCode) -> StatusCode:
     return first if _CODE_RANK.get(first, 3) <= _CODE_RANK.get(second, 3) else second
 
 
-def _scope_line(noun: str, found: int, regions: tuple[str, ...]) -> Entry:
-    """How many of a thing were seen at all (little-sister ADR-0043).
+def _scope_line(noun: str, found: int, regions: tuple[str, ...], *,
+                code: StatusCode = StatusCode.OK, tail: str = "") -> Entry:
+    """How many of a thing were seen at all (little-sister ADR-0043) — the one
+    coverage line every aspect writes.
 
-    OK when the answer is none, unlike the alarm aspect's: an account may
-    legitimately run no pipelines and no Batch queues, where an account whose
-    CloudWatch has gone quiet has probably lost its credential. The two readings
-    differ on purpose, and this is the half that does not grade.
+    **The wording is shared and the grading is not.** Four aspects were spelling
+    this sentence out separately, three of them identically but for the noun, and
+    a fourth that really does say something else: an empty CloudWatch is a
+    **warning**, because an account whose alarms have gone quiet has probably lost
+    its credential, where an account may legitimately run no EC2, no Lambda, no
+    pipelines and no Batch queues. That difference is a judgment about the
+    service, so it stays with the aspect and arrives here as ``code`` and
+    ``tail`` — what the line *says* is one place, what it *claims* is the
+    caller's.
+
+    ``tail`` is appended inside the sentence's own punctuation rather than being
+    a second entry, for the reason the aspect cards give elsewhere: two entries
+    read as two findings, and *expected at least three* is not a finding of its
+    own.
     """
     where = ", ".join(plain(region) for region in regions)
     if not found:
-        return Entry(slug("scope"), f"no {noun}s in scope ({where})",
-                     StatusCode.OK)
+        return Entry(slug("scope"), f"no {noun}s in scope ({where}){tail}", code)
+    counted = noun if found == 1 else f"{noun}s"
     return Entry(slug("scope"),
-                 f"{found} {noun if found == 1 else noun + 's'} in scope "
-                 f"({where})", StatusCode.OK)
+                 f"{found} {counted} in scope ({where}){tail}", code)
 
 
 @register("aws")
@@ -1512,7 +1545,7 @@ class AwsCheck(Check):
         # (little-sister ADR-0049). The two declarations beside it are this type's
         # half of the `subnodes:` block: it states the text it ships and the token
         # that text reuses, and little-sister does the reading and the resolving
-        # (its ADR-0025, 2026-08-19 update).
+        # (little-sister ADR-0025).
         super().__init__(subnode_defaults=SUBNODES,
                          label_tokens={"pin_note": PIN_NOTE}, **kwargs)
         self.accounts = accounts
@@ -1909,19 +1942,19 @@ class AwsCheck(Check):
     def _scope_entry(self, counted: int, regions: tuple[str, ...]) -> Entry:
         """The coverage backstop (little-sister ADR-0043), as a coded line so it
         sorts with the rest: a credential that has stopped seeing anything looks
-        exactly like a healthy account until something says how many it saw."""
-        where = ", ".join(plain(region) for region in regions)
+        exactly like a healthy account until something says how many it saw.
+
+        This is the aspect whose coverage line **grades**, and the only one: the
+        sentence comes from :func:`_scope_line`, the two verdicts are this
+        aspect's own.
+        """
         minimum = self.cloudwatch.expect_min_alarms
         if not counted:
-            return Entry(slug("scope"), f"no alarms in scope ({where})",
-                         StatusCode.WARN)
-        noun = "alarm" if counted == 1 else "alarms"
+            return _scope_line("alarm", 0, regions, code=StatusCode.WARN)
         if counted < minimum:
-            return Entry(slug("scope"),
-                         f"{counted} {noun} in scope ({where}), expected at "
-                         f"least {minimum}", StatusCode.WARN)
-        return Entry(slug("scope"), f"{counted} {noun} in scope ({where})",
-                     StatusCode.OK)
+            return _scope_line("alarm", counted, regions, code=StatusCode.WARN,
+                               tail=f", expected at least {minimum}")
+        return _scope_line("alarm", counted, regions)
 
     @staticmethod
     def _roster(alarms: list[Alarm], show_region: bool) -> str:
@@ -2014,7 +2047,7 @@ class AwsCheck(Check):
         entries = [self._instance_entry(region, name, counts[(region, name)],
                                         ages[(region, name)], show_region)
                    for (region, name) in sorted(kept, key=_instance_order)]
-        reason = [*failures, *entries, self._instance_scope_entry(found, regions)]
+        reason = [*failures, *entries, _scope_line("instance", found, regions)]
         reason.sort(key=lambda entry: _CODE_RANK.get(
             entry.code or StatusCode.OK, 3))
         return CheckResult(reason=list(reason), name=EC2,
@@ -2066,19 +2099,6 @@ class AwsCheck(Check):
                      f"{where}{label}: {count}{suffix}{said}", code)
 
     @staticmethod
-    def _instance_scope_entry(found: int, regions: tuple[str, ...]) -> Entry:
-        """How many instances were seen at all. Unlike the alarm aspect's, an
-        empty one is **not** a warning: an account may legitimately run no EC2 at
-        all, where an account whose CloudWatch suddenly shows nothing is a
-        symptom."""
-        where = ", ".join(plain(region) for region in regions)
-        if not found:
-            return Entry(slug("scope"), f"no instances in scope ({where})",
-                         StatusCode.OK)
-        noun = "instance" if found == 1 else "instances"
-        return Entry(slug("scope"), f"{found} {noun} in scope ({where})",
-                     StatusCode.OK)
-
     @staticmethod
     def _instance_roster(counts: dict[tuple[str, str | None], int],
                          ages: dict[tuple[str, str | None], tuple[int, ...]],
@@ -2269,23 +2289,13 @@ class AwsCheck(Check):
                     StatusCode.WARN))
         entries = [self._function_entry(reading, now, show_region)
                    for reading in readings]
-        scope = self._function_scope_entry(len(readings), regions)
+        scope = _scope_line("function", len(readings), regions)
         reason = [*failures, *entries, scope]
         reason.sort(key=lambda entry: _CODE_RANK.get(
             entry.code or StatusCode.OK, 3))
         return CheckResult(reason=list(reason), name=LAMBDA,
                            description=f"Lambda functions in {account.name}",
                            report=self._function_roster(readings, show_region))
-
-    @staticmethod
-    def _function_scope_entry(found: int, regions: tuple[str, ...]) -> Entry:
-        where = ", ".join(plain(region) for region in regions)
-        if not found:
-            return Entry(slug("scope"), f"no functions in scope ({where})",
-                         StatusCode.OK)
-        noun = "function" if found == 1 else "functions"
-        return Entry(slug("scope"), f"{found} {noun} in scope ({where})",
-                     StatusCode.OK)
 
     def _function_roster(self, readings: list[FunctionReading],
                          show_region: bool) -> str:
@@ -2849,7 +2859,7 @@ class AwsCheck(Check):
         if rule.ignore:
             return "neither listed nor counted"
         count, aged = self.ec2.thresholds_for(rule)
-        # Each half is labelled: "warn above 15, warn above 2h" would read as one
+        # Each half is labeled: "warn above 15, warn above 2h" would read as one
         # judgment with two warning levels, which is not a thing.
         # Levels only, no sentences: a rule's sentence is shown where it is
         # useful — on the line it colors — and six rules quoting two sentences

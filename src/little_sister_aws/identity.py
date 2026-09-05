@@ -484,6 +484,14 @@ def open_session(identity: Identity, *, base: Session | None = None,
 
     Pass *base* to reuse a session already built for this identity's profile —
     a caller opening several roles from one profile builds it once and says so.
+
+    **It renews nothing.** A credential that has gone stale raises from here, and
+    whether to answer that with ``aws sso login`` — and what the attempt may cost —
+    is the caller's, one call further out, because a check waiting on an engine
+    worker and an application waiting inside its own import can afford very
+    different numbers (ADR-0001 §5, its fourth point; the module docstring's second
+    rule). The three callers in this family answer it differently on purpose, and
+    :func:`is_credential_error` is the reading they share.
     """
     source = base if base is not None else base_session(identity, factory=factory)
     session = assumed_session(identity, source, factory=factory)
@@ -509,7 +517,32 @@ def open_session(identity: Identity, *, base: Session | None = None,
 def is_credential_error(error: BaseException) -> bool:
     """True when *error* means the credentials went stale rather than that AWS
     said no. The two need opposite answers: a stale credential is worth renewing
-    and retrying, an ``AccessDenied`` is worth reporting."""
+    and retrying, an ``AccessDenied`` is worth reporting.
+
+    **What this answers for an SSO profile**, measured on 2026-09-03 against
+    botocore 1.43 with a fabricated ``~/.aws`` and an endpoint nothing was
+    listening on, because *"it tried to log in when I had no connection"* is the
+    reading somebody will otherwise reach for:
+
+    * a **valid** cached token and an unreachable endpoint —
+      ``EndpointConnectionError``, **false**: the transport failure travels as itself.
+    * an **expired** token with refresh material, endpoint unreachable — the refresh
+      is attempted and its ``EndpointConnectionError`` propagates, **false**.
+    * an **expired** token with nothing to refresh with — no ``refreshToken``, or a
+      registration that has itself expired — ``TokenRetrievalError``, **true**, and
+      decided from the token cache alone without a single call. This is the one that
+      renews on a machine with no connection, and the reading is *right*: the
+      credential is stale and a login is the fix. It is simply the same answer online
+      and off.
+    * a valid token an endpoint **refuses** — ``UnauthorizedSSOTokenError``, **true**.
+
+    So being offline does not by itself make this say yes, and what it costs when it
+    does is one login attempt per profile per process, bounded by the caller's timeout
+    and the cooldown. **Whether to spend that is not decided here**: this function
+    reports a state, and ``open_session`` renews nothing — whether to try, and at what
+    price, belongs one call further out (ADR-0001 §5, its fourth point). The three
+    callers in this family answer it differently on purpose.
+    """
     if type(error).__name__ in CREDENTIAL_ERROR_TYPES:
         return True
     if isinstance(error, ClientError):

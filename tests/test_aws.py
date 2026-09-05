@@ -923,7 +923,7 @@ def test_an_alarm_name_with_markdown_in_it_is_folded_but_the_link_is_not() -> No
 
 
 def test_the_aspect_leaf_declares_its_built_in_display_text() -> None:
-    # Declared, not stamped (little-sister ADR-0025, 2026-08-19 update): the text
+    # Declared, not stamped (little-sister ADR-0025): the text
     # is resolved by the library and written by the engine per subnode name, so
     # it is read off the check rather than off the result. The `{pin_note}` token
     # this package declares beside it has expanded by the time it lands here.
@@ -1721,7 +1721,7 @@ def test_a_refusal_names_the_rule_it_is_about() -> None:
 
 def test_a_rule_that_matches_nothing_goes_to_the_log_and_not_to_a_node(
         caplog: pytest.LogCaptureFixture) -> None:
-    """A regex with a typo in it is a fact about the *configuration*. Colouring
+    """A regex with a typo in it is a fact about the *configuration*. Coloring
     a card over it would send an operator hunting through an account where
     nothing is wrong."""
     check = _build(ec2={"rules": [
@@ -2014,7 +2014,7 @@ def test_the_log_reading_can_be_switched_off_entirely() -> None:
 
 def test_an_ignored_function_is_skipped_by_its_whole_name() -> None:
     """A rule matching by exact `names:` says what the old `ignore:` list said —
-    and a neighbour whose name merely starts the same is untouched."""
+    and a neighbor whose name merely starts the same is untouched."""
     leaf = _lambda(_build(**{"lambda": {"rules": [
         {"name": "the old collector", "names": ["running-collector-lambda"],
          "ignore": True}]}}),
@@ -3713,3 +3713,87 @@ def test_a_healthy_run_never_asks_who_it_is(
     _stub(check, sts)
     check.run()
     assert sts.identity_calls == 0
+
+
+# --- the shared console address and the shared coverage line -----------------
+#
+# Six link builders and four coverage lines were six and four string templates
+# that agreed by having been written the same way. These pin what the fold onto
+# `_console_url` and `_scope_line` had to preserve exactly — the values are the
+# ones the six builders produced before it, captured rather than re-derived.
+
+CONSOLE = "https://eu-central-1.console.aws.amazon.com"
+#: A space and a slash, because the two are escaped differently and the console's
+#: own fragments carry a literal `/`.
+AWKWARD = "a b/c"
+
+
+@pytest.mark.parametrize("built,expected", [
+    (lambda: aws_module._function_link("eu-central-1", AWKWARD),
+     f"{CONSOLE}/lambda/home?region=eu-central-1#/functions/a%20b/c"),
+    (lambda: aws_module._console_link(
+        Alarm(name=AWKWARD, region="eu-central-1", state="ALARM",
+              description="", composite=False)),
+     f"{CONSOLE}/cloudwatch/home?region=eu-central-1#s=Alarms&alarm=a%20b/c"),
+    (lambda: aws_module._instance_link("eu-central-1", AWKWARD),
+     f"{CONSOLE}/ec2/home?region=eu-central-1#Instances:search=a%20b/c"),
+    (lambda: aws_module._pipeline_link("eu-central-1", AWKWARD),
+     f"{CONSOLE}/codesuite/codepipeline/pipelines/a%20b/c/executions"
+     "?region=eu-central-1"),
+    (lambda: aws_module._job_link("eu-central-1", AWKWARD),
+     f"{CONSOLE}/batch/home?region=eu-central-1#jobs/detail/a%20b/c"),
+    (lambda: aws_module._queue_link("eu-central-1"),
+     f"{CONSOLE}/batch/home?region=eu-central-1#queues"),
+])
+def test_every_console_link_is_the_address_it_was(built: Any,
+                                                  expected: str) -> None:
+    assert built() == expected
+
+
+def test_the_region_is_in_the_host_and_in_the_query() -> None:
+    """Twice, which is what the console wants and what six copies each had to
+    remember."""
+    address = aws_module._console_url("eu-west-1", "batch/home", "queues")
+
+    assert address == ("https://eu-west-1.console.aws.amazon.com/batch/home"
+                       "?region=eu-west-1#queues")
+
+
+def test_a_link_with_no_fragment_carries_no_hash() -> None:
+    """CodePipeline's address is a path, so an empty fragment must not leave a
+    trailing `#` on it."""
+    assert aws_module._console_url("eu-west-1", "codesuite/x") == (
+        "https://eu-west-1.console.aws.amazon.com/codesuite/x?region=eu-west-1")
+
+
+@pytest.mark.parametrize("found,noun,text", [
+    (0, "pipeline", "no pipelines in scope (eu-central-1, eu-west-1)"),
+    (1, "pipeline", "1 pipeline in scope (eu-central-1, eu-west-1)"),
+    (2, "job queue", "2 job queues in scope (eu-central-1, eu-west-1)"),
+    (1, "job queue", "1 job queue in scope (eu-central-1, eu-west-1)"),
+])
+def test_the_coverage_line_counts_and_pluralizes(found: int, noun: str,
+                                                 text: str) -> None:
+    line = aws_module._scope_line(noun, found, ("eu-central-1", "eu-west-1"))
+
+    assert line.text == text
+    assert line.code is StatusCode.OK
+    assert line.slug == "scope"
+
+
+def test_the_coverage_line_grades_only_where_the_caller_says_so() -> None:
+    """The wording is shared and the verdict is not: an empty CloudWatch is a
+    warning because alarms going quiet is a symptom, where an account may
+    legitimately run no EC2 at all."""
+    quiet = aws_module._scope_line("alarm", 0, ("eu-central-1",),
+                                   code=StatusCode.WARN)
+    short = aws_module._scope_line("alarm", 2, ("eu-central-1",),
+                                   code=StatusCode.WARN,
+                                   tail=", expected at least 5")
+
+    assert quiet.text == "no alarms in scope (eu-central-1)"
+    assert quiet.code is StatusCode.WARN
+    assert short.text == "2 alarms in scope (eu-central-1), expected at least 5"
+    assert short.code is StatusCode.WARN
+    # one entry, not two: "expected at least five" is not a finding of its own
+    assert short.slug == "scope"

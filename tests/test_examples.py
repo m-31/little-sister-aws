@@ -28,15 +28,18 @@ import yaml
 
 from little_sister_aws.aws import AwsCheck
 from little_sister_aws.identities import declare_aspect, load_identities
+from little_sister_aws.keeper import KeeperConfig, load_keeper_config
+from little_sister_aws.keeper import declare_aspect as declare_keeper_aspect
 
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 
 
 @pytest.fixture(autouse=True)
 def _declared() -> None:
-    """The aspect is claimed before anything asks for its file — the order
+    """The aspects are claimed before anything asks for their files — the order
     `register_extensions()` keeps."""
     declare_aspect()
+    declare_keeper_aspect()
 
 
 def _check_config() -> dict[str, Any]:
@@ -89,6 +92,30 @@ def test_the_codepipeline_and_lambda_examples_carry_rules_too() -> None:
     assert any(rule.ignore for rule in check.codepipeline.rules)
     assert check.lambda_.rules, "the lambda example must show `rules:`"
     assert any(rule.ignore for rule in check.lambda_.rules)
+
+
+def test_the_keeper_example_parses() -> None:
+    """`examples/aws-keeper.yaml` is read by the loader an operator's copy meets,
+    which refuses an unknown key rather than ignoring it — so a key retired from
+    this file would fail here with the message the operator would have got."""
+    config = load_keeper_config(EXAMPLES)
+
+    assert isinstance(config, KeeperConfig)
+    assert config.bucket, "the example must show a bucket — it is the one required key"
+
+
+def test_the_keeper_example_shows_every_key_it_takes() -> None:
+    """PL5: the example is the annotated *shape*, so a key it stops demonstrating
+    is a key nobody copying this file will know exists."""
+    config = load_keeper_config(EXAMPLES)
+
+    assert config is not None
+    assert config.prefix, "the example must show `prefix:`"
+    assert config.identity, "the example must show `identity:`"
+    assert config.region, "the example must show `region:`"
+    assert config.prefix.endswith("/"), (
+        "a prefix is normalized to end in one separator, and the example is read "
+        "through the loader that does it")
 
 
 def test_the_identities_example_parses() -> None:
