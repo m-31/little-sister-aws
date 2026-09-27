@@ -23,6 +23,14 @@ about: |
   The team's AWS accounts, one node each.
 frequency: 60s
 timeout: 120s
+# How many readings of each history to keep, the oldest out. This check keeps three:
+# each Batch job name's runs, one record per run, in its final state once it has
+# finished; each pipeline's executions, one record per execution; and the accounts'
+# own, one record each time an account opens or stops opening. Alarms, instances,
+# functions and queues keep none. A history is keyed by the account's `name` below, so
+# renaming an account starts its histories again, and adding or removing an account
+# starts the accounts' own again. The default, 0, keeps nothing.
+# series_keep: 200
 
 # --- Credentials -------------------------------------------------------------
 # With no `secrets:` block the ambient AWS credential chain is used — an instance

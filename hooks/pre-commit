@@ -11,8 +11,11 @@
 # in its own `pyproject.toml` — never this shell.
 #
 # It is version-controlled in `hooks/` rather than `.git/hooks/` so it can be
-# shared, and it names nothing under `release/`, because a published repository
-# ships this file and drops that directory. Enable it once per clone:
+# shared, and it names `release/` only where a reader needs it: the install line
+# below, and the shellcheck argument that is the only thing linting the release
+# hook at all. Neither costs a published repository anything — that tree drops the
+# directory, so the install line is prose about a path it does not have and
+# `git ls-files` matches nothing under it. Enable it once per clone:
 #
 #     git config core.hooksPath hooks          # a project with no release/
 #     git config core.hooksPath release/hooks  # a project that publishes

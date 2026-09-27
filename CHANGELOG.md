@@ -6,6 +6,115 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-09-27
+
+**Upgrade the library first:** this release speaks little-sister's check API epoch 3 and
+needs little-sister 0.3.18 (see *Requires*). Beyond that, nothing you configure moves —
+no `type:` name, no configuration key — and every line says what it said, with three
+exceptions an upgrade can meet. Free text past 300 characters is clipped, and a name so
+long in an alphabet JSON escapes that it is cut moves its slug, so a pin on that line
+can stop matching. The check's own page heads with what its accounts roll up to, so red
+where an account is red, rather than OK (both in *Changed*). And a keeper registered
+with a `KeeperConfig` built in code, whose `prefix` lacks the trailing `/` or begins
+with one, keeps its objects under that prefix rather than beside it (see *Fixed*); a
+keeper configured by `config/aws-keeper.yaml` keeps them where it did.
+
+### Added
+
+- **The `aws` check runs as two halves, on the library's third check API epoch.** Each
+  run first reads AWS and hands back what it read, then says what that means from those
+  readings alone, so the same verdict can be reached again later over a reading this
+  process did not take
+  ([ADR-0005](docs/adr/0005-a-run-is-its-readings-and-the-runs-keep-a-history.md),
+  little-sister ADR-0086). A run reads one thing per reading: whether the credentials
+  opened and what became of each account, then every alarm, instance, function,
+  pipeline, job queue and Batch job run, and every region an aspect could not read —
+  each record naming the aspect it was read for, its kind, and the account and region
+  it is about. An ignore list that saves no request — alarm names, instance states, job
+  names — is applied to what was read, so what it hides is still neither listed nor
+  counted.
+- **Every line made from one reading carries it**: the reading's record as the line's
+  `data` — an alarm's line, a function's, a pipeline's, a queue's, an instance name's
+  where one instance carries that name, and a region's that could not be read. A job
+  name's line is made from all of that name's runs and carries none of them, and names
+  the job it is about as its `subject`. The record shows on the node's own page and in
+  the JSON a client reads — a few hundred bytes a line with ordinary names — and its
+  field names are keys from now on, like a slug (ADR-0005 §1), so a line template or a
+  grading map may be written against them. Every time in a record is under `at`,
+  `started` or `ended`, the names little-sister reads as an instant: an instance's
+  launch as `started`, a function's newest invocation as `at`, a job's creation as
+  `created.at`.
+- **`series_keep:` keeps three histories on this check.** The setting is little-sister's
+  — `series_keep: 200` keeps the newest 200 records of each history, the oldest dropped
+  first — and this check says what its histories are. Each Batch job name's runs, one
+  record per run named by its `jobId`, so a run seen waiting, running and finished is
+  one record, in its final state once it has finished; each pipeline's executions, one
+  record per execution named by its id, and one for as long as a pipeline has never run;
+  and the accounts' own, one record each time an account opens or stops opening. Alarms,
+  instances, functions and queues keep none. A history names an account by its
+  configured `name`, so renaming an account starts its histories again. The accounts'
+  own history is of the accounts the configuration lists, so adding or removing an
+  account starts that one again too. With `series_keep` unset — the default — nothing is
+  kept beyond the node.
+
+### Changed
+
+- **`aws sso login` starts through little-sister's process function**
+  (little-sister ADR-0089). The renewal runs the CLI in a process group of its own,
+  with nothing on its stdin and bounded by the same `timeout:` as before, and a login
+  still waiting for its person when the instance stops is ended with the instance —
+  its line then says the stop ended it. What a login needs is unchanged: the CLI opens
+  the browser and prints its URL itself. Nothing to configure.
+- **The install snippet names versions instead of placeholders.** `little-sister==<the
+  version you pin>` could not go stale and could not be checked either; the library
+  line now carries the floor this release was built against and the package line the
+  version being released, and the release refuses either if it drifts.
+- **The check's own node declares no code of its own.** It declared OK beside the
+  accounts and regions in scope, and now declares nothing, as a container. Its card on
+  the dashboard rolls up to its accounts exactly as before. At the top of its own page
+  it read OK whatever its accounts said; with little-sister 0.3.18 it reads what they
+  roll up to, so red when an account is red. With every account pinned, both read
+  MAINTENANCE where they read OK.
+- **Free text is clipped once, at 300 characters.** An alarm's description, a queue's
+  status reason and the error AWS answered with are shorter on their line than AWS
+  wrote them when they ran past that; a name written in an alphabet JSON escapes is
+  cut past 600 bytes, and its slug can move with it, so a pin on that line can stop
+  matching. The line says exactly the text the record keeps.
+
+### Fixed
+
+- **A Lambda function's line no longer flips to *no log event* between polls.** The
+  log read took an empty page from CloudWatch Logs for the end of the stream, but
+  GetLogEvents may answer one while the stream still has events. It now follows the
+  page's backward token until an event comes back or the stream ends, for at most three
+  more pages, one call each on top of the usual two; past that the line says
+  `newest log event not reached in 4 pages` rather than that there is none.
+- **A `KeeperConfig` built in code keeps its state under its prefix.** The prefix was
+  normalized — a leading `/` dropped, a trailing one added — only when it was read from
+  `config/aws-keeper.yaml`, so `register_s3_keeper(config=KeeperConfig(bucket=…,
+  prefix="state"))` wrote every object beside the prefix instead of under it:
+  `state.little-sister-owner.json`, `stateevents.json`, in the bucket's root. The class
+  now normalizes its own `prefix`, so that config keeps them at
+  `state/.little-sister-owner.json` and `state/events.json`, as the file always did.
+  **Which keys move:** only those of a keeper registered with a hand-built
+  `KeeperConfig` whose non-empty `prefix` lacked the trailing `/` (or began with one).
+  Such an installation starts from an empty prefix after the upgrade — its state
+  restores empty and it takes a fresh lease — unless its objects are moved first, each
+  from the key the prefix made as written to the one it makes normalized
+  (`stateevents.json` to `state/events.json`, `/state/events.json` to
+  `state/events.json`), the lease and the other `.little-sister-` objects included. A
+  prefix written as `state/`, an empty one, and every configuration read from the file
+  are unchanged.
+
+### Requires
+
+- **little-sister 0.3.18 or newer.** The floor rises from 0.3.15 because that release is
+  the first to speak check API epoch 3, where a check type measures and then grades
+  (little-sister ADR-0086), and the first with the process function the SSO login
+  starts through (little-sister ADR-0089); this package says `require_api(3)`, and
+  against an older library it refuses at import, naming both epochs. Upgrade the
+  library first; no configuration changes with it.
+
 ## [0.1.3] - 2026-09-05
 
 ### Added

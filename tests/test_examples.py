@@ -1,16 +1,17 @@
-"""The two shipped examples, read by the code that will read an operator's copy.
+"""The three shipped examples, read by the code that will read an operator's copy.
 
-`examples/checks/aws.yaml` and `examples/aws.yaml` are what somebody copies to start
-from, and they were the one pair of artifacts no test read. That is the wrong file to
-leave unparsed: this release replaced the whole threshold vocabulary — `max_per_name`
-and `max_age` became pairs, `ignore_name_patterns` and `ignore:` became a rule action
-— and an example still naming a retired key would have shipped past a green suite to
-fail in somebody's first start, on the aspect parser's unknown-key refusal.
+`examples/checks/aws.yaml`, `examples/aws.yaml` and `examples/aws-keeper.yaml` are what
+somebody copies to start from, and the first two were the one pair of artifacts no test
+read. That is the wrong file to leave unparsed: this release replaced the whole
+threshold vocabulary — `max_per_name` and `max_age` became pairs,
+`ignore_name_patterns` and `ignore:` became a rule action — and an example still naming
+a retired key would have shipped past a green suite to fail in somebody's first start,
+on the aspect parser's unknown-key refusal.
 
-So both are read here through the entry points the application itself uses:
-`AwsCheck.from_config` and `load_identities`. Nothing is mocked and nothing reaches
-AWS — the example declares no `secrets:` block, so no reference is resolved, and a
-check is only *constructed*, never run.
+So all three are read here through the entry points the application itself uses:
+`AwsCheck.from_config`, `load_identities` and `load_keeper_config`. Nothing is mocked
+and nothing reaches AWS — the check example declares no `secrets:` block, so no
+reference is resolved, and a check is only *constructed*, never run.
 
 The assertions past "it parses" are deliberately about **shape**, not about numbers.
 An example is meant to be edited — a level raised, a rule renamed — and a test that
@@ -119,7 +120,7 @@ def test_the_keeper_example_shows_every_key_it_takes() -> None:
 
 
 def test_the_identities_example_parses() -> None:
-    """`examples/aws.yaml` is the other file an operator copies, and it is read by a
+    """`examples/aws.yaml` is another file an operator copies, and it is read by a
     different loader — through a configuration root, exactly as a deployment's is."""
     identities = load_identities(EXAMPLES)
 

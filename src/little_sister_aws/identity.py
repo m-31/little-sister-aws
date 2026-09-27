@@ -34,7 +34,6 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-import subprocess
 import sys
 import threading
 import time
@@ -47,6 +46,7 @@ import boto3
 import botocore.session
 from boto3.session import Session
 from botocore.exceptions import BotoCoreError, ClientError
+from little_sister import process
 from little_sister.checks import CheckError, parse_duration, plain
 from little_sister.spans import format_span
 
@@ -631,24 +631,34 @@ def login_command(profile: str) -> str:
 def run_sso_login(profile: str, timeout: int) -> str:
     """Run one ``aws sso login``. ``""`` when it succeeded, else why it did not.
 
-    Never ``shell=True`` and never a composed string: *profile* comes from a
-    config file, and a config file is not a thing to interpolate into a shell.
+    Never a shell and never a composed string: *profile* comes from a config file,
+    and a config file is not a thing to interpolate into a shell. It starts through
+    little-sister's process function (little-sister ADR-0089): a process group of its
+    own, ``/dev/null`` for stdin, *timeout* as its bound, and the instance's stop,
+    which ends a login still waiting for its person. The CLI opens the browser itself
+    and prints its URL on stdout, so none of that changes what a login needs.
     """
     command = ["aws", "sso", "login"] + (["--profile", profile] if profile else [])
     logger.info("aws: renewing the SSO login (%s)", login_command(profile))
     try:
-        completed = subprocess.run(command, capture_output=True, text=True,
-                                   timeout=timeout, check=False)
-    except FileNotFoundError:
-        return "the aws CLI is not on PATH"
-    except OSError as error:
-        return f"`{login_command(profile)}` could not be started: {plain(error)}"
-    except subprocess.TimeoutExpired:
+        finished = process.run(command, timeout=timeout)
+    except process.NotStarted as error:
+        if isinstance(error.__cause__, FileNotFoundError):
+            return "the aws CLI is not on PATH"
+        if error.__cause__ is None:
+            return (f"`{login_command(profile)}` was not started: the instance is "
+                    f"stopping")
+        return (f"`{login_command(profile)}` could not be started: "
+                f"{plain(str(error.__cause__))}")
+    if finished.ended is process.Ended.BOUND:
         return (f"`{login_command(profile)}` was still waiting after "
                 f"{format_span(timeout)} and was stopped")
-    if completed.returncode != 0:
-        lines = (completed.stderr or completed.stdout or "").strip().splitlines()
-        detail = lines[-1].strip() if lines else f"exit {completed.returncode}"
+    if finished.ended is process.Ended.STOP:
+        return f"`{login_command(profile)}` was ended by the instance's stop"
+    if finished.status != 0:
+        said = (finished.stderr or finished.stdout).decode("utf-8", "replace")
+        lines = said.strip().splitlines()
+        detail = lines[-1].strip() if lines else f"exit {finished.status}"
         # The CLI's own words, folded into a reason that is rendered as Markdown
         # (little-sister ADR-0018) — escaped like any other captured output.
         return f"`{login_command(profile)}` failed: {plain(detail[:200])}"

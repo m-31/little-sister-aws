@@ -1,12 +1,12 @@
 # ADR-0001 — The `aws` check type: account nodes, aspect leaves, and boto3
 
 - **Status:** Accepted
-- **Date:** 2026-08-23 (the type was accepted 2026-08-09)
+- **Date:** 2026-09-27 (the type was accepted 2026-08-09)
 - **Related:** [ADR-0002](0002-aws-secret-references.md) (the secret references the
   identities on this package's seam are read with), little-sister **ADR-0042**
-  (coded entries), little-sister **ADR-0043** / **ADR-0044** (the coverage reading
-  and the roster), little-sister **ADR-0025** (subnode text); the lift-out this
-  record promised has happened, and this package is the result
+  (coded entries), little-sister **ADR-0043** / little-sister **ADR-0044** (the
+  coverage reading and the roster), little-sister **ADR-0025** (subnode text); the
+  lift-out this record promised has happened, and this package is the result
 
 > This record was written in the deployment whose AWS checks this type replaced and
 > traveled here with the code: *that codebase* in the Context below is that
@@ -97,6 +97,12 @@ different `~/.aws/config` profiles.
   both open a login, and at `frequency: 60s` a login nobody completes would
   otherwise be a browser window a minute for as long as you are away from the
   desk.
+- The login is started through **little-sister's process function**
+  (little-sister ADR-0089), never by a `subprocess` of this package's own: in a process
+  group of its own, with `/dev/null` for stdin and the timeout above as its bound, and
+  ended with the instance — a login still waiting for its person when the instance
+  stops is ended, and the account's line says the stop ended it. What a login needs is
+  the CLI's own business: it opens the browser and prints its URL itself.
 - Either way the account carries **two lines**: what expired, and the exact
   `aws sso login --profile …` that fixes it — except where no profile is
   configured, since telling a server to open a browser is advice for a machine

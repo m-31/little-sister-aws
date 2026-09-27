@@ -31,16 +31,26 @@ saved. Everything imported from little-sister below is part of its check-authori
 surface (``architecture.md`` §11) — including ``little_sister.spans``, which is
 how the library writes a span of time, so the ages on these lines read the way
 the rest of the page does instead of inventing a fourth spelling. That surface is
-what this package pins with ``require_api(2)``.
+what this package pins with ``require_api(3)``.
+
+**A run is two halves** (little-sister ADR-0086). :meth:`AwsCheck.measure` reads
+every account and hands back one reading per thing it read — the estate first, then
+each account's own, then each aspect's in the order it read them — and
+:meth:`AwsCheck.grade` builds the tree above out of those readings and the
+configuration alone, so the same verdict can be reached again over readings this
+process did not take. A reading has a history only where there is one to keep: a
+Batch job's runs, a pipeline's executions, and the estate (ADR-0005).
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import re
 import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -52,6 +62,7 @@ from little_sister.checks import (
     CheckError,
     CheckResult,
     Entry,
+    Measurement,
     coerce_code,
     config_markdown,
     parse_duration,
@@ -59,7 +70,7 @@ from little_sister.checks import (
     plain,
     register,
 )
-from little_sister.reasons import slug
+from little_sister.reasons import MAX_SUBJECT_LENGTH, clip, slug
 from little_sister.spans import coarse_span, format_span
 from little_sister.status import StatusCode
 
@@ -100,7 +111,7 @@ from little_sister_aws.identity import (
 if TYPE_CHECKING:
     # The service clients, for their **types** only: `boto3-stubs`' per-service
     # extras are a dev dependency, so these names must not be imported at run
-    # time. They are why ADR-0006 bought the extras at all — without them every
+    # time. They are why ADR-0001 §3 bought the extras at all — without them every
     # client is a bare `BaseClient` and strict mypy checks nothing on the one
     # call path that matters.
     from mypy_boto3_batch.client import BatchClient
@@ -134,6 +145,36 @@ LAMBDA = "lambda"
 CODEPIPELINE = "codepipeline"
 BATCH = "batch"
 
+#: Free text a reading keeps — an alarm's description, the reason AWS gives for a
+#: queue's or a job's status, an error AWS answered with, a name AWS lets somebody
+#: type — is clipped **once**, in the measuring half, to this many characters and then
+#: to this many of the bytes the seam weighs a record in (little-sister ADR-0086
+#: decision 7), and the line is written from what was kept. A name AWS limits to
+#: ASCII is never cut; the byte budget shortens only a name written in an alphabet
+#: JSON escapes. The bounds are the ones `little-sister-github` and
+#: `little-sister-wiz` keep, so the family clips one way (ADR-0005 §8).
+_TEXT_CHARS = 300
+_TEXT_BYTES = 600
+#: A status, a state or an identifier AWS mints is short, and is held to this.
+_WORD_BYTES = 100
+
+#: The three outcomes an account's reading can name, and so the only words that can
+#: follow the last `=` of a pair in the estate's state (ADR-0005 §6): the account
+#: opened; AWS said no; its login had expired and was not renewed, or was renewed
+#: and still refused.
+READ = "read"
+UNREACHABLE = "unreachable"
+EXPIRED = "expired"
+#: The estate's state where the credentials themselves did not open, and so no
+#: account was tried at all.
+CREDENTIALS_UNUSABLE = "credentials=unusable"
+#: The state a pipeline's reading names when it has never been executed: there is
+#: no execution to name, and a pipeline that stays unrun is one spell (ADR-0005 §5).
+NEVER_RUN = "never-run"
+#: The second line of an expired account whose login was renewed and is refused all
+#: the same.
+RENEWED_STILL_REFUSED = ("the login was renewed and the credentials are still "
+                         "refused")
 
 
 #: Alarm names carrying one of these (case-insensitively, as a **substring**) are
@@ -206,6 +247,13 @@ _METRIC_BATCH = 500
 #: The words a Lambda runtime writes at the start of a log line. The last event's
 #: word says how the newest invocation ended, and ``ERROR`` is the one that counts.
 _LOG_STATUS = re.compile(r"\b(INIT_START|START|END|REPORT|ERROR)\b")
+
+#: How many pages of a function's newest log stream the log read asks for before it
+#: says the newest event was not reached: the first, and three more. GetLogEvents may
+#: answer an empty page while the stream still has events, and says where the stream
+#: ends by handing back the token it was sent; each page is one call on top of the
+#: two the read costs when the first page answers.
+_LOG_PAGES = 4
 
 #: How recent an error has to be before it is graded rather than merely reported.
 #: The reasoning: past this, CloudWatch has condensed the bucket
@@ -453,7 +501,7 @@ rules:
 {pin_note}
 """,
         # A roster: which functions exist at all, and when each last ran, is the
-        # reading — so it is read while everything is fine (ADR-0063).
+        # reading — so it is read while everything is fine (little-sister ADR-0063).
         "show_when_quiet": True,
     },
     CODEPIPELINE: {
@@ -495,7 +543,7 @@ It has nothing to report, which is itself the report.
 {pin_note}
 """,
         # A roster: every pipeline every run, with what it last did. Which
-        # pipelines exist is half of what a reader came for (ADR-0063).
+        # pipelines exist is half of what a reader came for (little-sister ADR-0063).
         "show_when_quiet": True,
     },
     BATCH: {
@@ -520,7 +568,7 @@ is of the newest ones only.
 {pin_note}
 """,
         # A roster: which job names a queue is carrying, and what each is doing,
-        # is worth a glance while nothing is failing (ADR-0063).
+        # is worth a glance while nothing is failing (little-sister ADR-0063).
         "show_when_quiet": True,
     },
 }
@@ -555,6 +603,9 @@ class Alarm:
 
     Nothing downstream touches a boto3 response: the aspect grades, sorts and
     renders *this*, which is why its tests need no AWS-shaped fixtures.
+    ``description`` is what AWS sent, empty where it sent none — the line says
+    :data:`NO_DESCRIPTION` in its place, because the reading keeps what was read
+    and the sentence is the line's.
     """
 
     name: str
@@ -632,6 +683,10 @@ class FunctionReading:
 
     ``errors`` is ``None`` when CloudWatch had no data point at all in any of its
     retention windows — a different fact from zero errors, and graded differently.
+    ``log_note`` says why the log gave no status word where it gave none, and
+    ``log_error`` what AWS answered where the log could not be read at all: kept
+    apart, because a reading keeps what AWS said and the sentence around it is the
+    line's (:attr:`notes`).
     """
 
     name: str
@@ -639,7 +694,15 @@ class FunctionReading:
     errors: int | None = None
     last_run: datetime | None = None
     log_status: str = ""
-    notes: tuple[str, ...] = ()
+    log_note: str = ""
+    log_error: str = ""
+
+    @property
+    def notes(self) -> tuple[str, ...]:
+        """What the line says about the log, beside its status word."""
+        if self.log_error:
+            return (f"log unreadable: {plain(self.log_error)}",)
+        return (self.log_note,) if self.log_note else ()
 
 
 @dataclass(frozen=True)
@@ -799,13 +862,16 @@ class PipelineReading:
 
     ``status`` is empty when the pipeline has never been executed at all — which
     is a different fact from every failure status there is, and the one the
-    original could not report because it built no line for it.
+    original could not report because it built no line for it. ``execution_id``
+    is the id CodePipeline gives that newest execution: the event this pipeline's
+    reading is of (ADR-0005 §5).
     """
 
     name: str
     region: str
     status: str = ""
     started: datetime | None = None
+    execution_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -843,6 +909,8 @@ class Job:
 
     Batch reports its timestamps as Unix **milliseconds**; they are datetimes by
     the time they reach here, so nothing downstream has to remember that.
+    ``reason`` is Batch's own ``statusReason``: no line says it, and a kept run
+    carries it.
     """
 
     job_id: str
@@ -851,6 +919,7 @@ class Job:
     created: datetime | None = None
     started: datetime | None = None
     stopped: datetime | None = None
+    reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -1419,7 +1488,7 @@ def _job_link(region: str, job_id: str) -> str:
     """One Batch job's detail page.
 
     A job id, not the queue's ARN: the console will take an ARN here and an ARN
-    carries the account number, which is exactly the string ADR-0006 keeps out
+    carries the account number, which is exactly the string ADR-0001 keeps out
     of a line somebody may bookmark or paste into a ticket.
     """
     return _console_url(region, "batch/home", f"jobs/detail/{_quoted(job_id)}")
@@ -1491,6 +1560,203 @@ def _worst(first: StatusCode, second: StatusCode) -> StatusCode:
     return first if _CODE_RANK.get(first, 3) <= _CODE_RANK.get(second, 3) else second
 
 
+def _kept(text: str) -> str:
+    """Free text as a reading keeps it, and as the line will say it — clipped once,
+    in characters and then in the bytes the seam weighs (:data:`_TEXT_CHARS`)."""
+    return clip(text, chars=_TEXT_CHARS, budget=_TEXT_BYTES)
+
+
+def _word(text: str) -> str:
+    """A status or a state AWS reports, held to :data:`_WORD_BYTES`. AWS's own
+    vocabularies are a few letters long, so this is a bound nobody meets."""
+    return clip(text, chars=_WORD_BYTES, budget=_WORD_BYTES)
+
+
+def _digest(text: str) -> str:
+    """``sha256:`` and 32 hex digits of *text* — the spelling a subject, a state or an
+    identifier takes where its own would not travel: the same text always gives the
+    same digest, and two texts in practice never share one."""
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+
+
+def _identifier(text: str) -> str:
+    """An identifier AWS minted — an instance's, a job's, an execution's — kept
+    whole, or as a digest of itself past :data:`_WORD_BYTES` or where it would not
+    travel (:func:`_travels`): a clipped identifier could meet another one, and a
+    digest cannot. AWS mints them short and plain."""
+    return (text if len(json.dumps(text)) <= _WORD_BYTES and _travels(text)
+            else _digest(text))
+
+
+def _travels(text: str) -> bool:
+    """Whether a subject or a state can go as it is spelled: within the length the
+    library allows one, and free of control characters (`check_subject`)."""
+    return (len(text) <= MAX_SUBJECT_LENGTH
+            and not any(ord(char) < 32 or ord(char) == 127 for char in text))
+
+
+def _subject(kind: str, *parts: str) -> str:
+    """The object a reading is of, as ADR-0005 §4 spells it: its kind, then the
+    account by its configured name and the address AWS gives the rest, with `/`
+    between the parts — ``batch/live/eu-central-1/nightly/aggregate``.
+
+    `/` is the one character an account name cannot hold, since it is a node's
+    path segment, and AWS refuses it in a region, a queue, a job and a pipeline
+    name; so a subject splits back into its parts, and the kind first keeps a job,
+    a pipeline and the estate from ever meeting. Past what a subject may hold — or
+    with a control character in an account name — it is the kind and a digest of
+    the rest, which is still the kind's and still one object's.
+    """
+    spelled = "/".join((kind, *parts))
+    if _travels(spelled):
+        return spelled
+    return f"{kind}/{_digest('/'.join(parts))}"
+
+
+def _estate_state(outcomes: Sequence[tuple[str, str]]) -> str:
+    """The state the estate is in, spelled from each account's outcome
+    (ADR-0005 §6): ``backup=expired/live=read``.
+
+    Sorted by name, as the estate's subject is, so reordering the configuration
+    does not break a spell; the pairs joined by `/`, which a name cannot contain;
+    and never the error text, so a reworded AWS message does not start one. What
+    follows a pair's last `=` is :data:`READ`, :data:`UNREACHABLE` or
+    :data:`EXPIRED`, so a `;` or `=` inside a name cannot make two spellings meet,
+    and only a spelling that would not travel — past what a state may hold, or with
+    a control character in a name — becomes a digest.
+    """
+    spelled = "/".join(f"{name}={outcome}" for name, outcome in sorted(outcomes))
+    return spelled if _travels(spelled) else _digest(spelled)
+
+
+def _iso(value: datetime | None) -> str | None:
+    """A time as a record keeps it: ISO 8601 in UTC, converted at the seam and
+    never re-stamped (little-sister ADR-0082, little-sister ADR-0087 decision 6) —
+    and always under `at`, `started` or `ended`, at the top of a record or nested
+    (`created.at`), the names little-sister reads as an instant (ADR-0005 §1)."""
+    return None if value is None else value.astimezone(UTC).isoformat()
+
+
+def _time(value: object) -> datetime | None:
+    """A time a record kept, as the value a line is written from again."""
+    return datetime.fromisoformat(value) if isinstance(value, str) else None
+
+
+def _reading(aspect: str | None, kind: str, account: str | None,
+             region: str | None, fields: Mapping[str, Any], *, subject: str = "",
+             identity: str = "", state: str = "") -> Measurement:
+    """One reading of this check, in the one vocabulary its grading sorts by
+    (ADR-0005 §1).
+
+    Every record names the **aspect** it was read for — ``None`` for the estate
+    and an account's own reading — and its **kind**, the shape the rest of it has.
+    A reading about one account names it as `account`, by its configured name, and
+    one about one region names the region; *fields* are the rest, a mapping of
+    their own so that a record's `state` — an alarm's, a queue's — is never taken
+    for the measurement's. ``subject``, ``identity`` and ``state`` are empty for
+    every reading but the three kinds that have a history: the estate, a pipeline
+    and a Batch job's run.
+    """
+    record: dict[str, Any] = {"aspect": aspect, "kind": kind}
+    if account is not None:
+        record["account"] = account
+    if region is not None:
+        record["region"] = region
+    record.update(fields)
+    return Measurement(record=record, subject=subject, identity=identity,
+                       state=state)
+
+
+def _carrying(entry: Entry, reading: Measurement) -> Entry:
+    """*entry* as the line of *reading*: the reading's record as its ``data`` and
+    the reading's subject as its own (ADR-0005 §7). Every line the grading writes
+    out of **one** reading carries it this way, so what the line read stays beside
+    what it says, and a kept reading finds the line it stood on
+    (little-sister ADR-0087 decision 8). A line written out of many carries none."""
+    return replace(entry, subject=reading.subject, data=dict(reading.record))
+
+
+def _unreadable(aspect: str, account: Account, region: str,
+                error: BaseException) -> Measurement:
+    """A region one aspect could not read in one account: asked and not answered,
+    and a reading all the same (little-sister ADR-0085 decision 3)."""
+    return _reading(aspect, "unreadable", account.name, region,
+                    {"error": _kept(str(error))})
+
+
+def _unreadable_entry(reading: Measurement, noun: str) -> Entry:
+    """The line an unreadable region has always been: a WARN of its own, since a
+    read failure has no honest verdict about what could not be read."""
+    record = reading.record
+    region = str(record["region"])
+    return _carrying(Entry(
+        slug("read", region),
+        f"{plain(region)}: {noun} cannot be read: {plain(str(record['error']))}",
+        StatusCode.WARN), reading)
+
+
+def _alarm_of(record: Mapping[str, Any]) -> Alarm:
+    return Alarm(name=str(record["name"]), region=str(record["region"]),
+                 state=str(record["state"]),
+                 description=str(record.get("description") or ""),
+                 composite=bool(record["composite"]))
+
+
+def _instance_of(record: Mapping[str, Any]) -> Instance:
+    return Instance(instance_id=str(record["id"]),
+                    name=str(record.get("name") or ""),
+                    region=str(record["region"]), state=str(record["state"]),
+                    launched=_time(record.get("started")))
+
+
+def _function_of(record: Mapping[str, Any]) -> FunctionReading:
+    errors = record.get("errors")
+    return FunctionReading(
+        name=str(record["name"]), region=str(record["region"]),
+        errors=errors if isinstance(errors, int) else None,
+        last_run=_time(record.get("at")),
+        log_status=str(record.get("log_status") or ""),
+        log_note=str(record.get("log_note") or ""),
+        log_error=str(record.get("log_error") or ""))
+
+
+def _pipeline_of(record: Mapping[str, Any]) -> PipelineReading:
+    return PipelineReading(name=str(record["name"]), region=str(record["region"]),
+                           status=str(record.get("status") or ""),
+                           started=_time(record.get("started")),
+                           execution_id=str(record.get("execution") or ""))
+
+
+def _queue_of(record: Mapping[str, Any]) -> QueueReading:
+    return QueueReading(
+        queue=JobQueue(name=str(record["name"]), region=str(record["region"]),
+                       state=str(record.get("state") or ""),
+                       status=str(record.get("status") or ""),
+                       status_reason=str(record.get("reason") or "")),
+        capped=bool(record["capped"]))
+
+
+def _job_of(record: Mapping[str, Any]) -> Job:
+    return Job(job_id=str(record.get("id") or ""), name=str(record["name"]),
+               status=str(record["status"]),
+               created=_time(record["created"]["at"]),
+               started=_time(record.get("started")),
+               stopped=_time(record.get("ended")),
+               reason=str(record.get("reason") or ""))
+
+
+@dataclass(frozen=True)
+class _Refusal:
+    """Why an account could not be opened, as its reading keeps it: AWS said no
+    (:data:`UNREACHABLE`) or the login had expired (:data:`EXPIRED`), what AWS
+    answered, and for an expired login why it was not renewed — or what renewing
+    it did."""
+
+    outcome: str
+    error: str
+    renewal: str = ""
+
+
 def _scope_line(noun: str, found: int, regions: tuple[str, ...], *,
                 code: StatusCode = StatusCode.OK, tail: str = "") -> Entry:
     """How many of a thing were seen at all (little-sister ADR-0043) — the one
@@ -1545,9 +1811,15 @@ class AwsCheck(Check):
         # (little-sister ADR-0049). The two declarations beside it are this type's
         # half of the `subnodes:` block: it states the text it ships and the token
         # that text reuses, and little-sister does the reading and the resolving
-        # (little-sister ADR-0025).
-        super().__init__(subnode_defaults=SUBNODES,
-                         label_tokens={"pin_note": PIN_NOTE}, **kwargs)
+        # (little-sister ADR-0025). The object it watches is declared here too, so
+        # a run that raises is still recorded against it (little-sister ADR-0086
+        # decision 4): the accounts it reads, by their configured names, sorted —
+        # the estate's subject (ADR-0005 §4, §6).
+        super().__init__(
+            subject=_subject("accounts",
+                             *sorted(account.name for account in accounts)),
+            subnode_defaults=SUBNODES, label_tokens={"pin_note": PIN_NOTE},
+            **kwargs)
         self.accounts = accounts
         self.regions = regions
         self.role_session_name = role_session_name
@@ -1891,11 +2163,11 @@ class AwsCheck(Check):
                     if not name:
                         continue
                     alarms.append(Alarm(
-                        name=name,
+                        name=_kept(name),
                         region=region,
-                        state=str(row.get("StateValue", "")),
-                        description=str(row.get("AlarmDescription", "")
-                                        or NO_DESCRIPTION),
+                        state=_word(str(row.get("StateValue", ""))),
+                        description=_kept(
+                            str(row.get("AlarmDescription", "") or "")),
                         composite=composite))
         return alarms
 
@@ -1913,10 +2185,10 @@ class AwsCheck(Check):
                             name = str(tag.get("Value", "")).strip()
                             break
                     instances.append(Instance(
-                        instance_id=str(row.get("InstanceId", "")),
-                        name=name,
+                        instance_id=_identifier(str(row.get("InstanceId", ""))),
+                        name=_kept(name),
                         region=region,
-                        state=str(state.get("Name", "")) if state else "",
+                        state=_word(str(state.get("Name", ""))) if state else "",
                         launched=row.get("LaunchTime")))
         return instances
 
@@ -1931,12 +2203,13 @@ class AwsCheck(Check):
                  ("composite", alarm.composite)) if on]
         where = f"{plain(alarm.region)} / " if show_region else ""
         suffix = f" ({', '.join(tags)})" if tags else ""
+        described = alarm.description or NO_DESCRIPTION
         return Entry(
             # The region is in the slug whether or not it is in the text: a pin
             # must not re-point the day a second region is configured.
             slug(alarm.region, alarm.name),
             f"{where}[{plain(alarm.name)}]({_console_link(alarm)}): "
-            f"{_state_phrase(alarm.state)}{suffix} — {plain(alarm.description)}",
+            f"{_state_phrase(alarm.state)}{suffix} — {plain(described)}",
             code)
 
     def _scope_entry(self, counted: int, regions: tuple[str, ...]) -> Entry:
@@ -1958,40 +2231,61 @@ class AwsCheck(Check):
 
     @staticmethod
     def _roster(alarms: list[Alarm], show_region: bool) -> str:
-        """What the run *found*: presence without a verdict (ADR-0044). The count
-        can alarm and lives in a reason; these names cannot and live here."""
+        """What the run *found*: presence without a verdict (little-sister ADR-0044).
+        The count can alarm and lives in a reason; these names cannot and live here."""
         return "\n".join(
             f"- {f'{plain(alarm.region)} / ' if show_region else ''}"
             f"[{plain(alarm.name)}]({_console_link(alarm)})"
             for alarm in alarms)
 
-    def _cloudwatch_aspect(self, account: Account,
-                           session: Session) -> CheckResult:
+    def _measure_cloudwatch(self, account: Account,
+                            session: Session) -> list[Measurement]:
+        """Every alarm in this account's regions, one reading each — the ignored
+        ones too, because ``ignore_name_patterns`` spares no request:
+        ``describe_alarms`` answers with every alarm either way, so the list only
+        chooses what is said, and that is the grading's (ADR-0005 §2). A region
+        that cannot be read is a reading of its own."""
+        readings: list[Measurement] = []
+        for region in self.regions_for(account):
+            try:
+                alarms = self._describe_alarms(session, region)
+            except (BotoCoreError, ClientError) as error:
+                readings.append(_unreadable(CLOUDWATCH, account, region, error))
+                continue
+            readings.extend(
+                _reading(CLOUDWATCH, "alarm", account.name, region,
+                         {"name": alarm.name, "state": alarm.state,
+                          "description": alarm.description or None,
+                          "composite": alarm.composite})
+                for alarm in alarms)
+        return readings
+
+    def _grade_cloudwatch(self, account: Account, readings: Sequence[Measurement],
+                          now: datetime) -> CheckResult:
+        """The alarms leaf, from its readings: a line per alarm that is not OK —
+        or per alarm, with ``show_healthy`` — carrying its reading, a WARN line per
+        region that could not be read, and the coverage line last."""
         settings = self.cloudwatch
         regions = self.regions_for(account)
         show_region = len(regions) > 1
         failures: list[Entry] = []
         entries: list[Entry] = []
         found: list[Alarm] = []
-        for region in regions:
-            try:
-                alarms = self._describe_alarms(session, region)
-            except (BotoCoreError, ClientError) as error:
+        for reading in readings:
+            if reading.record["kind"] == "unreadable":
                 # A read failure has no honest alarm state, so it stays a WARN
                 # line of its own rather than being graded as one.
-                failures.append(Entry(
-                    slug("read", region),
-                    f"{plain(region)}: alarms cannot be read: {plain(error)}",
-                    StatusCode.WARN))
+                failures.append(_unreadable_entry(reading, "alarms"))
                 continue
-            for alarm in alarms:
-                if settings.ignored(alarm.name):
-                    continue
-                found.append(alarm)
-                code = settings.code_for(alarm.state)
-                if code is StatusCode.OK and not settings.show_healthy:
-                    continue
-                entries.append(self._alarm_entry(alarm, code, show_region))
+            alarm = _alarm_of(reading.record)
+            if settings.ignored(alarm.name):
+                continue
+            found.append(alarm)
+            code = settings.code_for(alarm.state)
+            if code is StatusCode.OK and not settings.show_healthy:
+                continue
+            entries.append(_carrying(self._alarm_entry(alarm, code, show_region),
+                                     reading))
         # The scope line goes last so an OK one ends the list rather than
         # sitting between the findings and the healthy lines; a WARN one still
         # floats up with the sort.
@@ -2006,7 +2300,40 @@ class AwsCheck(Check):
 
     # --- the ec2 aspect ----------------------------------------------------
 
-    def _ec2_aspect(self, account: Account, session: Session) -> CheckResult:
+    def _measure_ec2(self, account: Account,
+                     session: Session) -> list[Measurement]:
+        """Every instance in this account's regions, one reading each — the
+        terminated ones and the ones a rule ignores too, since neither spares a
+        request (ADR-0005 §2).
+
+        Per instance, although a line is per name: the line gives the age of every
+        box under the name, and a fleet's launch times do not fit one record
+        (ADR-0005 §1). Which rules matched a name is noted here, over the names the
+        grading will group, because the log line about a rule that matched nothing
+        is state between runs and the grading may keep none.
+        """
+        settings = self.ec2
+        readings: list[Measurement] = []
+        for region in self.regions_for(account):
+            try:
+                instances = self._describe_instances(session, region)
+            except (BotoCoreError, ClientError) as error:
+                readings.append(_unreadable(EC2, account, region, error))
+                continue
+            for instance in instances:
+                if not settings.ignored_state(instance.state):
+                    self._note_rule(EC2, settings.rule_for(instance.name or None))
+                readings.append(_reading(
+                    EC2, "instance", account.name, region,
+                    {"id": instance.instance_id, "name": instance.name or None,
+                     "state": instance.state,
+                     "started": _iso(instance.launched)}))
+        return readings
+
+    def _grade_ec2(self, account: Account, readings: Sequence[Measurement],
+                   now: datetime) -> CheckResult:
+        """The instances leaf, from its readings: a line per name, graded on its
+        count and on the age of its oldest box at *now*."""
         settings = self.ec2
         regions = self.regions_for(account)
         show_region = len(regions) > 1
@@ -2014,39 +2341,41 @@ class AwsCheck(Check):
         # Keyed on the **raw** name, with ``None`` for the instances nobody named:
         # a rule asks about the name AWS returned, and the placeholder a card
         # prints for the unnamed group is display text this package may reword.
-        groups: dict[tuple[str, str | None], list[Instance]] = {}
-        now = _utcnow()
-        for region in regions:
-            try:
-                instances = self._describe_instances(session, region)
-            except (BotoCoreError, ClientError) as error:
-                failures.append(Entry(
-                    slug("read", region),
-                    f"{plain(region)}: instances cannot be read: {plain(error)}",
-                    StatusCode.WARN))
+        groups: dict[tuple[str, str | None],
+                     list[tuple[Instance, Measurement]]] = {}
+        for reading in readings:
+            if reading.record["kind"] == "unreadable":
+                failures.append(_unreadable_entry(reading, "instances"))
                 continue
-            for instance in instances:
-                if settings.ignored_state(instance.state):
-                    continue
-                # An instance with no `Name` tag reads back as an empty name at
-                # the seam; `None` is what the rest of this aspect calls "nobody
-                # named this", and the two must not be two states.
-                groups.setdefault((region, instance.name or None),
-                                  []).append(instance)
-        # Ignoring happens **after** grouping now, because a rule matches a name
-        # and a name is a group. An ignored group leaves no line and is not in
-        # scope, which is what the flat list of substrings did instance by
-        # instance — and it is ordered, so a rule above it can except a name.
+            instance = _instance_of(reading.record)
+            if settings.ignored_state(instance.state):
+                continue
+            # An instance with no `Name` tag reads back as an empty name at
+            # the seam; `None` is what the rest of this aspect calls "nobody
+            # named this", and the two must not be two states.
+            groups.setdefault((instance.region, instance.name or None),
+                              []).append((instance, reading))
+        # Ignoring happens **after** grouping, because a rule matches a name and
+        # a name is a group. An ignored group leaves no line and is not in scope,
+        # which is what the flat list of substrings did instance by instance —
+        # and it is ordered, so a rule above it can except a name.
         kept = {key: members for key, members in groups.items()
                 if not self._ignores(key[1])}
-        for key in groups:
-            self._note_rule(EC2, settings.rule_for(key[1]))
         found = sum(len(members) for members in kept.values())
         counts = {key: len(members) for key, members in kept.items()}
-        ages = {key: self._ages(members, now) for key, members in kept.items()}
-        entries = [self._instance_entry(region, name, counts[(region, name)],
-                                        ages[(region, name)], show_region)
-                   for (region, name) in sorted(kept, key=_instance_order)]
+        ages = {key: self._ages([instance for instance, _ in members], now)
+                for key, members in kept.items()}
+        entries: list[Entry] = []
+        for key in sorted(kept, key=_instance_order):
+            region, name = key
+            entry = self._instance_entry(region, name, counts[key], ages[key],
+                                         show_region)
+            members = kept[key]
+            # A line one instance made carries that instance's reading; a line
+            # about several carries none, since no one record is what it read
+            # (ADR-0005 §7).
+            entries.append(_carrying(entry, members[0][1]) if len(members) == 1
+                           else entry)
         reason = [*failures, *entries, _scope_line("instance", found, regions)]
         reason.sort(key=lambda entry: _CODE_RANK.get(
             entry.code or StatusCode.OK, 3))
@@ -2098,7 +2427,6 @@ class AwsCheck(Check):
         return Entry(slug(region, name if name is not None else NO_NAME_TAG),
                      f"{where}{label}: {count}{suffix}{said}", code)
 
-    @staticmethod
     @staticmethod
     def _instance_roster(counts: dict[tuple[str, str | None], int],
                          ages: dict[tuple[str, str | None], tuple[int, ...]],
@@ -2181,10 +2509,17 @@ class AwsCheck(Check):
         return found
 
     def _log_reading(self, session: Session, region: str,
-                     name: str) -> tuple[str, str]:
-        """The status word of the function's newest log event, and a note when
-        there is none. A function that has never run has no log group at all,
-        which is a sentence rather than a failure."""
+                     name: str) -> tuple[str, str, str]:
+        """The status word of the function's newest log event, a note when there
+        is none, and what AWS answered when the log could not be read at all. A
+        function that has never run has no log group, which is a sentence rather
+        than a failure.
+
+        An empty page is not the end of a stream: GetLogEvents may answer one
+        while the stream still has events, and the end is the backward token
+        coming back the same as the one sent. So an empty page is followed by the
+        token it handed back, up to :data:`_LOG_PAGES` pages — past which the note
+        says the newest event was not reached, not that there is none."""
         client = session.client("logs", region_name=region)
         group = f"/aws/lambda/{name}"
         try:
@@ -2192,20 +2527,30 @@ class AwsCheck(Check):
                 logGroupName=group, orderBy="LastEventTime", descending=True,
                 limit=1).get("logStreams", [])
             if not streams:
-                return "", "no log stream"
-            events = client.get_log_events(
-                logGroupName=group,
-                logStreamName=str(streams[0].get("logStreamName", "")),
-                limit=1, startFromHead=False).get("events", [])
-            if not events:
-                return "", "no log event"
-            message = str(events[0].get("message", ""))
-            match = _LOG_STATUS.search(message)
-            if match is None:
-                return "", "no status word in the last log line"
-            return match.group(1), ""
+                return "", "no log stream", ""
+            stream = str(streams[0].get("logStreamName", ""))
+            sent = ""
+            for _ in range(_LOG_PAGES):
+                page = (client.get_log_events(
+                            logGroupName=group, logStreamName=stream, limit=1,
+                            startFromHead=False, nextToken=sent)
+                        if sent else client.get_log_events(
+                            logGroupName=group, logStreamName=stream, limit=1,
+                            startFromHead=False))
+                events = page.get("events", [])
+                if events:
+                    message = str(events[0].get("message", ""))
+                    match = _LOG_STATUS.search(message)
+                    if match is None:
+                        return "", "no status word in the last log line", ""
+                    return match.group(1), "", ""
+                token = str(page.get("nextBackwardToken") or "")
+                if not token or token == sent:
+                    return "", "no log event", ""
+                sent = token
+            return "", f"newest log event not reached in {_LOG_PAGES} pages", ""
         except (BotoCoreError, ClientError) as error:
-            return "", f"log unreadable: {plain(error)}"
+            return "", "", _kept(str(error))
 
     def _read_functions(self, session: Session, region: str,
                         now: datetime) -> list[FunctionReading]:
@@ -2216,21 +2561,21 @@ class AwsCheck(Check):
         readings: list[FunctionReading] = []
         for name in sorted(names):
             count, last_run = errors.get(name, (None, None))
-            status, note = ("", "")
-            # Per function, because the log read is two API calls each and the
-            # functions worth paying for are not always the whole account.
+            status, note, failure = ("", "", "")
+            # Per function, because the log read is two API calls each — more where
+            # a page comes back empty — and the functions worth paying for are not
+            # always the whole account.
             if settings.reads_log(settings.rule_for(name)):
-                status, note = self._log_reading(session, region, name)
+                status, note, failure = self._log_reading(session, region, name)
             readings.append(FunctionReading(
-                name=name, region=region, errors=count, last_run=last_run,
-                log_status=status, notes=(note,) if note else ()))
+                name=_kept(name), region=region, errors=count, last_run=last_run,
+                log_status=status, log_note=note, log_error=failure))
         return readings
 
     def _function_entry(self, reading: FunctionReading, now: datetime,
                         show_region: bool) -> Entry:
         settings = self.lambda_
         rule = settings.rule_for(reading.name)
-        self._note_rule(LAMBDA, rule)
         age = (None if reading.last_run is None
                else max(0, int((now - reading.last_run).total_seconds())))
         parts: list[str] = []
@@ -2273,29 +2618,55 @@ class AwsCheck(Check):
                      f"{' · '.join(parts)}",
                      code)
 
-    def _lambda_aspect(self, account: Account, session: Session) -> CheckResult:
+    def _measure_lambda(self, account: Account,
+                        session: Session) -> list[Measurement]:
+        """Every function in this account's regions that no rule ignores, one
+        reading each: a rule's ``ignore`` and ``read_log_status`` spare the metric
+        and the log reads, so they are decided here (ADR-0005 §2)."""
+        settings = self.lambda_
+        now = _utcnow()
+        readings: list[Measurement] = []
+        for region in self.regions_for(account):
+            try:
+                functions = self._read_functions(session, region, now)
+            except (BotoCoreError, ClientError) as error:
+                readings.append(_unreadable(LAMBDA, account, region, error))
+                continue
+            for function in functions:
+                self._note_rule(LAMBDA, settings.rule_for(function.name))
+                readings.append(_reading(
+                    LAMBDA, "function", account.name, region,
+                    {"name": function.name, "errors": function.errors,
+                     "at": _iso(function.last_run),
+                     "log_status": function.log_status or None,
+                     "log_note": function.log_note or None,
+                     "log_error": function.log_error or None}))
+        return readings
+
+    def _grade_lambda(self, account: Account, readings: Sequence[Measurement],
+                      now: datetime) -> CheckResult:
+        """The functions leaf, from its readings: a line per function, each
+        carrying its reading, with its ages measured to *now*."""
         regions = self.regions_for(account)
         show_region = len(regions) > 1
-        now = _utcnow()
         failures: list[Entry] = []
-        readings: list[FunctionReading] = []
-        for region in regions:
-            try:
-                readings.extend(self._read_functions(session, region, now))
-            except (BotoCoreError, ClientError) as error:
-                failures.append(Entry(
-                    slug("read", region),
-                    f"{plain(region)}: functions cannot be read: {plain(error)}",
-                    StatusCode.WARN))
-        entries = [self._function_entry(reading, now, show_region)
-                   for reading in readings]
-        scope = _scope_line("function", len(readings), regions)
+        entries: list[Entry] = []
+        functions: list[FunctionReading] = []
+        for reading in readings:
+            if reading.record["kind"] == "unreadable":
+                failures.append(_unreadable_entry(reading, "functions"))
+                continue
+            function = _function_of(reading.record)
+            functions.append(function)
+            entries.append(_carrying(
+                self._function_entry(function, now, show_region), reading))
+        scope = _scope_line("function", len(functions), regions)
         reason = [*failures, *entries, scope]
         reason.sort(key=lambda entry: _CODE_RANK.get(
             entry.code or StatusCode.OK, 3))
         return CheckResult(reason=list(reason), name=LAMBDA,
                            description=f"Lambda functions in {account.name}",
-                           report=self._function_roster(readings, show_region))
+                           report=self._function_roster(functions, show_region))
 
     def _function_roster(self, readings: list[FunctionReading],
                          show_region: bool) -> str:
@@ -2321,10 +2692,11 @@ class AwsCheck(Check):
 
     @staticmethod
     def _newest_execution(client: CodePipelineClient, name: str
-                          ) -> tuple[str, datetime | None]:
-        """The pipeline's most recent execution: its status and when it started.
+                          ) -> tuple[str, datetime | None, str]:
+        """The pipeline's most recent execution: its status, when it started, and
+        the id CodePipeline gives it.
 
-        ``("", None)`` when the pipeline has never been executed — the case the
+        ``("", None, "")`` when the pipeline has never been executed — the case the
         original dropped on the floor, because it only ever built a ``Status``
         inside the loop over executions.
         """
@@ -2341,8 +2713,9 @@ class AwsCheck(Check):
             if newest is None or started > newest["startTime"]:
                 newest = dict(summary)
         if newest is None:
-            return "", None
-        return str(newest.get("status", "")), newest["startTime"]
+            return "", None, ""
+        return (_word(str(newest.get("status", ""))), newest["startTime"],
+                _identifier(str(newest.get("pipelineExecutionId", "") or "")))
 
     def _read_pipelines(self, session: Session,
                         region: str) -> list[PipelineReading]:
@@ -2353,16 +2726,16 @@ class AwsCheck(Check):
         for name in self._list_pipeline_names(client):
             if self.codepipeline.ignored(name):
                 continue
-            status, started = self._newest_execution(client, name)
-            readings.append(PipelineReading(name=name, region=region,
-                                            status=status, started=started))
+            status, started, execution = self._newest_execution(client, name)
+            readings.append(PipelineReading(name=_kept(name), region=region,
+                                            status=status, started=started,
+                                            execution_id=execution))
         return readings
 
     def _pipeline_entry(self, reading: PipelineReading, now: datetime,
                         show_region: bool) -> Entry:
         settings = self.codepipeline
         rule = settings.rule_for(reading.name)
-        self._note_rule(CODEPIPELINE, rule)
         age = (None if reading.started is None
                else max(0, int((now - reading.started).total_seconds())))
         said = ""
@@ -2399,30 +2772,73 @@ class AwsCheck(Check):
             f"{phrase}{said}",
             code)
 
-    def _codepipeline_aspect(self, account: Account,
-                             session: Session) -> CheckResult:
+    def _measure_codepipeline(self, account: Account,
+                              session: Session) -> list[Measurement]:
+        """Every pipeline in this account's regions that no rule ignores — a rule's
+        ``ignore`` spares the pipeline's execution list, so it is decided here
+        (ADR-0005 §2) — one reading each."""
+        settings = self.codepipeline
+        readings: list[Measurement] = []
+        for region in self.regions_for(account):
+            try:
+                pipelines = self._read_pipelines(session, region)
+            except (BotoCoreError, ClientError) as error:
+                readings.append(_unreadable(CODEPIPELINE, account, region, error))
+                continue
+            for pipeline in pipelines:
+                self._note_rule(CODEPIPELINE, settings.rule_for(pipeline.name))
+                readings.append(self._pipeline_reading(account, pipeline))
+        return readings
+
+    @staticmethod
+    def _pipeline_reading(account: Account,
+                          pipeline: PipelineReading) -> Measurement:
+        """A pipeline's reading, of the object ADR-0005 §3 gives a history: the
+        pipeline, in its account and its region.
+
+        It names the newest execution by the id CodePipeline gives it, so an
+        execution read in progress and again finished is one record rather than a
+        row a poll repeats (ADR-0005 §5), and it names the state
+        :data:`NEVER_RUN` where there is no execution to name. Its own time, `at`,
+        is when that execution started — the instant its line reports.
+        """
+        started = _iso(pipeline.started)
+        identity, state = ((pipeline.execution_id, "") if pipeline.status
+                           else ("", NEVER_RUN))
+        return _reading(
+            CODEPIPELINE, "pipeline", account.name, pipeline.region,
+            {"name": pipeline.name, "execution": pipeline.execution_id or None,
+             "status": pipeline.status or None, "started": started,
+             "at": started},
+            subject=_subject(CODEPIPELINE, account.name, pipeline.region,
+                             pipeline.name),
+            identity=identity, state=state)
+
+    def _grade_codepipeline(self, account: Account,
+                            readings: Sequence[Measurement],
+                            now: datetime) -> CheckResult:
+        """The pipelines leaf, from its readings: a line per pipeline, each
+        carrying its reading, with its staleness measured to *now*."""
         regions = self.regions_for(account)
         show_region = len(regions) > 1
-        now = _utcnow()
         failures: list[Entry] = []
-        readings: list[PipelineReading] = []
-        for region in regions:
-            try:
-                readings.extend(self._read_pipelines(session, region))
-            except (BotoCoreError, ClientError) as error:
-                failures.append(Entry(
-                    slug("read", region),
-                    f"{plain(region)}: pipelines cannot be read: {plain(error)}",
-                    StatusCode.WARN))
-        entries = [self._pipeline_entry(reading, now, show_region)
-                   for reading in readings]
+        entries: list[Entry] = []
+        pipelines: list[PipelineReading] = []
+        for reading in readings:
+            if reading.record["kind"] == "unreadable":
+                failures.append(_unreadable_entry(reading, "pipelines"))
+                continue
+            pipeline = _pipeline_of(reading.record)
+            pipelines.append(pipeline)
+            entries.append(_carrying(
+                self._pipeline_entry(pipeline, now, show_region), reading))
         reason = [*failures, *entries,
-                  _scope_line("pipeline", len(readings), regions)]
+                  _scope_line("pipeline", len(pipelines), regions)]
         reason.sort(key=lambda entry: _CODE_RANK.get(
             entry.code or StatusCode.OK, 3))
         return CheckResult(reason=list(reason), name=CODEPIPELINE,
                            description=f"CodePipeline pipelines in {account.name}",
-                           report=self._pipeline_roster(readings, show_region))
+                           report=self._pipeline_roster(pipelines, show_region))
 
     @staticmethod
     def _pipeline_roster(readings: list[PipelineReading],
@@ -2471,12 +2887,13 @@ class AwsCheck(Check):
                 if not name:
                     continue
                 jobs.append(Job(
-                    job_id=str(row.get("jobId", "")),
-                    name=name,
-                    status=str(row.get("status", "")).upper(),
+                    job_id=_identifier(str(row.get("jobId", ""))),
+                    name=_kept(name),
+                    status=_word(str(row.get("status", "")).upper()),
                     created=self._job_time(row.get("createdAt")),
                     started=self._job_time(row.get("startedAt")),
-                    stopped=self._job_time(row.get("stoppedAt"))))
+                    stopped=self._job_time(row.get("stoppedAt")),
+                    reason=_kept(str(row.get("statusReason", "") or ""))))
         return jobs, False
 
     def _read_queues(self, session: Session, region: str) -> list[QueueReading]:
@@ -2488,10 +2905,11 @@ class AwsCheck(Check):
             name = str(row.get("jobQueueName", "")).strip()
             if not name or settings.ignored_queue(name):
                 continue
-            queue = JobQueue(name=name, region=region,
-                             state=str(row.get("state", "")),
-                             status=str(row.get("status", "")),
-                             status_reason=str(row.get("statusReason", "")))
+            queue = JobQueue(name=_kept(name), region=region,
+                             state=_word(str(row.get("state", ""))),
+                             status=_word(str(row.get("status", ""))),
+                             status_reason=_kept(
+                                 str(row.get("statusReason", "") or "")))
             jobs: list[Job] = []
             capped = False
             for status in BATCH_STATUSES:
@@ -2632,44 +3050,100 @@ class AwsCheck(Check):
                 for stamp in (when(job) for job in jobs) if stamp is not None]
         return max(ages) if ages else None
 
-    def _batch_aspect(self, account: Account, session: Session) -> CheckResult:
+    def _measure_batch(self, account: Account,
+                       session: Session) -> list[Measurement]:
+        """Every job queue no ``ignore_queue_patterns`` entry names — that list
+        spares each queue's job listings, so it is decided here — then a reading
+        per queue and one per run in it, the names ``ignore_name_patterns`` hides
+        included: listing a queue answers with them either way (ADR-0005 §2)."""
+        readings: list[Measurement] = []
+        for region in self.regions_for(account):
+            try:
+                queues = self._read_queues(session, region)
+            except (BotoCoreError, ClientError) as error:
+                readings.append(_unreadable(BATCH, account, region, error))
+                continue
+            for read in queues:
+                queue = read.queue
+                readings.append(_reading(
+                    BATCH, "queue", account.name, region,
+                    {"name": queue.name, "state": queue.state or None,
+                     "status": queue.status or None,
+                     "reason": queue.status_reason or None,
+                     "capped": read.capped}))
+                readings.extend(self._run_reading(account, queue, job)
+                                for job in read.jobs)
+        return readings
+
+    @staticmethod
+    def _run_reading(account: Account, queue: JobQueue, job: Job) -> Measurement:
+        """One run of a job, of the object ADR-0005 §3 gives a history: the job's
+        name in its queue, in its account and its region.
+
+        It names the run by the ``jobId`` Batch gives it, so a run seen waiting,
+        then running, then finished is one record that ends in its final state, and
+        several runs of one name in one poll are several records (ADR-0005 §5).
+        Its own time, `at`, is when it finished — nothing while it has not.
+        """
+        return _reading(
+            BATCH, "job", account.name, queue.region,
+            {"queue": queue.name, "name": job.name, "id": job.job_id or None,
+             "status": job.status, "reason": job.reason or None,
+             "created": {"at": _iso(job.created)}, "started": _iso(job.started),
+             "ended": _iso(job.stopped), "at": _iso(job.stopped)},
+            subject=_subject(BATCH, account.name, queue.region, queue.name,
+                             job.name),
+            identity=job.job_id)
+
+    def _grade_batch(self, account: Account, readings: Sequence[Measurement],
+                     now: datetime) -> CheckResult:
+        """The job queues leaf, from its readings: per queue, a line of its own when
+        it has something to say, then a line per job name carrying every reading
+        of that name at once, its ages measured to *now*."""
         settings = self.batch
         regions = self.regions_for(account)
         show_region = len(regions) > 1
-        now = _utcnow()
         failures: list[Entry] = []
         entries: list[Entry] = []
         roster: list[str] = []
-        queues = 0
-        for region in regions:
-            try:
-                readings = self._read_queues(session, region)
-            except (BotoCoreError, ClientError) as error:
-                failures.append(Entry(
-                    slug("read", region),
-                    f"{plain(region)}: job queues cannot be read: {plain(error)}",
-                    StatusCode.WARN))
-                continue
-            for reading in readings:
-                queues += 1
-                groups: dict[str, list[Job]] = {}
-                for job in reading.jobs:
-                    if settings.ignored(job.name):
-                        continue
-                    groups.setdefault(job.name, []).append(job)
-                queue_entry = self._queue_entry(reading, len(groups), show_region)
-                if queue_entry is not None:
-                    entries.append(queue_entry)
-                for name in sorted(groups):
-                    entries.append(self._job_entry(
-                        reading.queue, name, groups[name], now, show_region))
-                where = f"{plain(region)} / " if show_region else ""
-                names = "no job names" if not groups else (
-                    f"{len(groups)} job name{'' if len(groups) == 1 else 's'}")
-                roster.append(f"- {where}"
-                              f"[{plain(reading.queue.name)}]({_queue_link(region)})"
-                              f" — {names}")
-        reason = [*failures, *entries, _scope_line("job queue", queues, regions)]
+        queues: list[tuple[QueueReading, Measurement]] = []
+        runs: dict[tuple[str, str], list[tuple[Job, Measurement]]] = {}
+        for reading in readings:
+            record = reading.record
+            if record["kind"] == "unreadable":
+                failures.append(_unreadable_entry(reading, "job queues"))
+            elif record["kind"] == "queue":
+                queues.append((_queue_of(record), reading))
+            elif record["kind"] == "job":
+                runs.setdefault((str(record["region"]), str(record["queue"])),
+                                []).append((_job_of(record), reading))
+        for read, reading in queues:
+            queue = read.queue
+            groups: dict[str, list[Job]] = {}
+            subjects: dict[str, str] = {}
+            for job, run in runs.get((queue.region, queue.name), []):
+                if settings.ignored(job.name):
+                    continue
+                groups.setdefault(job.name, []).append(job)
+                subjects.setdefault(job.name, run.subject)
+            queue_entry = self._queue_entry(read, len(groups), show_region)
+            if queue_entry is not None:
+                entries.append(_carrying(queue_entry, reading))
+            for name in sorted(groups):
+                # Written from every run of its name, so it carries none of them —
+                # but it is about the one object they all are, and says which
+                # (ADR-0005 §7).
+                entries.append(replace(
+                    self._job_entry(queue, name, groups[name], now, show_region),
+                    subject=subjects[name]))
+            where = f"{plain(queue.region)} / " if show_region else ""
+            names = "no job names" if not groups else (
+                f"{len(groups)} job name{'' if len(groups) == 1 else 's'}")
+            roster.append(f"- {where}"
+                          f"[{plain(queue.name)}]({_queue_link(queue.region)})"
+                          f" — {names}")
+        reason = [*failures, *entries,
+                  _scope_line("job queue", len(queues), regions)]
         reason.sort(key=lambda entry: _CODE_RANK.get(
             entry.code or StatusCode.OK, 3))
         return CheckResult(reason=list(reason), name=BATCH,
@@ -2717,78 +3191,93 @@ class AwsCheck(Check):
                      self.path, account.name, target,
                      self._credentials_for(account), as_whom, " ".join(failure))
 
-    def _account_result(self, base: Session, account: Account
-                        ) -> tuple[CheckResult, bool]:
-        """One account's node, and whether it could be **looked at** at all.
+    def _estate(self, *, credentials: str | None = None,
+                outcomes: Sequence[tuple[str, str]] = ()) -> Measurement:
+        """The run's own reading, about the object this check declares
+        (ADR-0005 §6): whether the credentials opened — and what AWS answered
+        where they did not — and, in configuration order, what became of each
+        account. It names the state those outcomes spell (:func:`_estate_state`),
+        or :data:`CREDENTIALS_UNUSABLE` where no account was tried, and never the
+        text, which the record keeps."""
+        state = (CREDENTIALS_UNUSABLE if credentials is not None
+                 else _estate_state(outcomes))
+        return _reading(None, "estate", None, None,
+                        {"credentials": credentials,
+                         "accounts": [{"name": name, "outcome": outcome}
+                                      for name, outcome in outcomes]},
+                        subject=self.subject, state=state)
 
-        The second half is said rather than inferred. It was briefly read back
-        off the result — an ERROR node with no children — which is true today
-        only because this method builds exactly those two shapes, and a mutation
-        that broke the inference changed no behavior at all: proof that the
-        caller was relying on a coincidence rather than on an answer. The
-        distinction matters too much to rest on that. It is the whole difference
-        between *this check measured and did not like what it saw* and *this
-        check could not measure*.
-        """
-        session, failure = self._open(base, account)
-        if session is None:
-            self._log_unreadable(base, account, failure)
+    def _grade_account(self, account: Account, record: Mapping[str, Any],
+                       placed: Mapping[tuple[str, str], Sequence[Measurement]],
+                       now: datetime) -> CheckResult:
+        """One account's node, from its own reading and its aspects' readings:
+        red with what refused it, or a container of the aspects this configuration
+        runs, each built from this account's readings of it."""
+        outcome = str(record["outcome"])
+        if outcome != READ:
             # This account's problem, and this account's node. The others keep
             # reporting, which is the whole reason the tree branches here.
             return CheckResult(
-                StatusCode.ERROR, failure,
+                StatusCode.ERROR,
+                self._refusal_lines(account, _Refusal(
+                    outcome, str(record.get("error") or ""),
+                    str(record.get("renewal") or ""))),
                 name=account.name, title=account.title, about=account.about,
-                config=self._account_config(account)), False
-        builders = {CLOUDWATCH: self._cloudwatch_aspect,
-                    EC2: self._ec2_aspect,
-                    LAMBDA: self._lambda_aspect,
-                    CODEPIPELINE: self._codepipeline_aspect,
-                    BATCH: self._batch_aspect}
-        # A switched-off aspect emits no node **and makes no API call** — which is
-        # the half that matters to a role whose policy does not carry that
-        # service's permissions at all.
-        children = tuple(builders[name](account, session)
+                config=self._account_config(account))
+        graders: dict[str, Callable[[Account, Sequence[Measurement], datetime],
+                                    CheckResult]] = {
+            CLOUDWATCH: self._grade_cloudwatch, EC2: self._grade_ec2,
+            LAMBDA: self._grade_lambda, CODEPIPELINE: self._grade_codepipeline,
+            BATCH: self._grade_batch}
+        children = tuple(graders[name](account,
+                                       placed.get((account.name, name), ()), now)
                          for name in self.active_aspects())
         return CheckResult(StatusCode.OK, [], name=account.name,
                            children=children, title=account.title,
                            about=account.about,
-                           config=self._account_config(account)), True
+                           config=self._account_config(account))
 
-    def _open(self, base: Session, account: Account
-              ) -> tuple[Session | None, list[str]]:
+    def _open(self, base: Session, account: Account) -> Session | _Refusal:
         """Open *account*'s session, renewing an expired login once if it can.
 
-        Returns the session and no reasons, or no session and the reasons the
-        node will carry. The retry is the point of the whole exercise: an SSO
-        login expires roughly once a working day, and on the machine where that
+        Returns the session, or why there is none — which the account's reading
+        keeps and its node says. The retry is the point of the whole exercise: an
+        SSO login expires roughly once a working day, and on the machine where that
         happens the fix is a command this process can run — so it runs it, once,
         and asks AWS again rather than reddening three accounts until somebody
         notices the dashboard.
         """
         try:
-            return self._opened(base, account), []
+            return self._opened(base, account)
         except (BotoCoreError, ClientError) as error:
             if not is_credential_error(error):
-                return None, [self._unreachable(account, error)]
+                return _Refusal(UNREACHABLE, _kept(str(error)))
             problem = self._renew(account)
             if problem:
-                return None, self._expired(account, error, problem)
+                return _Refusal(EXPIRED, _kept(str(error)), _kept(problem))
             try:
                 # A *new* base session: the one above cached the credentials
                 # that just expired, and the login wrote a fresh token beside it.
-                return self._opened(self._base_session(), account), []
+                return self._opened(self._base_session(), account)
             except (BotoCoreError, ClientError) as again:
-                return None, self._expired(
-                    account, again,
-                    "the login was renewed and the credentials are still refused")
+                return _Refusal(EXPIRED, _kept(str(again)), RENEWED_STILL_REFUSED)
 
-    def _unreachable(self, account: Account, error: BaseException) -> str:
+    def _refusal_lines(self, account: Account, refusal: _Refusal) -> list[str]:
+        """What an account that could not be opened says: one line where AWS said
+        no, two where its login had expired. Written from the refusal and the
+        configuration alone, so the node the grading builds and the log line the
+        measuring half writes say the same thing."""
+        if refusal.outcome == EXPIRED:
+            return self._expired(account, refusal.error, refusal.renewal)
+        return [self._unreachable(account, refusal.error)]
+
+    def _unreachable(self, account: Account, error: str) -> str:
         """AWS said no, and it was not about the credentials being stale."""
         if account.role_arn:
             return f"role cannot be assumed: {plain(error)}"
         return f"account cannot be read: {plain(error)}"
 
-    def _expired(self, account: Account, error: BaseException,
+    def _expired(self, account: Account, error: str,
                  problem: str) -> list[str]:
         """Two lines: what went wrong, and what to do about it.
 
@@ -2940,36 +3429,112 @@ class AwsCheck(Check):
             f"{', '.join(plain(region) for region in self.regions_for(account))}"
             for account in self.accounts)
 
-    def run(self) -> CheckResult:
+    def measure(self) -> list[Measurement]:
+        """Read every account: the estate first, then each account's own reading,
+        then each aspect's readings in the order it read them (ADR-0005 §1).
+
+        The credentials are opened once; where they cannot be, the estate is the
+        only reading, and no account is tried. An account that cannot be opened is
+        a reading of its own — and, because a check that could not look is a
+        different event from one that looked and graded badly, a line in the log
+        naming who we actually were (:meth:`_log_unreadable`). What the log says
+        about the run as a whole — the accounts in scope, how many could not be
+        read, the rules that matched nothing — is said here too: it is this
+        process talking about this run, and the grading may keep no state.
+        """
         try:
             base = self._base_session()
         except (BotoCoreError, ClientError) as error:
             # Nothing can be read at all — the whole branch goes red rather than
             # every account inventing the same excuse.
-            return CheckResult(
-                StatusCode.ERROR,
-                [f"no usable AWS credentials: {plain(error)}"],
-                report=self._scope_report())
+            return [self._estate(credentials=_kept(str(error)))]
+        self._matched_rules = {}
+        measurers: dict[str, Callable[[Account, Session], list[Measurement]]] = {
+            CLOUDWATCH: self._measure_cloudwatch, EC2: self._measure_ec2,
+            LAMBDA: self._measure_lambda, CODEPIPELINE: self._measure_codepipeline,
+            BATCH: self._measure_batch}
+        outcomes: list[tuple[str, str]] = []
+        accounts: list[Measurement] = []
+        readings: list[Measurement] = []
+        for account in self.accounts:
+            opened = self._open(base, account)
+            if isinstance(opened, _Refusal):
+                self._log_unreadable(base, account,
+                                     self._refusal_lines(account, opened))
+                outcomes.append((account.name, opened.outcome))
+                accounts.append(_reading(None, "account", account.name, None,
+                                         {"outcome": opened.outcome,
+                                          "error": opened.error,
+                                          "renewal": opened.renewal or None}))
+                continue
+            outcomes.append((account.name, READ))
+            accounts.append(_reading(None, "account", account.name, None,
+                                     {"outcome": READ, "error": None,
+                                      "renewal": None}))
+            # A switched-off aspect emits no node **and makes no API call** — which
+            # is the half that matters to a role whose policy does not carry that
+            # service's permissions at all.
+            for name in self.active_aspects():
+                readings.extend(measurers[name](account, opened))
         # An account that could not be looked at at all — not one whose aspects
         # graded badly, which is an ordinary reading and says so on its own node.
         # `2 of 2` is the shape of a credential problem and `1 of 3` the shape of
-        # one account's policy, so the count is itself a diagnosis.
-        self._matched_rules = {}
-        read = [self._account_result(base, account) for account in self.accounts]
-        children = tuple(result for result, _ in read)
-        unreadable = [result.name for result, looked in read if not looked]
+        # one account's policy, so the count is itself a diagnosis — which is why
+        # the estate's state is spelled from it (ADR-0005 §6).
+        unreadable = [name for name, outcome in outcomes if outcome != READ]
         # "in scope", not "read": this line is the roster, and directly under a
         # run where every account was refused, "read 2 account(s)" was a claim
         # the very next line contradicted.
-        logger.info("%s: %d account(s) in scope: %s", self.path, len(children),
+        logger.info("%s: %d account(s) in scope: %s", self.path, len(outcomes),
                     ", ".join(account.name for account in self.accounts))
         if unreadable:
             logger.error("%s: %d of %d account(s) could not be read: %s",
-                         self.path, len(unreadable), len(children),
+                         self.path, len(unreadable), len(outcomes),
                          ", ".join(unreadable))
         self._report_unmatched_rules()
-        # The root stays OK and says only what is watched: an account that failed
-        # is red on its own node and reaches this container by roll-up, so
-        # repeating it here would report one fact twice.
-        return CheckResult(StatusCode.OK, [self._scope_reason()],
+        return [self._estate(outcomes=outcomes), *accounts, *readings]
+
+    def grade(self, measurements: Sequence[Measurement],
+              now: datetime) -> CheckResult:
+        """The check's tree, from the readings alone (little-sister ADR-0086
+        decision 6): the estate says whether the credentials opened, each
+        account's reading whether that account did, and each aspect's readings
+        become that account's child. *now* is what every age on a line is
+        measured to.
+        """
+        estate: Mapping[str, Any] | None = None
+        accounts: dict[str, Mapping[str, Any]] = {}
+        placed: dict[tuple[str, str], list[Measurement]] = {}
+        for measurement in measurements:
+            record = measurement.record
+            kind = record.get("kind")
+            if kind == "estate":
+                estate = record
+            elif kind == "account":
+                accounts[str(record["account"])] = record
+            elif record.get("aspect") in self.ASPECTS:
+                placed.setdefault((str(record["account"]), str(record["aspect"])),
+                                  []).append(measurement)
+        if estate is None:
+            # Only a failure record written by the engine has no estate reading,
+            # and the engine grades that run itself; this is the guard for a caller
+            # that hands over something no measurement of ours produced.
+            return CheckResult(StatusCode.ERROR,
+                               ["no estate reading to grade — nothing was read"],
+                               report=self._scope_report())
+        if estate.get("credentials") is not None:
+            return CheckResult(
+                StatusCode.ERROR,
+                [f"no usable AWS credentials: {plain(str(estate['credentials']))}"],
+                report=self._scope_report())
+        children = tuple(self._grade_account(account, accounts[account.name],
+                                             placed, now)
+                         for account in self.accounts if account.name in accounts)
+        # The root grades nothing. It says only what is watched: an account that
+        # failed is red on its own node and reaches this container by roll-up, so
+        # repeating it here would report one fact twice. So it declares
+        # `UNDEFINED` — a container that happens to carry a sentence — and what
+        # stood on it for the estate's reading is what the run rolls up to
+        # (little-sister ADR-0087 decision 8, ADR-0005 §6).
+        return CheckResult(StatusCode.UNDEFINED, [self._scope_reason()],
                            children=children, report=self._scope_report())

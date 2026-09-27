@@ -61,7 +61,7 @@ keeps its own state for as long as it stands by — pins set on it, the events i
 observes — while the holder keeps writing the store. When the holder's lease lapses
 and the standby takes it, *its own state is what it writes* put hours-old pins over
 what the holder had written. A rollout produces exactly that overlap. The rule that
-settles it is little-sister's (ADR-0077): **authority follows the lease** — whoever
+settles it is little-sister ADR-0077's: **authority follows the lease** — whoever
 held it wrote the truth up to the moment it lapsed, and a standby's own state is a
 shadow of the store. The library adopts; this record is what the keeper owes that
 rule, and three things beside it that the same run asked for: the holder cannot see a
@@ -193,8 +193,8 @@ meet on every page that shows a store stamp beside a local one.
    `lapse_after × state_interval` — three minutes at the defaults — and the
    heartbeat interval is the knob that trades cost for it, linearly.
 
-   The mark is little-sister's (ADR-0074): no two processes share one, one
-   process's does not change while it runs, and nothing here parses it. The
+   The mark is the library's (little-sister ADR-0074): no two processes share one,
+   one process's does not change while it runs, and nothing here parses it. The
    object keeps the last four claims beside the current one, newest first, each
    stamped with the moment it was taken — a pattern rather than a fact, and four
    claims in ten minutes reads differently from one nine days ago.
@@ -206,9 +206,9 @@ meet on every page that shows a store stamp beside a local one.
    way rather than louder. Through its own self-report contributor (little-sister
    ADR-0072), on its child `/little-sister/aws-keeper`. **Every line is a claim and
    carries a code; what the keeper merely knows is the child's `report`**
-   (little-sister ADR-0076 decision 1, ADR-0044 decision 6): shown on the child's
-   page, never on a card, never a grade — so the card says something only when
-   something is wrong, and pinning the one warning quiets the child.
+   (little-sister ADR-0076 decision 1, little-sister ADR-0044 decision 6): shown on
+   the child's page, never on a card, never a grade — so the card says something only
+   when something is wrong, and pinning the one warning quiets the child.
 
    The report: *this instance holds the lease on `s3://…`, heartbeat every n, lapse
    after m* — for the life of the tenure; whose lease this replaced and how (a

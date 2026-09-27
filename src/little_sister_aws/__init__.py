@@ -11,6 +11,6 @@ the place it is taken.
 """
 from little_sister.checks import require_api
 
-require_api(2)                       # the check API epoch this package was built for
+require_api(3)                       # the check API epoch this package was built for
 
 from little_sister_aws import aws  # noqa: E402,F401  registration side effect

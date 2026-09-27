@@ -1,20 +1,23 @@
 """One reading identity: the session it opens, and the SSO login behind it.
 
-No live AWS anywhere and no subprocess anywhere: sessions are built through the
-``factory`` seam and the CLI through the one :func:`run_sso_login` replaces. The
-check's own use of all this — what a node says when a login expired, what the
-card promises — stays in ``test_aws.py``, because that is the check's behavior
-rather than this seam's.
+No live AWS anywhere: sessions are built through the ``factory`` seam, and the CLI
+through little-sister's process function, which the tests of :func:`run_sso_login`
+replace — all but two, which run a stand-in ``aws`` script for real. The check's own
+use of all this — what a node says when a login expired, what the card promises —
+stays in ``test_aws.py``, because that is the check's behavior rather than this seam's.
 """
 from __future__ import annotations
 
-import subprocess
+import os
 import threading
 import time
+from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 import pytest
 from botocore.exceptions import ClientError, NoCredentialsError
+from little_sister import process
 
 from little_sister_aws import identity as identity_module
 from little_sister_aws.identity import (
@@ -489,47 +492,73 @@ def test_concurrent_renewals_of_one_profile_run_one_login() -> None:
 
 
 # --- running the CLI ------------------------------------------------------
+#
+# The CLI starts through little-sister's process function (little-sister ADR-0089):
+# what a login came to is a `Finished`, and a CLI that could not start is
+# `NotStarted`. Most of these replace that one call; the last two run a stand-in
+# `aws` for real, from a directory put first on PATH.
 
-class _Completed:
-    def __init__(self, returncode: int, stderr: str = "", stdout: str = "") -> None:
-        self.returncode = returncode
-        self.stderr = stderr
-        self.stdout = stdout
+def _finished(status: int = 0, *, stderr: str = "", stdout: str = "",
+              ended: process.Ended = process.Ended.EXITED) -> process.Finished:
+    return process.Finished(status=status, stdout=stdout.encode(),
+                            stderr=stderr.encode(), ended=ended, stdout_cut=False,
+                            stderr_cut=False, seconds=0.0)
 
 
-def _ran(monkeypatch: pytest.MonkeyPatch, result: Any) -> list[list[str]]:
-    """Replace the subprocess and record the argv it was given."""
-    commands: list[list[str]] = []
+def _not_started(cause: OSError | None) -> process.NotStarted:
+    """What the process function raises: with the ``OSError`` that said so, or none
+    while the instance is stopping."""
+    try:
+        if cause is None:
+            raise process.NotStarted("aws was not started: the instance is stopping")
+        raise process.NotStarted(f"aws could not be started: {cause}") from cause
+    except process.NotStarted as error:
+        return error
 
-    def fake_run(command: list[str], **kwargs: Any) -> Any:
-        commands.append(command)
+
+def _ran(monkeypatch: pytest.MonkeyPatch,
+         result: Any) -> list[tuple[list[str], dict[str, Any]]]:
+    """Replace the process function and record what it was asked to run."""
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def fake_run(argv: Sequence[str], **kwargs: Any) -> process.Finished:
+        calls.append((list(argv), kwargs))
         if isinstance(result, BaseException):
             raise result
+        assert isinstance(result, process.Finished)
         return result
 
-    monkeypatch.setattr(identity_module.subprocess, "run", fake_run)
-    return commands
+    monkeypatch.setattr(identity_module.process, "run", fake_run)
+    return calls
 
 
 def test_the_login_command_names_the_profile(
         monkeypatch: pytest.MonkeyPatch) -> None:
-    commands = _ran(monkeypatch, _Completed(0))
+    calls = _ran(monkeypatch, _finished(0))
     assert identity_module.run_sso_login(PRIMARY, 120) == ""
-    assert commands == [["aws", "sso", "login", "--profile", PRIMARY]]
+    assert [argv for argv, _ in calls] == [
+        ["aws", "sso", "login", "--profile", PRIMARY]]
 
 
 def test_without_a_profile_the_cli_is_left_to_pick_one(
         monkeypatch: pytest.MonkeyPatch) -> None:
     """`login: always` with no profile is still meaningful — AWS_PROFILE in the
     environment is a profile the CLI will find and this check never saw."""
-    commands = _ran(monkeypatch, _Completed(0))
+    calls = _ran(monkeypatch, _finished(0))
     identity_module.run_sso_login("", 120)
-    assert commands == [["aws", "sso", "login"]]
+    assert [argv for argv, _ in calls] == [["aws", "sso", "login"]]
+
+
+def test_the_login_is_bounded_by_the_timeout_it_was_given(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _ran(monkeypatch, _finished(0))
+    identity_module.run_sso_login(PRIMARY, 120)
+    assert calls[0][1]["timeout"] == 120
 
 
 def test_a_failed_login_reports_the_cli_s_last_word(
         monkeypatch: pytest.MonkeyPatch) -> None:
-    _ran(monkeypatch, _Completed(
+    _ran(monkeypatch, _finished(
         255, stderr="Attempting to automatically open the SSO page\n"
                     "Error loading SSO Token: Token has expired"))
     problem = identity_module.run_sso_login(PRIMARY, 120)
@@ -541,23 +570,77 @@ def test_a_login_nobody_completes_is_stopped_and_says_so(
         monkeypatch: pytest.MonkeyPatch) -> None:
     """It holds an engine worker thread while it waits, so the bound is the
     point of the sentence, not decoration."""
-    _ran(monkeypatch, subprocess.TimeoutExpired(cmd="aws", timeout=120))
+    _ran(monkeypatch, _finished(-15, ended=process.Ended.BOUND))
     assert "still waiting after 2m" in identity_module.run_sso_login(PRIMARY, 120)
+
+
+def test_a_login_the_instance_s_stop_ended_says_so(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stop ends a login still waiting for its person (little-sister ADR-0088)."""
+    _ran(monkeypatch, _finished(-15, ended=process.Ended.STOP))
+    problem = identity_module.run_sso_login(PRIMARY, 120)
+    assert "ended by the instance's stop" in problem
+    assert "still waiting" not in problem
 
 
 def test_a_missing_cli_is_a_reason_not_a_crash(
         monkeypatch: pytest.MonkeyPatch) -> None:
-    _ran(monkeypatch, FileNotFoundError("aws"))
+    _ran(monkeypatch, _not_started(FileNotFoundError(2, "No such file", "aws")))
     assert identity_module.run_sso_login(PRIMARY, 120) == "the aws CLI is not on PATH"
+
+
+def test_a_cli_that_cannot_start_says_why(monkeypatch: pytest.MonkeyPatch) -> None:
+    _ran(monkeypatch, _not_started(PermissionError(13, "Permission denied", "aws")))
+    problem = identity_module.run_sso_login(PRIMARY, 120)
+    assert "could not be started" in problem
+    assert "Permission denied" in problem
+
+
+def test_a_login_asked_for_while_the_instance_stops_is_not_started(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    _ran(monkeypatch, _not_started(None))
+    problem = identity_module.run_sso_login(PRIMARY, 120)
+    assert "the instance is stopping" in problem
 
 
 def test_the_cli_s_words_are_escaped_before_they_reach_a_card(
         monkeypatch: pytest.MonkeyPatch) -> None:
     """A reason renders as Markdown (little-sister ADR-0018), and the CLI's
     stderr is captured output like any other."""
-    _ran(monkeypatch, _Completed(1, stderr="see *this* [link](http://x)"))
+    _ran(monkeypatch, _finished(1, stderr="see *this* [link](http://x)"))
     problem = identity_module.run_sso_login(PRIMARY, 120)
     assert r"\*this\*" in problem and r"\[link\]" in problem
+
+
+def _stand_in(directory: Path, monkeypatch: pytest.MonkeyPatch, body: str) -> None:
+    """A stand-in `aws`, first on PATH, that the process function runs for real."""
+    aws = directory / "aws"
+    aws.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+    aws.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{directory}{os.pathsep}{os.environ.get('PATH', '')}")
+
+
+def test_a_stand_in_cli_gets_its_arguments_and_nothing_on_stdin(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """What a login needs arrives, and nothing it does not: the CLI opens the browser
+    itself and reads nothing from stdin, which is ``/dev/null``."""
+    _stand_in(tmp_path, monkeypatch,
+              'printf "%s\\n" "$@" > "$0.args"\n'
+              'cat > "$0.stdin"\n'
+              'echo "https://device.sso.example/?user_code=ABCD-EFGH"\n')
+    assert identity_module.run_sso_login(PRIMARY, 30) == ""
+    assert (tmp_path / "aws.args").read_text().split() == [
+        "sso", "login", "--profile", PRIMARY]
+    assert (tmp_path / "aws.stdin").read_text() == ""
+
+
+def test_a_stand_in_cli_that_never_returns_is_ended_at_the_bound(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _stand_in(tmp_path, monkeypatch, "sleep 60\n")
+    started = time.monotonic()
+    problem = identity_module.run_sso_login(PRIMARY, 1)
+    assert "still waiting after" in problem
+    assert time.monotonic() - started < 10
 
 
 # --- the ``sso:`` block, read once for three packages ------------------------

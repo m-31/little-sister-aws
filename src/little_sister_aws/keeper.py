@@ -16,6 +16,14 @@ old one; without it, every pin is lost with the disk.
 import-before-app slot, because where an installation's state is kept is a
 decision, and a decision should be readable at the place it is taken.
 
+That call has **two routes**, and the file is only one of them. With no argument
+it reads ``config/aws-keeper.yaml``; with ``config=`` it takes a
+:class:`KeeperConfig` the deployment built itself and reads no file. The second is
+the only route for an installation whose bucket name is not a constant — one that
+carries the account id, say, where one image is deployed to several accounts — and
+the two are the same keeper: :class:`KeeperConfig` normalizes its own ``prefix``,
+so a config built by hand keeps its keys where the file's would.
+
 The shape is ADR-0004's, and four things decide it.
 
 * **One lease per prefix.** One object under the prefix, :data:`OWNER_NAME`, says
@@ -252,11 +260,12 @@ class Lease:
     """The lease object, as it was read: who holds it, for how long, and how old
     the read found it.
 
-    ``instance`` is the library's mark (ADR-0074) — compared for equality, never
-    parsed. ``age_seconds`` and ``served_at`` are both S3's: the age is the answer's
-    ``Date`` against the object's ``LastModified``, and ``served_at`` the same
-    ``Date`` as an ISO instant, which is what the next claim stamps this one with,
-    so the history stays in one clock domain however many machines contributed.
+    ``instance`` is the library's mark (little-sister ADR-0074) — compared for
+    equality, never parsed. ``age_seconds`` and ``served_at`` are both S3's: the age
+    is the answer's ``Date`` against the object's ``LastModified``, and
+    ``served_at`` the same ``Date`` as an ISO instant, which is what the next claim
+    stamps this one with, so the history stays in one clock domain however many
+    machines contributed.
     """
 
     instance: str = ""
@@ -483,6 +492,16 @@ class KeeperConfig:
     #: intervals. The holder writes ``lapse_after × interval`` into the lease as
     #: ``ttl_seconds``, so a reader needs nothing but the object.
     lapse_after: int = DEFAULT_LAPSE_AFTER
+
+    def __post_init__(self) -> None:
+        # Here rather than in the loader, because the loader is one of two routes:
+        # ``register_s3_keeper(config=…)`` hands a config a deployment built itself
+        # straight to the keeper, which builds every key by concatenation — and
+        # ``prefix="state"`` would keep the lease at ``state.little-sister-owner.json``
+        # in the bucket's root.
+        prefix = self.prefix.lstrip("/")
+        object.__setattr__(self, "prefix",
+                           f"{prefix.rstrip('/')}/" if prefix else "")
 
 
 class S3Keeper:
@@ -1417,7 +1436,7 @@ class S3Keeper:
         way to lose state, it is a standby. **Every line is a claim and carries a
         code**; what this keeper merely knows — who holds the lease, whom it took
         it from, the last transitions — is :meth:`report` (little-sister ADR-0076
-        decision 1, ADR-0044 decision 6).
+        decision 1, little-sister ADR-0044 decision 6).
         """
         with self._lock:
             return self._lines()
@@ -1660,10 +1679,9 @@ def load_keeper_config(spec: str | Path | None = None) -> KeeperConfig | None:
         raise KeeperConfigError(
             f"{path}: 'bucket' is required — a keeper with no bucket is a file "
             f"that says the state is kept somewhere and does not say where")
-    prefix = _text(body, "prefix", path=path).lstrip("/")
     return KeeperConfig(
         bucket=bucket,
-        prefix=f"{prefix.rstrip('/')}/" if prefix else "",
+        prefix=_text(body, "prefix", path=path),
         identity=_text(body, "identity", path=path),
         region=_text(body, "region", path=path),
         lapse_after=_lapse_after(body, path=path))
@@ -1713,6 +1731,11 @@ def register_s3_keeper(config: KeeperConfig | None = None,
 
     Returns the keeper, or ``None`` where the configuration declares none — which
     is an instance that keeps its state on its own disk, and a supported shape.
+
+    ``config`` is the route that reads no file: a :class:`KeeperConfig` the
+    deployment built — a bucket name derived at startup rather than written down.
+    Without it, ``config/aws-keeper.yaml`` is read. ``identities`` is the same
+    choice for ``config/aws.yaml``.
 
     The session is opened **lazily**, at the first call little-sister makes, not
     here: registration happens in the import-before-app slot, and a bucket that

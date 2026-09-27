@@ -1,6 +1,6 @@
 [project]
 name = "little-sister-aws"
-version = "0.1.3"
+version = "0.1.4"
 # **Every surface, not one.** The old summary named only the check type, which was
 # true when this package was only that; it now also carries the AWS secret provider,
 # the S3 keeper and the identity seam all three open sessions through, and a summary
@@ -43,22 +43,26 @@ requires-python = ">=3.11"
 # a release. The upgrade a floor cannot see, the library moving *past* the
 # surface, is caught by `require_api()` in `__init__.py`.
 #
-# **0.3.15**, the release that carries the **keeper seam** this package now fills
-# (`little_sister.keeper`, little-sister architecture.md §11 and its ADR-0071 §5) —
-# and, from the same release, `little_sister.instance`, the mark this package writes
-# into a bucket and used to invent for itself (its ADR-0074). Two added names, one
-# floor: they went out together, so there is nothing to tell apart.
-# An *added* name is exactly the mismatch `require_api()` cannot catch — an epoch
-# says what was **removed** and nothing about what arrived — so the floor is the
-# only thing standing between an older library and an `ImportError` at the
-# deployment's registration call. The check API epoch did not move with it: a
-# keeper is not a check, and nothing left the check-authoring surface.
+# **0.3.18** is the release that speaks **check API epoch 3**: `run()` became
+# `measure()` and `grade()` (little-sister ADR-0086), and a type written for the old
+# shape cannot be adapted at runtime. `require_api()` catches that direction — but only
+# at startup, and a floor naming an older release would let a resolver install the
+# very library that call is about to reject.
 #
-# It was **0.3.13** before, for epoch 2, when three names left that surface
-# (little-sister ADR-0025); the reasoning is kept because it is the other half of
-# what a floor is for, and both halves still apply.
+# The floor's other job is unchanged and is why it names a real number rather than the
+# first release with the epoch: the **keeper seam** this package fills
+# (`little_sister.keeper`, little-sister architecture.md §11 and its ADR-0071 §5) and
+# `little_sister.instance`, the mark it writes into a bucket (its ADR-0074), arrived
+# together in 0.3.15. An *added* name is exactly the mismatch `require_api()` cannot
+# catch — an epoch says what was **removed** and nothing about what arrived — so the
+# floor is the only thing standing between an older library and an `ImportError` at
+# the deployment's registration call.
+#
+# A local checkout that wants the library from beside it uses the development
+# redirect further down — and restores `uv.lock` with it. See `### Requires` in the
+# CHANGELOG for when the floor last moved.
 dependencies = [
-    "little-sister>=0.3.15",
+    "little-sister>=0.3.18",
     # boto3, and the reason this package is the first in the family with a
     # dependency beyond the library (ADR-0001 §3). A **floor**, like the one
     # above: boto3 releases daily and a pin here would fight every consumer.

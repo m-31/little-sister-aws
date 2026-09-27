@@ -379,7 +379,8 @@ class TestTakingTheLease:
         assert [claim["instance"] for claim in lease["claims"]] == [OTHER, "host-c:3"]
         assert lease["claims"][0]["at"] == "2026-09-05T08:21:40Z", \
             "S3's clock at the read, as an ISO instant"
-        # whom the lease was taken from is a fact: the report, no line (ADR-0076)
+        # whom the lease was taken from is a fact: the report, no line
+        # (little-sister ADR-0076)
         assert "predecessor" not in _slugs(keeper)
         report = keeper.report()
         assert OTHER in report and "lapsed 3m 40s before" in report
@@ -553,6 +554,30 @@ class TestSaves:
 
         assert "state/events.json" in fake.objects
         assert "state/" + OWNER_NAME in fake.objects
+
+    @pytest.mark.parametrize("written", ["state", "/state", "state/", "/state/"])
+    def test_the_class_carries_the_slash_not_the_caller(self, written: str) -> None:
+        """``KeeperConfig.prefix`` is "normalized to end in ``/`` when it is not
+        empty, so the key is always ``prefix + name``" — for a config built by
+        hand as much as for one read from the file, since
+        ``register_s3_keeper(config=…)`` hands it straight to the keeper."""
+        keeper, fake = _keeper(KeeperConfig(bucket=BUCKET, prefix=written))
+
+        keeper.save("events.json", b"x")
+
+        assert "state/events.json" in fake.objects
+        assert "state/" + OWNER_NAME in fake.objects
+        assert "stateevents.json" not in fake.objects
+        assert "state" + OWNER_NAME not in fake.objects
+
+    @pytest.mark.parametrize("written", ["", "/"])
+    def test_no_prefix_is_the_bucket_root(self, written: str) -> None:
+        keeper, fake = _keeper(KeeperConfig(bucket=BUCKET, prefix=written))
+
+        keeper.save("events.json", b"x")
+
+        assert "events.json" in fake.objects
+        assert OWNER_NAME in fake.objects
 
 
 class TestClose:
@@ -1010,6 +1035,22 @@ class TestRegistration:
 
         assert seen[0].name == ""
         assert seen[0].identity == Identity()
+
+    def test_a_config_handed_in_keeps_its_state_under_the_prefix(
+            self, config_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The route a deployment whose bucket name is not a constant takes: no
+        file, a ``KeeperConfig`` built at startup, ``prefix`` without its slash."""
+        fake = _FakeS3()
+        monkeypatch.setattr(aws_keeper, "_new_client",
+                            lambda identity, config: fake)
+        keeper = register_s3_keeper(KeeperConfig(bucket=BUCKET, prefix="state"), {})
+        assert keeper is not None
+
+        assert keeper.tick(INTERVAL) is True
+        keeper.save("events.json", b"x")
+
+        assert [key for key in fake.objects if not key.startswith("state/")] == []
+        assert "state/events.json" in fake.objects
 
 
 class TestTheClientBudget:
@@ -1801,7 +1842,7 @@ class TestTheInstanceLog:
         b.tick(INTERVAL)
         fake.advance(1)
         assert INSTANCES_NAME not in b.list()
-        # the log is a fact: the report, no line (ADR-0076)
+        # the log is a fact: the report, no line (little-sister ADR-0076)
         assert "instances" not in _slugs(b)
         report = b.report()
         assert f"{OTHER} took the lease from {INSTANCE} (released)" in report

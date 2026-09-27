@@ -7,6 +7,7 @@ move into this package changed two import lines and nothing else.
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14,8 +15,10 @@ from typing import Any
 
 import pytest
 from botocore.exceptions import ClientError, NoCredentialsError
-from little_sister.checks import CHECK_TYPES, CheckError, CheckResult
-from little_sister.status import StatusCode
+from little_sister.checks import CHECK_TYPES, CheckError, CheckResult, Measurement
+from little_sister.reasons import RECORD_TIMESTAMP_KEYS
+from little_sister.status import StatusCode, effective_code
+from running import measured, run_check
 
 from little_sister_aws import aws as aws_module
 from little_sister_aws import identity as identity_module
@@ -23,9 +26,11 @@ from little_sister_aws.aws import (
     BATCH,
     CLOUDWATCH,
     CODEPIPELINE,
+    CREDENTIALS_UNUSABLE,
     DEFAULT_ROLE_SESSION_NAME,
     EC2,
     LAMBDA,
+    NEVER_RUN,
     NO_NAME_TAG,
     Account,
     Alarm,
@@ -223,12 +228,20 @@ class _FakeLambda:
 
 class _FakeLogs:
     """The newest log event per function. A function absent from ``messages`` has
-    no stream at all, which is what a never-invoked function looks like."""
+    no stream at all, which is what a never-invoked function looks like.
 
-    def __init__(self, messages: dict[str, str | None],
-                 calls: list[str]) -> None:
+    A function in ``pages`` answers GetLogEvents the way CloudWatch Logs pages a
+    stream: one page per call, newest first, each handing back the backward token
+    the next call sends — and handing back the token it was sent where the stream
+    ends. ``sent`` records each call's function and the token it sent."""
+
+    def __init__(self, messages: dict[str, str | None], calls: list[str],
+                 pages: dict[str, list[tuple[list[str], str]]] | None = None,
+                 sent: list[tuple[str, str | None]] | None = None) -> None:
         self._messages = messages
         self._calls = calls
+        self._pages = pages or {}
+        self._sent = sent if sent is not None else []
 
     @staticmethod
     def _name(group: str) -> str:
@@ -243,9 +256,18 @@ class _FakeLogs:
         return {"logStreams": [{"logStreamName": "2026/08/10/[$LATEST]abc"}]}
 
     def get_log_events(self, *, logGroupName: str, logStreamName: str,
-                       limit: int, startFromHead: bool) -> dict[str, Any]:
+                       limit: int, startFromHead: bool,
+                       nextToken: str | None = None) -> dict[str, Any]:
         assert (limit, startFromHead) == (1, False)
-        message = self._messages.get(self._name(logGroupName))
+        name = self._name(logGroupName)
+        self._sent.append((name, nextToken))
+        if name in self._pages:
+            pages = self._pages[name]
+            asked = sum(1 for called, _ in self._sent if called == name) - 1
+            events, token = pages[min(asked, len(pages) - 1)]
+            return {"events": [{"message": message} for message in events],
+                    "nextBackwardToken": token, "nextForwardToken": f"f/{token}"}
+        message = self._messages.get(name)
         if message is None:
             return {"events": []}
         return {"events": [{"message": message}]}
@@ -362,7 +384,9 @@ class _FakeSession:
                  queues: dict[str, list[list[dict[str, Any]]]] | None = None,
                  jobs: dict[tuple[str, str],
                             list[list[dict[str, Any]]]] | None = None,
-                 batch_unreadable: set[str] | None = None) -> None:
+                 batch_unreadable: set[str] | None = None,
+                 log_pages: dict[str, list[tuple[list[str], str]]] | None = None,
+                 ) -> None:
         self.sts = sts
         self.credentials = credentials
         self.alarms = alarms
@@ -383,6 +407,8 @@ class _FakeSession:
         self.paginators: dict[str, _FakePaginator] = {}
         self.metric_calls: list[list[dict[str, Any]]] = []
         self.log_calls: list[str] = []
+        self.log_pages = log_pages or {}
+        self.log_tokens: list[tuple[str, str | None]] = []
         self.execution_calls: list[tuple[str, int]] = []
         self.job_calls: list[tuple[str, str]] = []
 
@@ -420,7 +446,8 @@ class _FakeSession:
                     "ListFunctions")
             return _FakeLambda(self.functions.get(region_name, []))
         if name == "logs":
-            return _FakeLogs(self.messages, self.log_calls)
+            return _FakeLogs(self.messages, self.log_calls, self.log_pages,
+                             self.log_tokens)
         if region_name in self.unreadable:
             raise ClientError(
                 {"Error": {"Code": "AccessDenied", "Message": "no cloudwatch"}},
@@ -445,7 +472,9 @@ def _stub(check: AwsCheck, sts: _FakeSts | None = None, *,
           queues: dict[str, list[list[dict[str, Any]]]] | None = None,
           jobs: dict[tuple[str, str],
                      list[list[dict[str, Any]]]] | None = None,
-          batch_unreadable: set[str] | None = None) -> list[_FakeSession]:
+          batch_unreadable: set[str] | None = None,
+          log_pages: dict[str, list[tuple[list[str], str]]] | None = None,
+          ) -> list[_FakeSession]:
     """Replace the one place boto3 is constructed; record what was built."""
     shared_sts = sts if sts is not None else _FakeSts()
     built: list[_FakeSession] = []
@@ -459,7 +488,8 @@ def _stub(check: AwsCheck, sts: _FakeSts | None = None, *,
                                pipelines=pipelines, executions=executions,
                                pipelines_unreadable=pipelines_unreadable,
                                queues=queues, jobs=jobs,
-                               batch_unreadable=batch_unreadable)
+                               batch_unreadable=batch_unreadable,
+                               log_pages=log_pages)
         built.append(session)
         return session
 
@@ -589,7 +619,7 @@ def test_the_common_fields_still_bind() -> None:
 def test_without_a_secrets_block_the_ambient_chain_is_used() -> None:
     check = _build()
     built = _stub(check)
-    check.run()
+    run_check(check)
     assert built[0].credentials == {}
 
 
@@ -601,7 +631,7 @@ def test_a_secrets_block_resolves_static_keys(
                             "secret_access_key": "env://AWS_SECRET"})
     assert (check.access_key, check.secret_key) == ("AKIA-configured", "s3cret")
     built = _stub(check)
-    check.run()
+    run_check(check)
     assert built[0].credentials["aws_access_key_id"] == "AKIA-configured"
 
 
@@ -634,7 +664,7 @@ def test_each_account_is_assumed_with_the_configured_session_name() -> None:
     check = _build(role_session_name="little-sister")
     sts = _FakeSts()
     _stub(check, sts)
-    check.run()
+    run_check(check)
     assert sts.calls == [
         {"RoleArn": "arn:aws:iam::111:role/monitoring",
          "RoleSessionName": "little-sister"},
@@ -646,7 +676,7 @@ def test_each_account_is_assumed_with_the_configured_session_name() -> None:
 def test_the_assumed_session_carries_that_account_s_credentials() -> None:
     check = _build()
     built = _stub(check)
-    check.run()
+    run_check(check)
     tokens = [session.credentials.get("aws_session_token") for session in built]
     assert tokens[1:] == ["TOK-arn:aws:iam::111:role/monitoring",
                           "TOK-arn:aws:iam::222:role/monitoring"]
@@ -655,7 +685,7 @@ def test_the_assumed_session_carries_that_account_s_credentials() -> None:
 def test_sts_is_reached_in_the_configured_region() -> None:
     check = _build(sts_region="us-east-1")
     built = _stub(check)
-    check.run()
+    run_check(check)
     assert ("sts", "us-east-1") in built[0].clients
 
 
@@ -663,7 +693,7 @@ def test_an_account_without_a_role_arn_is_not_assumed() -> None:
     check = _build(accounts=[{"name": "here"}])
     sts = _FakeSts()
     built = _stub(check, sts)
-    check.run()
+    run_check(check)
     assert sts.calls == []
     assert len(built) == 1          # the base session, and no second one
 
@@ -675,7 +705,7 @@ def test_no_credentials_at_all_is_one_error_line_and_no_children() -> None:
         raise NoCredentialsError()
 
     check._new_session = refuse         # type: ignore[method-assign]
-    result = check.run()
+    result = run_check(check)
     assert result.code is StatusCode.ERROR
     assert result.children == ()
     assert "no usable AWS credentials" in _texts(result)[0]
@@ -686,40 +716,45 @@ def test_no_credentials_at_all_is_one_error_line_and_no_children() -> None:
 def test_the_root_carries_one_child_per_account_in_config_order() -> None:
     check = _build()
     _stub(check)
-    result = check.run()
+    result = run_check(check)
     assert [child.name for child in result.children] == ["live", "backup"]
 
 
 def test_each_account_carries_one_child_per_aspect() -> None:
     check = _build()
     _stub(check)
-    live = _child(check.run(), "live")
+    live = _child(run_check(check), "live")
     assert [child.name for child in live.children] == [
         CLOUDWATCH, EC2, LAMBDA, CODEPIPELINE, BATCH]
     assert AwsCheck.ASPECTS == (CLOUDWATCH, EC2, LAMBDA, CODEPIPELINE, BATCH)
 
 
-def test_the_root_stays_ok_and_says_only_what_is_watched() -> None:
+def test_the_root_grades_nothing_and_says_only_what_is_watched() -> None:
     """An account that failed is red on its own node and reaches the container
-    by roll-up; repeating it here would report one fact twice."""
+    by roll-up; repeating it here would report one fact twice. So the root
+    declares nothing of its own — `UNDEFINED`, a container that carries a
+    sentence — and what it shows is what its accounts roll up to (ADR-0005 §6)."""
     check = _build()
     _stub(check, _FakeSts(refuse={"arn:aws:iam::222:role/monitoring"}))
-    result = check.run()
-    assert result.code is StatusCode.OK
+    result = run_check(check)
+    assert result.code is StatusCode.UNDEFINED
     assert _texts(result) == ["2 accounts, 2 account/region pairs in scope"]
+    assert effective_code(result.stored_code,
+                          [child.stored_code for child in result.children]
+                          ) is StatusCode.ERROR
 
 
 def test_the_scope_counts_each_account_s_own_regions() -> None:
     check = _build(regions=["eu-central-1", "us-east-1"])
     _stub(check)
     # live inherits two regions, backup overrides to one: three pairs, not four.
-    assert _texts(check.run()) == ["2 accounts, 3 account/region pairs in scope"]
+    assert _texts(run_check(check)) == ["2 accounts, 3 account/region pairs in scope"]
 
 
 def test_an_unassumable_account_reddens_its_own_node_only() -> None:
     check = _build()
     _stub(check, _FakeSts(refuse={"arn:aws:iam::222:role/monitoring"}))
-    result = check.run()
+    result = run_check(check)
     backup = _child(result, "backup")
     assert backup.code is StatusCode.ERROR
     assert backup.children == ()
@@ -733,7 +768,7 @@ def test_an_account_publishes_its_own_title_about_and_config() -> None:
                               "about": "Off-site copies.",
                               "regions": ["eu-west-1"]}])
     _stub(check)
-    backup = _child(check.run(), "backup")
+    backup = _child(run_check(check), "backup")
     assert backup.title == "Backup (Ireland)"
     assert backup.about == "Off-site copies."
     assert "eu-west-1" in backup.config
@@ -743,7 +778,7 @@ def test_the_root_report_is_the_configured_scope_not_the_reachable_one() -> None
     """`report` is presence, never a status claim (little-sister ADR-0044)."""
     check = _build()
     _stub(check, _FakeSts(refuse={"arn:aws:iam::222:role/monitoring"}))
-    assert check.run().report == ("- **live** — eu-central-1\n"
+    assert run_check(check).report == ("- **live** — eu-central-1\n"
                                   "- **backup** — eu-west-1")
 
 
@@ -751,7 +786,7 @@ def test_the_root_report_is_the_configured_scope_not_the_reachable_one() -> None
 
 def _cloudwatch(check: AwsCheck, **stub: Any) -> CheckResult:
     _stub(check, **stub)
-    return _child(_child(check.run(), "live"), CLOUDWATCH)
+    return _child(_child(run_check(check), "live"), CLOUDWATCH)
 
 
 def test_an_alarm_becomes_one_coded_line_with_its_console_link() -> None:
@@ -897,7 +932,7 @@ def test_the_same_alarm_name_in_two_accounts_stays_two_pins() -> None:
     check = _build()
     _stub(check, alarms={"eu-central-1": [[_alarm("api-5xx")]],
                          "eu-west-1": [[_alarm("api-5xx")]]})
-    result = check.run()
+    result = run_check(check)
     live = _child(_child(result, "live"), CLOUDWATCH)
     backup = _child(_child(result, "backup"), CLOUDWATCH)
     # Same slug, different node — a pin is keyed on (path, slug), and the path
@@ -961,7 +996,7 @@ def test_one_declaration_serves_every_account_s_leaf_of_that_name() -> None:
     """
     check = _build()
     _stub(check, alarms={})
-    accounts = [_child(check.run(), name) for name in ("live", "backup")]
+    accounts = [_child(run_check(check), name) for name in ("live", "backup")]
     names = [tuple(leaf.name for leaf in account.children) for account in accounts]
     assert names[0] == names[1] == AwsCheck.ASPECTS
     for account in accounts:
@@ -1000,7 +1035,7 @@ def test_no_aspect_result_stamps_the_flag() -> None:
     beside the declarations it contradicts."""
     check = _build()
     _stub(check, alarms={})
-    for account in (_child(check.run(), name) for name in ("live", "backup")):
+    for account in (_child(run_check(check), name) for name in ("live", "backup")):
         for leaf in account.children:
             assert leaf.show_when_quiet is None
 
@@ -1013,7 +1048,7 @@ def test_the_built_in_text_names_no_account_and_the_description_does() -> None:
     check = _build()
     assert "backup" not in check.subnode_labels[CLOUDWATCH]["about"]
     _stub(check, alarms={})
-    result = check.run()
+    result = run_check(check)
     leaf = _child(_child(result, "backup"), CLOUDWATCH)
     assert leaf.description == "CloudWatch alarms in backup"
 
@@ -1039,7 +1074,7 @@ def test_the_ignore_match_is_a_substring_and_case_insensitive() -> None:
 
 def _ec2(check: AwsCheck, **stub: Any) -> CheckResult:
     _stub(check, **stub)
-    return _child(_child(check.run(), "live"), EC2)
+    return _child(_child(run_check(check), "live"), EC2)
 
 
 def test_one_line_per_name_with_the_count() -> None:
@@ -1728,7 +1763,7 @@ def test_a_rule_that_matches_nothing_goes_to_the_log_and_not_to_a_node(
         {"name": "typo", "prefixes": ["laodtest-"], "max_per_name_warn": 0}]})
     _stub(check, instances={"eu-central-1": [[_instance("prometheus")]]})
     with caplog.at_level(logging.INFO, logger="little_sister_aws.aws"):
-        result = check.run()
+        result = run_check(check)
     assert "typo" in caplog.text and "ec2 rule(s) matched no name" in caplog.text
     assert "typo" not in " ".join(_texts(_child(_child(result, "live"), EC2)))
 
@@ -1741,9 +1776,9 @@ def test_the_unmatched_rules_line_is_said_only_when_the_set_changes(
         {"name": "typo", "prefixes": ["laodtest-"], "max_per_name_warn": 0}]})
     _stub(check, instances={"eu-central-1": [[_instance("prometheus")]]})
     with caplog.at_level(logging.INFO, logger="little_sister_aws.aws"):
-        check.run()
+        run_check(check)
         caplog.clear()
-        check.run()
+        run_check(check)
     assert "matched no name" not in caplog.text
 
 
@@ -1753,10 +1788,10 @@ def test_a_rule_that_starts_matching_is_said_once_too(
         {"name": "web", "prefixes": ["web-"], "max_per_name_warn": 0}]})
     _stub(check, instances={"eu-central-1": [[_instance("prometheus")]]})
     with caplog.at_level(logging.INFO, logger="little_sister_aws.aws"):
-        check.run()
+        run_check(check)
         caplog.clear()
         _stub(check, instances={"eu-central-1": [[_instance("web-1")]]})
-        check.run()
+        run_check(check)
     assert "every ec2 rule now matches a name" in caplog.text
 
 
@@ -1890,7 +1925,7 @@ def test_an_instance_computes_its_own_age_and_never_a_negative_one() -> None:
 
 def _lambda(check: AwsCheck, **stub: Any) -> CheckResult:
     _stub(check, **stub)
-    return _child(_child(check.run(), "live"), LAMBDA)
+    return _child(_child(run_check(check), "live"), LAMBDA)
 
 
 def _line(leaf: CheckResult, name: str) -> str:
@@ -1994,6 +2029,45 @@ def test_the_status_word_of_the_last_log_event(message: str | None,
     assert expected in _line(leaf, "running-collector-lambda")
 
 
+def _paged_log_line(pages: list[tuple[list[str], str]]
+                    ) -> tuple[str, list[str | None]]:
+    """The function's line over a stream that answers page by page, and the token
+    each GetLogEvents call sent, in order."""
+    check = _one_account()
+    built = _stub(check, functions=ONE_FUNCTION,
+                  metrics={"running-collector-lambda":
+                           {"errors": 0, "age": timedelta(minutes=1)}},
+                  messages={"running-collector-lambda": None},
+                  log_pages={"running-collector-lambda": pages})
+    leaf = _child(_child(run_check(check), "live"), LAMBDA)
+    sent = [token for session in built for name, token in session.log_tokens
+            if name == "running-collector-lambda"]
+    return _line(leaf, "running-collector-lambda"), sent
+
+
+def test_an_empty_page_of_a_log_stream_is_not_its_end() -> None:
+    """GetLogEvents may answer an empty page while the stream still has events, so
+    the read follows the backward token it was handed to the newest event."""
+    line, sent = _paged_log_line([([], "b-1"), (["REPORT RequestId: 1"], "b-2")])
+    assert line.endswith(" · log: REPORT")
+    assert sent == [None, "b-1"]
+
+
+def test_a_log_stream_ends_where_its_token_comes_back_unchanged() -> None:
+    line, sent = _paged_log_line([([], "b-1"), ([], "b-1")])
+    assert line.endswith(" · no log event")
+    assert sent == [None, "b-1"]
+
+
+def test_the_log_read_stops_after_three_more_empty_pages_and_says_so() -> None:
+    """One page and at most three more, since the read is already two calls a
+    function — and then the note says the newest event was not reached, not that
+    there is none."""
+    line, sent = _paged_log_line([([], f"b-{page}") for page in range(1, 10)])
+    assert line.endswith(" · newest log event not reached in 4 pages")
+    assert sent == [None, "b-1", "b-2", "b-3"]
+
+
 def test_a_function_that_has_never_run_has_no_log_stream() -> None:
     leaf = _lambda(_build(), functions=ONE_FUNCTION,
                    metrics={"running-collector-lambda":
@@ -2007,7 +2081,7 @@ def test_the_log_reading_can_be_switched_off_entirely() -> None:
                   metrics={"running-collector-lambda":
                            {"errors": 0, "age": timedelta(minutes=1)}},
                   messages={"running-collector-lambda": "REPORT"})
-    check.run()
+    run_check(check)
     # Two API calls per function per run is the expensive half of this aspect.
     assert all(not session.log_calls for session in built)
 
@@ -2121,7 +2195,7 @@ def test_the_metric_is_asked_once_per_period_not_once_per_function() -> None:
     built = _stub(check, functions={"eu-central-1": [["a", "b", "c"]]},
                   metrics={name: {"errors": 0, "age": timedelta(minutes=1)}
                            for name in "abc"})
-    check.run()
+    run_check(check)
     calls = built[1].metric_calls          # the live account's session
     assert len(calls) == 1                 # one call, three queries
     assert len(calls[0]) == 3
@@ -2133,7 +2207,7 @@ def test_a_function_answering_at_one_minute_is_not_asked_again() -> None:
                   metrics={"fine": {"errors": 0, "age": timedelta(minutes=1)},
                            "coarse": {"errors": 0, "age": timedelta(days=40),
                                       "period": 3600}})
-    check.run()
+    run_check(check)
     calls = built[1].metric_calls
     periods = [call[0]["MetricStat"]["Period"] for call in calls]
     assert periods == [60, 300, 3600]      # widening only while something is left
@@ -2148,7 +2222,7 @@ def test_a_batch_larger_than_the_api_limit_is_split() -> None:
     built = _stub(check, functions={"eu-central-1": [names]},
                   metrics={name: {"errors": 0, "age": timedelta(minutes=1)}
                            for name in names})
-    check.run()
+    run_check(check)
     sizes = [len(call) for call in built[1].metric_calls]
     assert sizes == [500, 1]
 
@@ -2258,14 +2332,17 @@ def test_a_function_reading_defaults_to_nothing_known() -> None:
 
 def _pipelines(check: AwsCheck, **stub: Any) -> CheckResult:
     _stub(check, **stub)
-    return _child(_child(check.run(), "live"), CODEPIPELINE)
+    return _child(_child(run_check(check), "live"), CODEPIPELINE)
 
 
 def _execution(status: str = "Succeeded", *,
-               started: timedelta | None = timedelta(hours=2)) -> dict[str, Any]:
+               started: timedelta | None = timedelta(hours=2),
+               eid: str = "") -> dict[str, Any]:
     row: dict[str, Any] = {"status": status}
     if started is not None:
         row["startTime"] = NOW - started
+    if eid:
+        row["pipelineExecutionId"] = eid
     return row
 
 
@@ -2496,7 +2573,7 @@ def test_one_page_of_executions_is_enough_and_it_is_asked_for_by_size() -> None:
     check = _build()
     built = _stub(check, pipelines=ONE_PIPELINE,
                   executions={"running-deploy": [_execution()]})
-    check.run()
+    run_check(check)
     assert built[1].execution_calls == [("running-deploy", 100)]
 
 
@@ -2623,7 +2700,7 @@ def test_bad_codepipeline_settings_are_refused(block: dict[str, Any]) -> None:
 
 def _batch(check: AwsCheck, **stub: Any) -> CheckResult:
     _stub(check, **stub)
-    return _child(_child(check.run(), "live"), BATCH)
+    return _child(_child(run_check(check), "live"), BATCH)
 
 
 def _queue(name: str = "nightly", *, state: str = "ENABLED",
@@ -2888,7 +2965,7 @@ def test_all_four_job_statuses_are_read() -> None:
     """Three were the original's; RUNNABLE is the one it never asked for."""
     check = _build()
     built = _stub(check, queues=ONE_QUEUE)
-    check.run()
+    run_check(check)
     assert built[1].job_calls == [
         ("nightly", "SUCCEEDED"), ("nightly", "FAILED"),
         ("nightly", "RUNNING"), ("nightly", "RUNNABLE")]
@@ -2905,7 +2982,7 @@ def test_batch_timestamps_are_read_as_milliseconds() -> None:
 
 
 def test_the_job_link_is_a_job_id_and_never_an_arn() -> None:
-    """An ARN carries the account number, and ADR-0006 keeps that out of a line
+    """An ARN carries the account number, and ADR-0001 keeps that out of a line
     somebody may bookmark or paste into a ticket."""
     leaf = _batch(_build(), queues=ONE_QUEUE, jobs={
         ("nightly", "SUCCEEDED"): [[_job("etl", job_id="j-abc",
@@ -3042,7 +3119,7 @@ def test_the_config_card_names_the_shared_shorten_rules() -> None:
 
 def _aspect_names(check: AwsCheck, **stub: Any) -> list[str]:
     _stub(check, **stub)
-    return [child.name for child in _child(check.run(), "live").children]
+    return [child.name for child in _child(run_check(check), "live").children]
 
 
 def test_every_aspect_is_on_when_nothing_says_otherwise() -> None:
@@ -3072,7 +3149,7 @@ def test_a_disabled_aspect_makes_no_api_call() -> None:
     service's permissions at all."""
     check = _build(batch={"enabled": False}, codepipeline={"enabled": False})
     built = _stub(check, queues=ONE_QUEUE, pipelines=ONE_PIPELINE)
-    check.run()
+    run_check(check)
     asked = {name for name, _ in built[1].clients}
     assert "batch" not in asked and "codepipeline" not in asked
     assert built[1].job_calls == [] and built[1].execution_calls == []
@@ -3144,7 +3221,7 @@ def test_the_switch_reaches_the_aspect_s_own_settings() -> None:
 def test_a_disabled_aspect_does_not_disturb_the_account_s_own_node() -> None:
     check = _build(cloudwatch={"enabled": False})
     _stub(check)
-    live = _child(check.run(), "live")
+    live = _child(run_check(check), "live")
     assert live.code is StatusCode.OK
     assert "regions" in live.config
 
@@ -3169,7 +3246,7 @@ def test_without_a_profile_boto3_is_asked_for_none() -> None:
     """The case that must not move: every config written before this key."""
     check = _build()
     built = _stub(check)
-    check.run()
+    run_check(check)
     assert _profiles(built) == ["", "", ""]      # base + two assumed sessions
     assert check.profile == ""
 
@@ -3177,7 +3254,7 @@ def test_without_a_profile_boto3_is_asked_for_none() -> None:
 def test_the_check_s_profile_is_the_session_the_roles_are_assumed_from() -> None:
     check = _build(profile=PRIMARY)
     built = _stub(check)
-    check.run()
+    run_check(check)
     # One base session on the profile; the two assumed sessions carry the
     # role's temporary credentials instead, which is what an assumed session is.
     assert _profiles(built) == [PRIMARY, "", ""]
@@ -3192,7 +3269,7 @@ def test_an_account_overrides_the_check_s_profile_and_leaves_the_others() -> Non
         {"name": "other", "role_arn": "arn:aws:iam::999:role/monitoring",
          "profile": SECONDARY}])
     built = _stub(check)
-    check.run()
+    run_check(check)
     assert check.profile_for(check.accounts[0]) == PRIMARY
     assert check.profile_for(check.accounts[1]) == SECONDARY
     # base(PRIMARY) → live's assumed → other's own base(SECONDARY) → other's assumed
@@ -3205,7 +3282,7 @@ def test_the_role_is_assumed_from_the_account_s_own_profile() -> None:
     check = _build(accounts=[{"name": "live", "profile": SECONDARY,
                               "role_arn": "arn:aws:iam::111:role/monitoring"}])
     built = _stub(check)
-    check.run()
+    run_check(check)
     second_session = built[1]
     assert second_session.credentials == {"profile_name": SECONDARY}
     assert ("sts", "eu-central-1") in second_session.clients
@@ -3215,7 +3292,7 @@ def test_a_profile_only_account_is_read_through_the_profile_itself() -> None:
     check = _build(profile=PRIMARY, accounts=[{"name": "live"}])
     sts = _FakeSts()
     built = _stub(check, sts)
-    result = check.run()
+    result = run_check(check)
     assert sts.calls == []                       # nothing to assume
     assert _profiles(built) == [PRIMARY]          # one session, and it is the profile's
     assert _child(result, "live").code is StatusCode.OK
@@ -3226,7 +3303,7 @@ def test_a_profile_only_account_proves_its_credentials_before_the_aspects() -> N
     tried, and then all three would report it in their own words."""
     check = _build(profile=PRIMARY, accounts=[{"name": "live"}])
     built = _stub(check)
-    check.run()
+    run_check(check)
     assert built[0].sts.identity_calls == 1
 
 
@@ -3234,21 +3311,21 @@ def test_an_ambient_account_spends_no_extra_sts_call() -> None:
     """The preflight is the price of a profile, not of every check."""
     check = _build(accounts=[{"name": "live"}])
     built = _stub(check)
-    check.run()
+    run_check(check)
     assert built[0].sts.identity_calls == 0
 
 
 def test_the_account_card_names_the_profile_and_the_role_together() -> None:
     check = _build(profile=PRIMARY)
     _stub(check)
-    live = _child(check.run(), "live")
+    live = _child(run_check(check), "live")
     assert f"assumed role, from profile {PRIMARY}" in live.config
 
 
 def test_the_account_card_of_a_profile_only_account_names_the_profile() -> None:
     check = _build(profile=PRIMARY, accounts=[{"name": "live"}])
     _stub(check)
-    assert f"profile {PRIMARY}" in _child(check.run(), "live").config
+    assert f"profile {PRIMARY}" in _child(run_check(check), "live").config
 
 
 def test_config_summary_names_the_profile_and_its_overrides() -> None:
@@ -3354,7 +3431,7 @@ def test_the_account_line_names_it_too_where_a_role_is_assumed_from_it(
     _stub(check)
 
     assert ("assumed role, from the ambient chain (AWS_PROFILE=some-other-thing)"
-            in _child(check.run(), "live").config)
+            in _child(run_check(check), "live").config)
 
 
 def test_a_configured_profile_says_nothing_about_the_environment(
@@ -3417,7 +3494,7 @@ def test_an_expired_login_is_renewed_and_the_account_read_on_the_retry() -> None
                               "role_arn": "arn:aws:iam::111:role/monitoring"}])
     _stub(check, _FakeSts(expire=1))
     attempts = _sso(check)
-    live = _child(check.run(), "live")
+    live = _child(run_check(check), "live")
     assert attempts == [(PRIMARY, 120)]
     assert live.code is StatusCode.OK
     assert [child.name for child in live.children] == [
@@ -3430,7 +3507,7 @@ def test_a_renewal_that_does_not_help_reddens_the_account_with_the_command() -> 
                               "role_arn": "arn:aws:iam::111:role/monitoring"}])
     _stub(check, _FakeSts(expire=9))
     _sso(check)
-    live = _child(check.run(), "live")
+    live = _child(run_check(check), "live")
     assert live.code is StatusCode.ERROR
     assert "AWS credentials have expired" in _texts(live)[0]
     assert f"`aws sso login --profile {PRIMARY}`" in _texts(live)[1]
@@ -3443,7 +3520,7 @@ def test_a_login_that_cannot_run_here_is_the_second_line_of_the_node() -> None:
                               "role_arn": "arn:aws:iam::111:role/monitoring"}])
     _stub(check, _FakeSts(expire=9))
     attempts = _sso(check)
-    live = _child(check.run(), "live")
+    live = _child(run_check(check), "live")
     assert attempts == []               # nothing shelled out
     assert _texts(live)[1] == (
         f"renew it with `aws sso login --profile {PRIMARY}` — "
@@ -3457,7 +3534,7 @@ def test_without_a_profile_nothing_advises_running_aws_sso_login() -> None:
                               "role_arn": "arn:aws:iam::111:role/monitoring"}])
     _stub(check, _FakeSts(expire=9))
     attempts = _sso(check)
-    live = _child(check.run(), "live")
+    live = _child(run_check(check), "live")
     assert attempts == []
     assert "aws sso login" not in _texts(live)[1]
     assert "no profile is configured" in _texts(live)[1]
@@ -3470,7 +3547,7 @@ def test_a_refusal_is_reported_rather_than_renewed() -> None:
                               "role_arn": "arn:aws:iam::111:role/monitoring"}])
     _stub(check, _FakeSts(refuse={"arn:aws:iam::111:role/monitoring"}))
     attempts = _sso(check)
-    live = _child(check.run(), "live")
+    live = _child(run_check(check), "live")
     assert attempts == []
     assert _texts(live) == ["role cannot be assumed: An error occurred "
                             "(AccessDenied) when calling the AssumeRole "
@@ -3482,7 +3559,7 @@ def test_a_profile_only_account_that_is_refused_is_not_a_role_problem() -> None:
     this account does not have."""
     check = _build(profile=PRIMARY, accounts=[{"name": "live"}])
     _stub(check, _FakeSts(deny_identity=True))
-    live = _child(check.run(), "live")
+    live = _child(run_check(check), "live")
     assert live.code is StatusCode.ERROR
     assert _texts(live)[0].startswith("account cannot be read:")
 
@@ -3495,7 +3572,7 @@ def test_two_stale_accounts_of_one_profile_share_one_login() -> None:
     _stub(check, _FakeSts(expire_roles={"arn:aws:iam::111:role/monitoring",
                                         "arn:aws:iam::222:role/monitoring"}))
     attempts = _sso(check)
-    result = check.run()
+    result = run_check(check)
     assert len(attempts) == 1
     assert [child.code for child in result.children] == [StatusCode.OK,
                                                          StatusCode.OK]
@@ -3510,7 +3587,7 @@ def test_auto_asks_the_machine_first(monkeypatch: pytest.MonkeyPatch) -> None:
     check._profile_config = lambda profile: {}      # type: ignore[method-assign]
     _stub(check, _FakeSts(expire=9))
     attempts = _sso(check)
-    live = _child(check.run(), "live")
+    live = _child(run_check(check), "live")
     assert attempts == []
     assert f"profile {PRIMARY} is not an SSO profile" in _texts(live)[1]
 
@@ -3529,7 +3606,7 @@ def test_auto_logs_in_on_a_machine_that_can(
         monkeypatch.delenv(marker, raising=False)
     _stub(check, _FakeSts(expire=1))
     attempts = _sso(check)
-    assert _child(check.run(), "live").code is StatusCode.OK
+    assert _child(run_check(check), "live").code is StatusCode.OK
     assert attempts == [(PRIMARY, 120)]
 
 
@@ -3610,7 +3687,7 @@ def test_an_account_that_could_not_be_read_says_so_in_the_log(
                               "role_arn": "arn:aws:iam::111:role/monitoring"}])
     _stub(check, _FakeSts(refuse={"arn:aws:iam::111:role/monitoring"}))
     with caplog.at_level(logging.ERROR, logger="little_sister_aws.aws"):
-        check.run()
+        run_check(check)
     lines = _unreadable_lines(caplog)
     assert len(lines) == 2, lines          # the account, then the run summary
     assert "account 'live'" in lines[0]
@@ -3631,7 +3708,7 @@ def test_the_line_names_who_we_actually_were(
                               "role_arn": "arn:aws:iam::111:role/monitoring"}])
     _stub(check, _FakeSts(refuse={"arn:aws:iam::111:role/monitoring"}))
     with caplog.at_level(logging.ERROR, logger="little_sister_aws.aws"):
-        check.run()
+        run_check(check)
     assert "as 111, arn:aws:iam::111:user/fake" in _unreadable_lines(caplog)[0]
 
 
@@ -3642,7 +3719,7 @@ def test_the_line_names_the_credentials_the_account_was_read_with(
                               "role_arn": "arn:aws:iam::111:role/monitoring"}])
     _stub(check, _FakeSts(refuse={"arn:aws:iam::111:role/monitoring"}))
     with caplog.at_level(logging.ERROR, logger="little_sister_aws.aws"):
-        check.run()
+        run_check(check)
     assert f"profile {PRIMARY}" in _unreadable_lines(caplog)[0]
 
 
@@ -3654,7 +3731,7 @@ def test_without_a_profile_the_line_says_ambient(
                               "role_arn": "arn:aws:iam::111:role/monitoring"}])
     _stub(check, _FakeSts(refuse={"arn:aws:iam::111:role/monitoring"}))
     with caplog.at_level(logging.ERROR, logger="little_sister_aws.aws"):
-        check.run()
+        run_check(check)
     assert "the ambient credential chain" in _unreadable_lines(caplog)[0]
 
 
@@ -3667,7 +3744,7 @@ def test_an_unprovable_identity_still_leaves_the_refusal(
     _stub(check, _FakeSts(refuse={"arn:aws:iam::111:role/monitoring"},
                           deny_identity=True))
     with caplog.at_level(logging.ERROR, logger="little_sister_aws.aws"):
-        check.run()
+        run_check(check)
     line = _unreadable_lines(caplog)[0]
     assert "AccessDenied" in line
     assert " as " not in line
@@ -3683,7 +3760,7 @@ def test_the_summary_names_how_many_of_how_many(
     _stub(check, _FakeSts(refuse={"arn:aws:iam::111:role/monitoring",
                                   "arn:aws:iam::222:role/monitoring"}))
     with caplog.at_level(logging.ERROR, logger="little_sister_aws.aws"):
-        check.run()
+        run_check(check)
     assert "2 of 2 account(s) could not be read: live, backup" in \
         _unreadable_lines(caplog)[-1]
 
@@ -3696,7 +3773,7 @@ def test_a_readable_run_logs_nothing_of_the_kind(
                               "role_arn": "arn:aws:iam::111:role/monitoring"}])
     _stub(check, alarms={"eu-central-1": [[_alarm("api-5xx")]]})
     with caplog.at_level(logging.ERROR, logger="little_sister_aws.aws"):
-        result = check.run()
+        result = run_check(check)
     live = _child(result, "live")
     burning = [entry for child in live.children for entry in child.reason
                if entry.code is StatusCode.ERROR]
@@ -3711,7 +3788,7 @@ def test_a_healthy_run_never_asks_who_it_is(
                               "role_arn": "arn:aws:iam::111:role/monitoring"}])
     sts = _FakeSts()
     _stub(check, sts)
-    check.run()
+    run_check(check)
     assert sts.identity_calls == 0
 
 
@@ -3797,3 +3874,507 @@ def test_the_coverage_line_grades_only_where_the_caller_says_so() -> None:
     assert short.code is StatusCode.WARN
     # one entry, not two: "expected at least five" is not a finding of its own
     assert short.slug == "scope"
+
+
+# --- the two halves: what a run reads, and what keeps a history -------------
+#
+# little-sister ADR-0086 split a check into `measure()` and `grade()`, and this
+# package's ADR-0005 says what that asks of this vocabulary. Each test below is one
+# sentence of that record, with values that make the sentence false if the code is
+# wrong.
+
+ROLE_LIVE = "arn:aws:iam::111:role/monitoring"
+ROLE_BACKUP = "arn:aws:iam::222:role/monitoring"
+
+#: What one account answers in every aspect, for the tests about readings rather
+#: than about one leaf.
+EVERY_ASPECT: dict[str, Any] = {
+    "alarms": {"eu-central-1": [[_alarm("api-latency"), _alarm("db-cpu", "OK"),
+                                 _alarm("TargetTracking-x", "ALARM")]]},
+    "instances": {"eu-central-1": [
+        [_instance("web", instance_id="i-1", up=timedelta(hours=3))],
+        [_instance("pair", instance_id="i-2", up=timedelta(hours=1)),
+         _instance("pair", instance_id="i-3", up=timedelta(hours=2))],
+        [_instance("gone", "terminated", instance_id="i-4")]]},
+    "functions": {"eu-central-1": [["collector"]]},
+    "metrics": {"collector": {"errors": 0, "age": timedelta(minutes=5)}},
+    "messages": {"collector": "REPORT RequestId: 1"},
+    "pipelines": {"eu-central-1": [["deploy", "idle"]]},
+    "executions": {"deploy": [_execution(started=timedelta(hours=1), eid="e-1")]},
+    "queues": {"eu-central-1": [[_queue("nightly"), _queue("dormant")]]},
+    "jobs": {("nightly", "SUCCEEDED"): [[_job("etl", job_id="j-2",
+                                              created=timedelta(hours=2),
+                                              stopped=timedelta(hours=1))]],
+             ("nightly", "FAILED"): [[_job("etl", "FAILED", job_id="j-1",
+                                           created=timedelta(hours=5),
+                                           stopped=timedelta(hours=4))]]},
+}
+
+
+def _one_account(**overrides: Any) -> AwsCheck:
+    return _build(accounts=[{"name": "live", "role_arn": ROLE_LIVE}], **overrides)
+
+
+def _readings(check: AwsCheck, sts: _FakeSts | None = None,
+              **stub: Any) -> tuple[Measurement, ...]:
+    _stub(check, sts, **stub)
+    return measured(check)
+
+
+def _kind(readings: tuple[Measurement, ...], kind: str) -> list[Measurement]:
+    return [reading for reading in readings if reading.record["kind"] == kind]
+
+
+def test_the_grading_reads_nothing_but_the_readings() -> None:
+    """Graded again by a check that cannot reach AWS at all, over readings this
+    one took, the tree is the one the run itself wrote (little-sister ADR-0086
+    decision 6)."""
+    check = _build()
+    _stub(check, **EVERY_ASPECT)
+    taken = measured(check)
+    first = run_check(check, measurements=taken)
+    blind = _build()
+
+    def unreachable(**credentials: str) -> Any:
+        raise AssertionError("the grading asked AWS for something")
+
+    blind._new_session = unreachable     # type: ignore[method-assign]
+    assert run_check(blind, measurements=taken) == first
+
+
+def test_every_age_is_measured_to_the_instant_the_grading_is_handed() -> None:
+    check = _build()
+    _stub(check, **EVERY_ASPECT)
+    taken = measured(check)
+    later = run_check(check, measurements=taken, now=NOW + timedelta(days=2))
+    assert _line(_child(_child(later, "live"), EC2), "web").endswith(": 1 (2d 3h)")
+
+
+def test_the_estate_comes_first_then_each_account_then_the_aspects() -> None:
+    readings = _readings(_build(), **EVERY_ASPECT)
+    assert [reading.record["kind"] for reading in readings[:3]] == [
+        "estate", "account", "account"]
+    assert [reading.record["account"] for reading in readings[1:3]] == [
+        "live", "backup"]
+    assert {reading.record["kind"] for reading in readings[3:]} == {
+        "alarm", "instance", "function", "pipeline", "queue", "job"}
+
+
+def test_every_reading_names_its_aspect_its_kind_its_account_and_region() -> None:
+    readings = _readings(_build(), **EVERY_ASPECT)
+    assert {(reading.record["aspect"], reading.record["kind"])
+            for reading in readings} == {
+        (None, "estate"), (None, "account"), (CLOUDWATCH, "alarm"),
+        (EC2, "instance"), (LAMBDA, "function"), (CODEPIPELINE, "pipeline"),
+        (BATCH, "queue"), (BATCH, "job")}
+    for reading in readings[1:]:
+        assert reading.record["account"] in {"live", "backup"}
+    for reading in readings[3:]:
+        assert reading.record["region"] == "eu-central-1"
+
+
+def test_only_a_run_a_pipeline_and_the_estate_have_a_history() -> None:
+    """ADR-0005 §3: `series_keep` is one number per check, so every other
+    reading is read and graded and kept no longer than its node."""
+    readings = _readings(_build(), **EVERY_ASPECT)
+    kept = {"estate", "pipeline", "job"}
+    assert {reading.record["kind"] for reading in readings if reading.subject} == kept
+    assert all(reading.subject for reading in readings
+               if reading.record["kind"] in kept)
+
+
+def test_a_subject_names_the_account_by_its_configured_name() -> None:
+    readings = _readings(_build(), **EVERY_ASPECT)
+    assert readings[0].subject == "accounts/backup/live"
+    assert {reading.subject for reading in _kind(readings, "pipeline")} == {
+        "codepipeline/live/eu-central-1/deploy",
+        "codepipeline/live/eu-central-1/idle"}
+    assert {reading.subject for reading in _kind(readings, "job")} == {
+        "batch/live/eu-central-1/nightly/etl"}
+
+
+def test_the_estate_is_declared_at_construction_its_names_sorted() -> None:
+    """So a run that raises is still recorded against it, and reordering the
+    configuration does not start a new history."""
+    forward = _build(accounts=[{"name": "live"}, {"name": "backup"}])
+    backward = _build(accounts=[{"name": "backup"}, {"name": "live"}])
+    assert forward.subject == backward.subject == "accounts/backup/live"
+
+
+def test_every_time_a_record_keeps_is_under_a_name_the_library_reads_as_one() -> None:
+    """The node's page can show a record's time in the configured zone only under a
+    name little-sister reads as an instant — `at`, `started` or `ended`, at any
+    depth — so every time a reading keeps is under one, and each kind that keeps a
+    time says which."""
+    readings = _readings(_build(), **EVERY_ASPECT)
+    kept: dict[str, set[str]] = {}
+
+    def walk(kind: str, value: object, path: str) -> None:
+        if isinstance(value, dict):
+            for key, below in value.items():
+                walk(kind, below, f"{path}.{key}" if path else str(key))
+        elif isinstance(value, str):
+            try:
+                moment = datetime.fromisoformat(value)
+            except ValueError:
+                return
+            if moment.tzinfo is not None:
+                kept.setdefault(kind, set()).add(path)
+
+    for reading in readings:
+        walk(str(reading.record["kind"]), dict(reading.record), "")
+    assert all(path.rsplit(".", 1)[-1] in RECORD_TIMESTAMP_KEYS
+               for paths in kept.values() for path in paths), kept
+    assert kept == {"instance": {"started"}, "function": {"at"},
+                    "pipeline": {"started", "at"},
+                    "job": {"created.at", "ended", "at"}}
+
+
+def test_a_subject_past_what_one_may_hold_is_its_kind_and_a_digest() -> None:
+    queue, job = "q" * 128, "j" * 128
+    readings = _readings(_one_account(),
+                         queues={"eu-central-1": [[_queue(queue)]]},
+                         jobs={(queue, "SUCCEEDED"): [[_job(job, job_id="j-1")]],
+                               (queue, "FAILED"): [[_job("short", job_id="j-2")]]})
+    long_one, short_one = _kind(readings, "job")
+    assert long_one.subject.startswith("batch/sha256:")
+    assert len(long_one.subject) == len("batch/sha256:") + 32
+    assert short_one.subject == f"batch/live/eu-central-1/{queue}/short"
+
+
+def test_the_parts_of_a_subject_split_back_on_the_slash() -> None:
+    """`/` is the one character an account name — a node segment — cannot hold,
+    and AWS refuses it in regions, queue, job and pipeline names."""
+    readings = _readings(_build(accounts=[{"name": "a:b;c=d",
+                                           "role_arn": ROLE_LIVE}]),
+                         **EVERY_ASPECT)
+    (run,) = {reading.subject for reading in _kind(readings, "job")}
+    assert run.split("/") == ["batch", "a:b;c=d", "eu-central-1", "nightly", "etl"]
+
+
+def test_several_runs_of_one_name_in_one_poll_are_several_records() -> None:
+    readings = _readings(_one_account(), **EVERY_ASPECT)
+    runs = _kind(readings, "job")
+    assert [run.identity for run in runs] == ["j-2", "j-1"]
+    assert len({run.subject for run in runs}) == 1
+
+
+def test_a_run_seen_waiting_and_then_finished_is_one_record() -> None:
+    """Its identity is the `jobId`, which does not change as the run moves on, and
+    its own time is when it finished — nothing while it has not."""
+    waiting = _readings(_one_account(), queues=ONE_QUEUE, jobs={
+        ("nightly", "RUNNABLE"): [[_job("etl", "RUNNABLE", job_id="j-9",
+                                        created=timedelta(minutes=5))]]})
+    finished = _readings(_one_account(), queues=ONE_QUEUE, jobs={
+        ("nightly", "SUCCEEDED"): [[_job("etl", job_id="j-9",
+                                         created=timedelta(minutes=5),
+                                         started=timedelta(minutes=4),
+                                         stopped=timedelta(minutes=1))]]})
+    (before,) = _kind(waiting, "job")
+    (after,) = _kind(finished, "job")
+    assert (before.subject, before.identity) == (after.subject, after.identity)
+    assert before.record["at"] is None
+    assert datetime.fromisoformat(after.record["at"]) == NOW - timedelta(minutes=1)
+
+
+def test_a_pipeline_names_the_execution_it_last_ran() -> None:
+    executions = [_execution(started=timedelta(hours=5), eid="e-old"),
+                  _execution("InProgress", started=timedelta(minutes=3),
+                             eid="e-new")]
+    readings = _readings(_one_account(), pipelines=ONE_PIPELINE,
+                         executions={"running-deploy": executions})
+    (running,) = _kind(readings, "pipeline")
+    done = _readings(_one_account(), pipelines=ONE_PIPELINE, executions={
+        "running-deploy": [_execution(started=timedelta(minutes=3),
+                                      eid="e-new")]})
+    (finished,) = _kind(done, "pipeline")
+    assert (running.identity, running.state) == ("e-new", "")
+    assert (finished.subject, finished.identity) == (running.subject, "e-new")
+    assert datetime.fromisoformat(running.record["at"]) == NOW - timedelta(minutes=3)
+
+
+def test_a_pipeline_that_has_never_run_names_that_state() -> None:
+    readings = _readings(_one_account(), pipelines=ONE_PIPELINE, executions={})
+    (pipeline,) = _kind(readings, "pipeline")
+    assert (pipeline.identity, pipeline.state) == ("", NEVER_RUN)
+    assert pipeline.record["at"] is None
+
+
+def test_the_estate_names_each_account_s_outcome_sorted_by_name() -> None:
+    check = _build(accounts=[{"name": "live", "role_arn": ROLE_LIVE},
+                             {"name": "backup", "role_arn": ROLE_BACKUP}])
+    readings = _readings(check, _FakeSts(refuse={ROLE_BACKUP}))
+    assert readings[0].state == "backup=unreachable/live=read"
+    assert readings[0].record["accounts"] == [
+        {"name": "live", "outcome": "read"},
+        {"name": "backup", "outcome": "unreachable"}]
+
+
+def test_the_estate_s_state_is_never_spelled_from_the_error_text() -> None:
+    """Two expired logins whose second lines differ are one state; the text is
+    in the account's own reading, where the node is written from."""
+    quiet = _one_account(profile=PRIMARY, sso={"login": "never"})
+    tried = _one_account(profile=PRIMARY, sso={"login": "always"})
+    _sso(tried)
+    one = _readings(quiet, _FakeSts(expire=9))
+    two = _readings(tried, _FakeSts(expire=9))
+    assert one[0].state == two[0].state == "live=expired"
+    renewals = {_kind(readings, "account")[0].record["renewal"]
+                for readings in (one, two)}
+    assert len(renewals) == 2
+    assert "expired" not in json.dumps(dict(one[0].record["accounts"][0])
+                                       ).replace('"expired"', "")
+
+
+def test_a_name_holding_an_equals_sign_still_spells_apart() -> None:
+    """The outcome after a pair's last `=` is from a fixed vocabulary, so the
+    spelling splits back into its pairs whatever a name holds."""
+    check = _build(accounts=[{"name": "a=read"}, {"name": "b;c"}])
+    readings = _readings(check)
+    pairs = [pair.rpartition("=") for pair in readings[0].state.split("/")]
+    assert [(name, outcome) for name, _, outcome in pairs] == [
+        ("a=read", "read"), ("b;c", "read")]
+
+
+def test_an_estate_spelled_past_what_a_state_may_hold_is_a_digest() -> None:
+    check = _build(accounts=[{"name": f"account-number-{n:02d}"}
+                             for n in range(20)])
+    state = _readings(check)[0].state
+    assert state.startswith("sha256:")
+    assert len(state) == len("sha256:") + 32
+
+
+def test_without_credentials_the_estate_is_the_only_reading() -> None:
+    check = _build()
+
+    def refuse(**credentials: str) -> Any:
+        raise NoCredentialsError()
+
+    check._new_session = refuse         # type: ignore[method-assign]
+    (estate,) = measured(check)
+    assert estate.state == CREDENTIALS_UNUSABLE
+    assert estate.subject == "accounts/backup/live"
+    assert estate.record["credentials"] == "Unable to locate credentials"
+    assert estate.record["accounts"] == []
+
+
+def test_an_account_s_failure_text_lives_in_its_own_reading() -> None:
+    readings = _readings(_build(), _FakeSts(refuse={ROLE_BACKUP}))
+    (backup,) = [reading for reading in _kind(readings, "account")
+                 if reading.record["account"] == "backup"]
+    assert backup.record["outcome"] == "unreachable"
+    assert "AccessDenied" in backup.record["error"]
+    assert "AccessDenied" not in json.dumps(dict(readings[0].record))
+
+
+def test_what_spares_no_request_is_read_and_left_to_the_grading() -> None:
+    """ADR-0005 §2: an ignore list that saves no call only chooses what is said —
+    the ignored alarm, the terminated box and the hidden job name are readings."""
+    check = _one_account(batch={"ignore_name_patterns": ["etl"]})
+    readings = _readings(check, **EVERY_ASPECT)
+    assert "TargetTracking-x" in {reading.record["name"]
+                                  for reading in _kind(readings, "alarm")}
+    assert "terminated" in {reading.record["state"]
+                            for reading in _kind(readings, "instance")}
+    assert {reading.record["name"] for reading in _kind(readings, "job")} == {"etl"}
+    live = _child(run_check(check, measurements=readings), "live")
+    assert not any("TargetTracking" in text
+                   for text in _texts(_child(live, CLOUDWATCH)))
+    assert not any("[etl]" in text for text in _texts(_child(live, BATCH)))
+
+
+def test_what_spares_a_request_is_decided_while_reading() -> None:
+    """A lambda rule's `ignore` spares the metric and the log read, a queue's
+    ignore pattern its job listings: neither is read, so neither is a reading."""
+    check = _one_account(**{"lambda": {"rules": [
+        {"name": "old", "prefixes": ["old-"], "ignore": True}]}},
+        batch={"ignore_queue_patterns": ["dormant"]})
+    built = _stub(check, **{**EVERY_ASPECT,
+                            "functions": {"eu-central-1": [["old-one", "new-one"]]},
+                            "messages": {"old-one": "REPORT", "new-one": "REPORT"}})
+    readings = measured(check)
+    assert [reading.record["name"]
+            for reading in _kind(readings, "function")] == ["new-one"]
+    assert not any("old-one" in call for session in built
+                   for call in session.log_calls)
+    assert [reading.record["name"]
+            for reading in _kind(readings, "queue")] == ["nightly"]
+    assert not any(queue == "dormant" for session in built
+                   for queue, _ in session.job_calls)
+
+
+def test_a_line_one_reading_made_carries_it_and_one_many_made_carries_none() -> None:
+    """ADR-0005 §7, line by line."""
+    check = _build()
+    _stub(check, **EVERY_ASPECT)
+    taken = measured(check)
+    live = _child(run_check(check, measurements=taken), "live")
+
+    def reading(kind: str, name: str) -> Measurement:
+        (found,) = [one for one in _kind(taken, kind)
+                    if one.record.get("name") == name
+                    and one.record.get("account") == "live"]
+        return found
+
+    alarm = _entry(_child(live, CLOUDWATCH), "api-latency")
+    assert (alarm.data, alarm.subject) == (
+        dict(reading("alarm", "api-latency").record), "")
+    assert _entry(_child(live, EC2), "web").data["id"] == "i-1"
+    assert _entry(_child(live, EC2), "pair").data is None
+    for leaf in live.children:
+        (scope,) = [entry for entry in leaf.reason if entry.slug == "scope"]
+        assert (scope.data, scope.subject) == (None, "")
+    deploy = _entry(_child(live, CODEPIPELINE), "deploy")
+    assert (deploy.data, deploy.subject) == (
+        dict(reading("pipeline", "deploy").record),
+        "codepipeline/live/eu-central-1/deploy")
+    dormant = _entry(_child(live, BATCH), "dormant")
+    assert dormant.data == dict(reading("queue", "dormant").record)
+    etl = _entry(_child(live, BATCH), "etl")
+    assert (etl.data, etl.subject) == (None, "batch/live/eu-central-1/nightly/etl")
+
+
+def test_a_region_that_could_not_be_read_carries_its_reading() -> None:
+    check = _one_account()
+    _stub(check, unreadable={"eu-central-1"})
+    taken = measured(check)
+    (unreadable,) = [reading for reading in _kind(taken, "unreadable")
+                     if reading.record["aspect"] == CLOUDWATCH]
+    leaf = _child(_child(run_check(check, measurements=taken), "live"), CLOUDWATCH)
+    (line,) = [entry for entry in leaf.reason if entry.slug == "read-eu-central-1"]
+    assert line.data == dict(unreadable.record)
+    assert unreadable.record["error"].endswith("no cloudwatch")
+
+
+def test_free_text_is_clipped_once_and_the_line_says_what_the_record_keeps() -> None:
+    check = _one_account()
+    _stub(check, alarms={"eu-central-1": [[_alarm("api", description="x" * 1000)]]})
+    taken = measured(check)
+    (alarm,) = _kind(taken, "alarm")
+    assert alarm.record["description"] == "x" * 300
+    leaf = _child(_child(run_check(check, measurements=taken), "live"), CLOUDWATCH)
+    assert _entry(leaf, "api").text.endswith(" — " + "x" * 300)
+
+
+class _Wordy(_FakeSts):
+    """STS answering with the longest message an answer could carry — a refusal,
+    or with ``expire`` an expired token."""
+
+    def assume_role(self, *, RoleArn: str, RoleSessionName: str) -> dict[str, Any]:
+        code = "ExpiredToken" if self.expire else "AccessDenied"
+        raise ClientError({"Error": {"Code": code, "Message": EMOJI * 2000}},
+                          "AssumeRole")
+
+
+#: One character that JSON writes as twelve bytes — the worst any free text can do.
+EMOJI = "\U0001f600"
+
+
+def test_the_heaviest_reading_of_each_kind_fits_the_default_record_limit(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every free-text field at its bound, in the alphabet JSON escapes the most:
+    the seam weighs a record as `json.dumps` writes it, against 2048 bytes."""
+    assert len(EMOJI) == 1
+
+    def unreadable_log(self: Any, **query: Any) -> dict[str, Any]:
+        raise ClientError({"Error": {"Code": "AccessDenied",
+                                     "Message": EMOJI * 2000}}, "DescribeLogStreams")
+
+    monkeypatch.setattr(_FakeLogs, "describe_log_streams", unreadable_log)
+    heavy = {
+        "alarms": {"eu-central-1": [[_alarm(EMOJI * 255, description=EMOJI * 1024,
+                                            composite=True)]]},
+        "instances": {"eu-central-1": [[_instance(
+            EMOJI * 256, instance_id="i-" + "f" * 17, up=timedelta(days=3))]]},
+        "functions": {"eu-central-1": [["f" * 64]]},
+        "metrics": {"f" * 64: {"errors": 999, "age": timedelta(minutes=1)}},
+        "pipelines": {"eu-central-1": [["p" * 100]]},
+        "executions": {"p" * 100: [_execution("InProgress",
+                                              eid="00000000-0000-4000-8000-000000000000")]},
+        "queues": {"eu-central-1": [[_queue("q" * 128, reason=EMOJI * 1024)]]},
+        "jobs": {("q" * 128, "FAILED"): [[{
+            **_job("j" * 128, "FAILED", job_id="00000000-0000-4000-8000-000000000000",
+                   created=timedelta(hours=2), started=timedelta(hours=2),
+                   stopped=timedelta(hours=1)),
+            "statusReason": EMOJI * 1024}]]},
+    }
+    readings = _readings(_build(accounts=[
+        {"name": "live", "role_arn": ROLE_LIVE}]), **heavy)
+    refused = _readings(_one_account(profile=PRIMARY, sso={"login": "never"}),
+                        _Wordy())
+    lapsed = _one_account(profile=PRIMARY, sso={"login": "always"})
+    _sso(lapsed, EMOJI * 2000)
+    expired = _readings(lapsed, _Wordy(expire=9))
+    weights: dict[str, int] = {}
+    for reading in (*readings, *refused, *expired):
+        kind = reading.record["kind"]
+        weights[kind] = max(weights.get(kind, 0),
+                            len(json.dumps(dict(reading.record))))
+    assert _kind(expired, "account")[0].record["outcome"] == "expired"
+    assert _kind(readings, "function")[0].record["log_error"]
+    assert set(weights) == {"estate", "account", "alarm", "instance", "function",
+                            "pipeline", "queue", "job"}
+    assert max(weights.values()) <= 2048, weights
+
+
+def test_a_log_that_cannot_be_read_says_what_aws_answered(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """The reading keeps what AWS answered; the sentence around it is the line's."""
+    def refuse(self: Any, **query: Any) -> dict[str, Any]:
+        raise ClientError({"Error": {"Code": "AccessDenied",
+                                     "Message": "no logs"}}, "DescribeLogStreams")
+
+    monkeypatch.setattr(_FakeLogs, "describe_log_streams", refuse)
+    check = _one_account()
+    _stub(check, functions=ONE_FUNCTION,
+          metrics={"running-collector-lambda": {"errors": 0,
+                                                "age": timedelta(minutes=5)}})
+    taken = measured(check)
+    (function,) = _kind(taken, "function")
+    said = ("An error occurred (AccessDenied) when calling the "
+            "DescribeLogStreams operation: no logs")
+    assert function.record["log_error"] == said
+    assert function.record["log_status"] is None
+    leaf = _child(_child(run_check(check, measurements=taken), "live"), LAMBDA)
+    assert _entry(leaf, "running-collector-lambda").text.endswith(
+        f" · log unreadable: {said}")
+
+
+def test_readings_no_measurement_of_ours_produced_grade_to_an_error() -> None:
+    """Only the engine's own failure record has no estate, and the engine grades
+    that run itself; anything else handed over is refused rather than read."""
+    result = run_check(_build(), measurements=())
+    assert result.code is StatusCode.ERROR
+    assert _texts(result) == ["no estate reading to grade — nothing was read"]
+
+
+def test_an_identifier_past_its_bound_is_a_digest_of_itself() -> None:
+    """A clipped identifier could meet another one; a digest cannot."""
+    long_id = "j" * 150
+    readings = _readings(_one_account(), queues=ONE_QUEUE, jobs={
+        ("nightly", "SUCCEEDED"): [[_job("etl", job_id=long_id),
+                                    _job("etl", job_id=long_id + "x")]]})
+    first, second = _kind(readings, "job")
+    assert first.identity.startswith("sha256:") and len(first.identity) == 39
+    assert first.identity != second.identity
+    assert first.record["id"] == first.identity
+
+
+def test_an_identifier_with_a_control_character_is_a_digest_of_itself() -> None:
+    """An identifier that would not travel is a digest as well — never an answer
+    the library refuses."""
+    odd = "j-1" + chr(7)
+    assert len(odd) == 4
+    readings = _readings(_one_account(), queues=ONE_QUEUE, jobs={
+        ("nightly", "SUCCEEDED"): [[_job("etl", job_id=odd)]]})
+    (run,) = _kind(readings, "job")
+    assert run.identity.startswith("sha256:") and len(run.identity) == 39
+    assert run.record["id"] == run.identity
+
+
+def test_a_control_character_in_an_account_name_is_digested_not_refused() -> None:
+    """A configuration that loaded before this conversion still loads: a subject
+    that would not travel is its kind and a digest, never a refusal."""
+    check = _build(accounts=[{"name": "live\u0007"}])
+    assert check.subject.startswith("accounts/sha256:")
+    assert _readings(check)[0].state.startswith("sha256:")

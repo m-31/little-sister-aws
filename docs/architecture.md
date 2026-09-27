@@ -22,7 +22,7 @@ the same shape.)
 
 1. **The `aws` check type** (`aws.py`, with `_rules.py` beneath it) — the product.
    Registered by importing `little_sister_aws`, whose `__init__` calls
-   `require_api(2)` first, so a library that has moved past the check-authoring
+   `require_api(3)` first, so a library that has moved past the check-authoring
    surface refuses at import rather than at the first run.
 2. **The identity seam** (`identity.py`) — how a session is opened and an expired
    login renewed, usable with no check in the process.
@@ -45,8 +45,8 @@ threshold belongs in a deployment's YAML.** It is the test to apply to any new k
 
 | | |
 |---|---|
-| `__init__.py` | the API epoch (`require_api(2)`) and the import whose side effect registers the type |
-| `aws.py` | the `aws` check type: configuration, the five aspects, the tree it writes |
+| `__init__.py` | the API epoch (`require_api(3)`) and the import whose side effect registers the type |
+| `aws.py` | the `aws` check type: configuration, the five aspects — each measured and then graded — and the tree it writes |
 | `_rules.py` | the configuration vocabulary the aspects share — a graded threshold is a pair, a rule owns names ([ADR-0003](adr/0003-a-graded-threshold-is-a-pair-and-a-rule-owns-names.md)). Private on purpose: it is shared *between the aspects*, not with anybody outside |
 | `identity.py` | the identity seam (§4) |
 | `identities.py` | the `aws` configuration aspect — named identities, read from `config/aws.yaml`. It reads a **file**, which is exactly why it sits beside the seam and not in it |
@@ -94,11 +94,46 @@ account and leaves the others reporting
 - **A rule that matches nothing goes to the log and never to a node.** It is a fact
   about the *configuration*, not about the estate, and colouring a card over a typo in
   a file sends somebody hunting through an account where nothing is wrong.
-- **A check that could not look is not a check that graded badly.** `_account_result`
-  says which of the two happened rather than inferring it from the shape of the
-  result, and an account that could not be read is logged with the three facts that
-  are useless apart: what was attempted, **who we actually were**
-  (`caller_identity`), and what AWS said.
+- **A check that could not look is not a check that graded badly.** An account's
+  own reading says which of the two happened — `read`, `unreachable` or `expired` —
+  rather than the grading inferring it from the shape of the result, and an account
+  that could not be read is logged with the three facts that are useless apart: what
+  was attempted, **who we actually were** (`caller_identity`), and what AWS said.
+
+### A run is two halves
+
+`measure()` reads and `grade(measurements, now)` builds the tree
+([ADR-0005](adr/0005-a-run-is-its-readings-and-the-runs-keep-a-history.md),
+little-sister ADR-0086); each aspect is a `_measure_<aspect>` beside a
+`_grade_<aspect>`.
+
+- **The grading reads the readings, the configuration and the `now` it is handed** —
+  no session, no clock of its own, nothing the measuring half left on the check. A
+  record is turned back into the values the lines were always written from
+  (`_alarm_of`, `_instance_of`, …), so a line is written by the code that wrote it
+  before the split.
+- **One reading per thing a run read**: the estate first, each account's own, then each
+  aspect's in the order it read them. A record names its `aspect`, its `kind`, and the
+  `account` and `region` it is about; ADR-0005 §1 lists every kind's fields, and they
+  are keys, like a slug. A field goes into `_reading` as a mapping of its own, so a
+  record's `state` is never taken for the measurement's.
+- **What a setting spares decides its half.** One that spares a request is read while
+  measuring — `include_composite`, a `lambda` or `codepipeline` rule's `ignore`,
+  `read_log_status`, `ignore_queue_patterns`, `max_jobs` — and one that only chooses
+  what is said is the grading's, so what an ignore list hides is still a reading. Which
+  rules matched a name is noted while measuring: the log line about a rule that matched
+  nothing is state kept between runs.
+- **Three kinds keep a history, and no others**: a Batch job's run, named by its
+  `jobId`; a pipeline, by its newest execution's id or the state `never-run`; and the
+  estate, by each account's outcome — `backup=expired/live=read`. A subject names an
+  account by its configured `name`, the kind first and `/` between the parts —
+  `batch/<account>/<region>/<queue>/<job name>` — so an account's name is a stored key
+  twice over: every pin under it hangs off it, and so does every history.
+- **The root grades nothing**: it declares `UNDEFINED` beside the sentence that says
+  what is watched, so the estate's kept reading stands at what the run rolls up to. A
+  line made from one reading carries it as its `data` and its subject; one made from
+  several carries none — a job name's line names its subject instead. Free text is
+  clipped once, in the measuring half, by `_kept`.
 
 ## 4. The identity seam — `identity.py`
 
@@ -255,3 +290,9 @@ was rejected. Read one before changing what it decided.
   reporting by the library's loss principle, WARN for a standby, and the two actions
   the web app owes; **§10** versioning off and checked once; **§12** the bucket as a
   mirror of bounded memory, never a history.
+- **[ADR-0005](adr/0005-a-run-is-its-readings-and-the-runs-keep-a-history.md) — a
+  run is its readings, and only the runs and the estate keep a history.** The
+  conversion to little-sister's measure/grade split: one reading per thing a run read,
+  the configuration split by what it spares, a history only for a Batch job's runs, a
+  pipeline's executions and the estate, a subject that names an account by its
+  configured name, and a root that grades nothing.

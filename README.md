@@ -7,7 +7,7 @@ per account and a node per aspect beneath it — the **secret provider** behind
 instance's `var/state/` into a bucket, and the **identity seam** all three open their
 sessions through, which a deployment may also use on its own.
 
-- **Needs little-sister ≥ 0.3.15** (a floor, never a pin), and **boto3**.
+- **Needs little-sister ≥ 0.3.18** (a floor, never a pin), and **boto3**.
 - **Registers one check type: `aws`.**
 - **Ships the AWS secret provider** — `aws-sm://` and `aws-ssm://` secret
   references, with named reading identities — which a deployment installs by an
@@ -45,8 +45,10 @@ others reporting.
 
 ```toml
 dependencies = [
-    "little-sister==<the version you pin>",
-    "little-sister-aws==<this version>",
+    # Pin them: an upgrade is then a deliberate edit rather than drift. The library
+    # number is the floor this release was built against.
+    "little-sister==0.3.18",
+    "little-sister-aws==0.1.4",
 ]
 ```
 
@@ -125,6 +127,27 @@ lines, and drops the alarms that are fine.
 
 A deployment that disagrees says `show_when_quiet: false` for that name in the
 check's `subnodes:` block, or per path in `nodes.yaml`. Both still win.
+
+## What a run records
+
+Each run records what it read, one reading per thing: whether the credentials opened
+and what became of each account, then every alarm, instance, function, pipeline, job
+queue and Batch job run it read, and every region an aspect could not read. Every line
+made from one reading carries that reading's record as its `data` — an alarm's, a
+function's, a pipeline's, a queue's, a name's where one instance carries it — so a line
+template or a client can read what the line read; a job name's line is made from all of
+its runs, and carries none of them. Free text is clipped once, at 300 characters, and
+the line says exactly what the record keeps.
+
+`series_keep:` — little-sister's setting, **0 by default** — keeps three histories on
+this check: each **Batch job**'s runs, one record per run however many polls saw it,
+in its final state once it has finished; each **pipeline**'s executions, one record per
+execution; and the accounts' own — one record each time an account opens or stops
+opening. Alarms, instances, functions and queues keep none. A history is keyed by the
+account's configured `name`, so renaming an account starts it again. The accounts' own
+history is of the accounts the configuration lists, so adding or removing an account
+starts that one again too. Why it is shaped this way is
+[ADR-0005](docs/adr/0005-a-run-is-its-readings-and-the-runs-keep-a-history.md).
 
 ## The IAM policy
 
@@ -231,6 +254,12 @@ from little_sister_aws.keeper import register_s3_keeper
 
 register_s3_keeper()               # returns None where no aws-keeper.yaml declares one
 ```
+
+The file is one of two routes. `register_s3_keeper(config=KeeperConfig(bucket=…,
+prefix=…))` — `KeeperConfig` from the same module, with the file's keys and defaults —
+takes a configuration built in the deployment's own startup code and reads no file,
+which is the route for a bucket name that is not a constant, such as one carrying the
+account id.
 
 `identity:` names an entry in `config/aws.yaml` (above); one that was never declared
 refuses the start, as does an unknown key, a key left empty, a missing `bucket:`, or
@@ -453,6 +482,10 @@ suite replaces it.
   own configuration aspect, why every write is conditional and a refused one is
   reported rather than merged away, and why the session is re-opened at call time
   instead of the frozen identity seam growing a refresh.
+- [`docs/adr/0005-a-run-is-its-readings-and-the-runs-keep-a-history.md`](docs/adr/0005-a-run-is-its-readings-and-the-runs-keep-a-history.md)
+  — how a run measures and then grades: one reading per thing it read, which of them
+  keep a history (a Batch job's runs, a pipeline's executions, the accounts' own), and
+  why a history names an account by its configured name.
 
 ## License
 

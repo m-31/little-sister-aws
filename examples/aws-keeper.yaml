@@ -5,7 +5,7 @@
 # — and those files live on whichever disk the process happens to be running on. A
 # **keeper** carries that directory somewhere durable, so an instance redeployed
 # onto a fresh machine comes up as the instance that stopped on the old one. This
-# file turns on the S3 one (docs/adr/0004-the-s3-keeper.md).
+# file is one way to turn on the S3 one (docs/adr/0004-the-s3-keeper.md).
 #
 # **Its own file, not a block in `config/aws.yaml`.** That file is a mapping of
 # identity *names*, so a reserved key in it would be a name nobody may declare.
@@ -16,6 +16,15 @@
 # a laptop's and a cloud account's — puts this file in one of them, and the other
 # keeps its state on its own disk. What is refused is a file that exists and cannot
 # be read: an unknown key, a key written and left empty, or no `bucket:`.
+#
+# **This file is not the only door.**
+# `little_sister_aws.keeper.register_s3_keeper(config=…)` takes a
+# `KeeperConfig(bucket=…, prefix=…, identity=…, region=…, lapse_after=…)` that the
+# deployment builds in its own startup code, and then no file is read. That is the
+# route for an installation whose bucket name is not a constant — a bucket that
+# carries the account id, with one image deployed to several accounts — which a
+# file written once cannot name. The keys, their defaults and the prefix rule below
+# are the same on both routes.
 #
 # **What the bucket wants**, decided once when it is created rather than here:
 # versioning **off** (or suspended, which is all a bucket that once had it on can
