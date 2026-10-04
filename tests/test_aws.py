@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ import pytest
 from botocore.exceptions import ClientError, NoCredentialsError
 from little_sister.checks import CHECK_TYPES, CheckError, CheckResult, Measurement
 from little_sister.reasons import RECORD_TIMESTAMP_KEYS
+from little_sister.series import SeriesRecord
 from little_sister.status import StatusCode, effective_code
 from running import measured, run_check
 
@@ -177,35 +179,113 @@ class _FakePaginator:
         return out
 
 
+#: The field of a fixture's point each of a function's metrics answers from.
+_METRIC_FIELDS = {"Errors": "errors", "Invocations": "invocations",
+                  "Duration": "duration"}
+
+
 class _FakeCloudwatch:
+    """``get_metric_data`` the way CloudWatch answers it: the points of each query
+    that lie in the window asked, newest first, the window's end excluded — and of
+    each result whether it was answered, ``Complete``, or ``PartialData`` where a
+    page cut its points.
+
+    A function's fixture is one point — ``{"errors": 0, "age": …}`` — or its
+    ``runs``, a list of them. A point answers ``Errors`` from its ``errors``,
+    ``Invocations`` from its ``invocations`` and ``Duration`` from its ``duration``,
+    and a metric it does not name has no data point there. It comes back only at a
+    period at least as coarse as the one the fixture says the function has data at
+    — which is what makes the 60 → 300 → 3600 fallback testable.
+
+    A fixture's ``refused`` names a metric CloudWatch does not answer —
+    ``{"Errors": "InternalError"}``, or the status with the messages sent beside
+    it, ``("Forbidden", "…")``. That metric's result carries the status, the
+    messages and no point, in a call that succeeds.
+
+    With ``page`` set, an answer comes in pages of that many data points, each with
+    a token for the next. CloudWatch ends a page by another count — what the page's
+    part of the window could hold — and hands back a token the same way."""
+
     def __init__(self, paginator: _FakePaginator, metrics: dict[str, Any],
-                 calls: list[list[dict[str, Any]]]) -> None:
+                 calls: list[list[dict[str, Any]]],
+                 windows: list[tuple[datetime, datetime, str | None]],
+                 page: int | None = None) -> None:
         self._paginator = paginator
         self._metrics = metrics
         self._calls = calls
+        self._windows = windows
+        self._page = page
 
     def get_paginator(self, name: str) -> _FakePaginator:
         assert name == "describe_alarms"
         return self._paginator
 
+    def _points(self, query: dict[str, Any], start: datetime,
+                end: datetime) -> list[tuple[datetime, float]]:
+        stat = query["MetricStat"]
+        fixture = self._metrics.get(stat["Metric"]["Dimensions"][0]["Value"])
+        if fixture is None:
+            return []
+        field = _METRIC_FIELDS[stat["Metric"]["MetricName"]]
+        points = [(NOW - point["age"], point[field])
+                  for point in fixture.get("runs", [fixture])
+                  if point.get(field) is not None
+                  and stat["Period"] >= point.get("period",
+                                                  fixture.get("period", 60))
+                  and start <= NOW - point["age"] < end]
+        return sorted(points, reverse=True)
+
+    def _refused(self, query: dict[str, Any]) -> dict[str, Any] | None:
+        """The result of a query CloudWatch does not answer, by its function's
+        ``refused``, and nothing where it answers."""
+        metric = query["MetricStat"]["Metric"]
+        fixture = self._metrics.get(metric["Dimensions"][0]["Value"]) or {}
+        refused = fixture.get("refused", {}).get(metric["MetricName"])
+        if refused is None:
+            return None
+        status, *said = (refused,) if isinstance(refused, str) else refused
+        return {"Id": query["Id"], "Timestamps": [], "Values": [],
+                "StatusCode": status,
+                "Messages": [{"Code": status, "Value": text} for text in said]}
+
     def get_metric_data(self, *, StartTime: datetime, EndTime: datetime,
-                        MetricDataQueries: list[dict[str, Any]]) -> dict[str, Any]:
-        """A data point comes back only at a period at least as coarse as the one
-        the fixture says the function has data at — which is what makes the
-        60 → 300 → 3600 fallback testable."""
+                        MetricDataQueries: list[dict[str, Any]],
+                        NextToken: str | None = None) -> dict[str, Any]:
         self._calls.append(MetricDataQueries)
-        results = []
-        for query in MetricDataQueries:
-            stat = query["MetricStat"]
-            name = stat["Metric"]["Dimensions"][0]["Value"]
-            point = self._metrics.get(name)
-            if point is not None and stat["Period"] >= point.get("period", 60):
-                results.append({"Id": query["Id"],
-                                "Values": [point["errors"]],
-                                "Timestamps": [NOW - point["age"]]})
-            else:
-                results.append({"Id": query["Id"], "Values": [], "Timestamps": []})
-        return {"MetricDataResults": results}
+        self._windows.append((StartTime, EndTime, NextToken))
+        refused = {query["Id"]: refusal for query in MetricDataQueries
+                   if (refusal := self._refused(query)) is not None}
+        answered = [(query["Id"], self._points(query, StartTime, EndTime))
+                    for query in MetricDataQueries if query["Id"] not in refused]
+        if self._page is None:
+            whole = {query_id: {"Id": query_id,
+                                "Timestamps": [stamp for stamp, _ in points],
+                                "Values": [value for _, value in points],
+                                "StatusCode": "Complete"}
+                     for query_id, points in answered}
+            # In the order asked, as CloudWatch answers.
+            return {"MetricDataResults": [
+                refused.get(query["Id"]) or whole[query["Id"]]
+                for query in MetricDataQueries]}
+        flat = [(query_id, stamp, value) for query_id, points in answered
+                for stamp, value in points]
+        number = int(NextToken.removeprefix("page-")) if NextToken else 0
+        on_page = flat[number * self._page:(number + 1) * self._page]
+        # A result whose points go on behind the token says so.
+        cut = {query_id for query_id, _, _ in flat[(number + 1) * self._page:]}
+        results: dict[str, dict[str, Any]] = {}
+        for query_id, stamp, value in on_page:
+            result = results.setdefault(
+                query_id, {"Id": query_id, "Timestamps": [], "Values": [],
+                           "StatusCode": ("PartialData" if query_id in cut
+                                          else "Complete")})
+            result["Timestamps"].append(stamp)
+            result["Values"].append(value)
+        answer: dict[str, Any] = {"MetricDataResults": [
+            *results.values(), *(refused.values() if number == 0 else ())]}
+        if len(flat) > (number + 1) * self._page:
+            answer["NextToken"] = f"page-{number + 1}"
+        return answer
 
 
 class _FakeLambdaPaginator:
@@ -386,6 +466,7 @@ class _FakeSession:
                             list[list[dict[str, Any]]]] | None = None,
                  batch_unreadable: set[str] | None = None,
                  log_pages: dict[str, list[tuple[list[str], str]]] | None = None,
+                 metric_page: int | None = None,
                  ) -> None:
         self.sts = sts
         self.credentials = credentials
@@ -406,6 +487,10 @@ class _FakeSession:
         self.clients: list[tuple[str, str]] = []
         self.paginators: dict[str, _FakePaginator] = {}
         self.metric_calls: list[list[dict[str, Any]]] = []
+        #: Each ``get_metric_data`` call's window and the token it sent, beside
+        #: its queries in ``metric_calls``.
+        self.metric_windows: list[tuple[datetime, datetime, str | None]] = []
+        self.metric_page = metric_page
         self.log_calls: list[str] = []
         self.log_pages = log_pages or {}
         self.log_tokens: list[tuple[str, str | None]] = []
@@ -454,7 +539,8 @@ class _FakeSession:
                 "DescribeAlarms")
         paginator = _FakePaginator(self.alarms.get(region_name, []))
         self.paginators[region_name] = paginator
-        return _FakeCloudwatch(paginator, self.metrics, self.metric_calls)
+        return _FakeCloudwatch(paginator, self.metrics, self.metric_calls,
+                               self.metric_windows, self.metric_page)
 
 
 def _stub(check: AwsCheck, sts: _FakeSts | None = None, *,
@@ -474,6 +560,7 @@ def _stub(check: AwsCheck, sts: _FakeSts | None = None, *,
                      list[list[dict[str, Any]]]] | None = None,
           batch_unreadable: set[str] | None = None,
           log_pages: dict[str, list[tuple[list[str], str]]] | None = None,
+          metric_page: int | None = None,
           ) -> list[_FakeSession]:
     """Replace the one place boto3 is constructed; record what was built."""
     shared_sts = sts if sts is not None else _FakeSts()
@@ -489,7 +576,7 @@ def _stub(check: AwsCheck, sts: _FakeSts | None = None, *,
                                pipelines_unreadable=pipelines_unreadable,
                                queues=queues, jobs=jobs,
                                batch_unreadable=batch_unreadable,
-                               log_pages=log_pages)
+                               log_pages=log_pages, metric_page=metric_page)
         built.append(session)
         return session
 
@@ -506,6 +593,32 @@ def _child(result: CheckResult, name: str) -> CheckResult:
 
 def _texts(result: CheckResult) -> list[str]:
     return list(result.reason_texts)
+
+
+def _aspect(check: AwsCheck, result: CheckResult, aspect: str,
+            account: str = "live") -> CheckResult:
+    """One account's aspect in *result*: beneath the account's node where *check*
+    names several accounts, and beneath the check's own where it names one and the
+    account has no node (ADR-0007 §2)."""
+    return _child(_child(result, account) if len(check.accounts) > 1 else result,
+                  aspect)
+
+
+def _nodes(result: CheckResult) -> list[CheckResult]:
+    """*result* and every node beneath it, depth first."""
+    return [result, *(node for child in result.children for node in _nodes(child))]
+
+
+def _node(leaf: CheckResult, name: str) -> CheckResult:
+    """The one node called *name* beneath *leaf*, wherever it hangs."""
+    found = [node for node in _nodes(leaf)[1:] if node.name == name]
+    assert len(found) == 1, [node.name for node in _nodes(leaf)]
+    return found[0]
+
+
+def _function(leaf: CheckResult, name: str) -> CheckResult:
+    """The node of one function, wherever beneath the `lambda` node it hangs."""
+    return _node(leaf, name)
 
 
 # --- configuration --------------------------------------------------------
@@ -764,7 +877,8 @@ def test_an_unassumable_account_reddens_its_own_node_only() -> None:
 
 
 def test_an_account_publishes_its_own_title_about_and_config() -> None:
-    check = _build(accounts=[{"name": "backup", "title": "Backup (Ireland)",
+    check = _build(accounts=[{"name": "live"},
+                             {"name": "backup", "title": "Backup (Ireland)",
                               "about": "Off-site copies.",
                               "regions": ["eu-west-1"]}])
     _stub(check)
@@ -786,7 +900,7 @@ def test_the_root_report_is_the_configured_scope_not_the_reachable_one() -> None
 
 def _cloudwatch(check: AwsCheck, **stub: Any) -> CheckResult:
     _stub(check, **stub)
-    return _child(_child(run_check(check), "live"), CLOUDWATCH)
+    return _aspect(check, run_check(check), CLOUDWATCH)
 
 
 def test_an_alarm_becomes_one_coded_line_with_its_console_link() -> None:
@@ -983,7 +1097,7 @@ def test_a_deployment_can_extend_that_text_rather_than_replace_it() -> None:
     assert "composite alike" in about
 
 
-def test_one_declaration_serves_every_account_s_leaf_of_that_name() -> None:
+def test_one_declaration_serves_every_account_s_aspect_of_that_name() -> None:
     """The claim the reworded prose rests on.
 
     little-sister resolves a label once per subnode *name* and writes it wherever
@@ -1074,7 +1188,7 @@ def test_the_ignore_match_is_a_substring_and_case_insensitive() -> None:
 
 def _ec2(check: AwsCheck, **stub: Any) -> CheckResult:
     _stub(check, **stub)
-    return _child(_child(run_check(check), "live"), EC2)
+    return _aspect(check, run_check(check), EC2)
 
 
 def test_one_line_per_name_with_the_count() -> None:
@@ -1925,21 +2039,22 @@ def test_an_instance_computes_its_own_age_and_never_a_negative_one() -> None:
 
 def _lambda(check: AwsCheck, **stub: Any) -> CheckResult:
     _stub(check, **stub)
-    return _child(_child(run_check(check), "live"), LAMBDA)
+    return _aspect(check, run_check(check), LAMBDA)
 
 
 def _line(leaf: CheckResult, name: str) -> str:
-    for entry in leaf.reason:
-        if f"[{name}]" in entry.text:
-            return entry.text
-    raise AssertionError(f"no line for {name!r} in {[e.text for e in leaf.reason]}")
+    return str(_entry(leaf, name).text)
 
 
 def _entry(leaf: CheckResult, name: str) -> Any:
-    for entry in leaf.reason:
+    """The line that names *name*, on *leaf* or on a node beneath it — a function's
+    line stands on the function's own node (ADR-0006 §9)."""
+    lines = [entry for node in _nodes(leaf) for entry in node.reason_entries]
+    for entry in lines:
         if f"[{name}]" in entry.text:
             return entry
-    raise AssertionError(f"no entry for {name!r}")
+    raise AssertionError(
+        f"no line for {name!r} in {[entry.text for entry in lines]}")
 
 
 ONE_FUNCTION = {"eu-central-1": [["running-collector-lambda"]]}
@@ -2039,7 +2154,7 @@ def _paged_log_line(pages: list[tuple[list[str], str]]
                            {"errors": 0, "age": timedelta(minutes=1)}},
                   messages={"running-collector-lambda": None},
                   log_pages={"running-collector-lambda": pages})
-    leaf = _child(_child(run_check(check), "live"), LAMBDA)
+    leaf = _aspect(check, run_check(check), LAMBDA)
     sent = [token for session in built for name, token in session.log_tokens
             if name == "running-collector-lambda"]
     return _line(leaf, "running-collector-lambda"), sent
@@ -2094,8 +2209,7 @@ def test_an_ignored_function_is_skipped_by_its_whole_name() -> None:
          "ignore": True}]}}),
                    functions={"eu-central-1": [["running-collector-lambda",
                                                 "running-collector-lambda-v2"]]})
-    assert "[running-collector-lambda]" not in " ".join(_texts(leaf))
-    assert "running-collector-lambda-v2" in " ".join(_texts(leaf))
+    assert [node.name for node in leaf.children] == ["running-collector-lambda-v2"]
     assert "1 function in scope" in _texts(leaf)[-1]
 
 
@@ -2235,8 +2349,7 @@ def test_the_display_name_is_shortened_but_the_slug_is_not() -> None:
         {"from": "-reporter", "to": "-rp"}]}})
     leaf = _lambda(check, functions={
         "eu-central-1": [["running-collector-reporter-lambda"]]})
-    entry = leaf.reason[0]
-    assert "[collector-rp]" in entry.text
+    entry = _entry(leaf, "collector-rp")
     assert entry.slug == "eu-central-1-running-collector-reporter-lambda"
     assert "functions/running-collector-reporter-lambda" in entry.text
 
@@ -2245,33 +2358,37 @@ def test_shorten_rules_apply_in_order() -> None:
     check = _build(**{"lambda": {"shorten": [
         {"from": "load-", "to": "performance-"}, {"from": "performance-"}]}})
     leaf = _lambda(check, functions={"eu-central-1": [["load-runner"]]})
-    assert "[runner]" in leaf.reason[0].text
+    assert "[runner]" in _function(leaf, "load-runner").reason[0].text
 
 
 def test_a_name_shortened_to_nothing_still_has_a_label() -> None:
     check = _build(**{"lambda": {"shorten": [{"from": "gone"}]}})
     leaf = _lambda(check, functions={"eu-central-1": [["gone"]]})
-    assert "[(unnamed)]" in leaf.reason[0].text
+    assert "[(unnamed)]" in _function(leaf, "gone").reason[0].text
 
 
 def test_a_region_whose_functions_cannot_be_listed_is_its_own_warn_line() -> None:
-    check = _build(accounts=[{"name": "live", "role_arn": "arn:aws:iam::111:role/m",
-                              "regions": ["eu-central-1", "eu-west-1"]}])
-    leaf = _lambda(check, functions={"eu-central-1": [["survivor"]]},
-                   metrics={"survivor": {"errors": 0, "age": timedelta(minutes=1)}},
-                   lambda_unreadable={"eu-west-1"})
+    """Where the account reads one region, the region has no node, and the line
+    stays `lambda`'s own (ADR-0006 §9) — above the scope line, which counts
+    nothing."""
+    leaf = _lambda(_build(), lambda_unreadable={"eu-central-1"})
     assert leaf.reason[0].code is StatusCode.WARN
-    assert leaf.reason[0].text.startswith("eu-west-1: functions cannot be read")
-    assert "survivor" in " ".join(_texts(leaf))
+    assert leaf.reason[0].text.startswith("eu-central-1: functions cannot be read")
+    assert _texts(leaf)[-1] == "no functions in scope (eu-central-1)"
+    assert leaf.children == ()
 
 
-def test_the_worst_function_sorts_first_and_the_scope_line_last() -> None:
+def test_the_functions_stand_in_name_order_and_the_worst_one_reddens_its_own_node(
+        ) -> None:
     leaf = _lambda(_build(), functions={"eu-central-1": [["quiet", "loud"]]},
                    metrics={"quiet": {"errors": 0, "age": timedelta(minutes=1)},
                             "loud": {"errors": 9, "age": timedelta(minutes=1)}})
-    assert leaf.reason[0].code is StatusCode.ERROR
-    assert "loud" in leaf.reason[0].text
-    assert leaf.reason[-1].slug == "scope"
+    assert [node.name for node in leaf.children] == ["loud", "quiet"]
+    assert [node.stored_code for node in leaf.children] == [StatusCode.ERROR,
+                                                            StatusCode.OK]
+    # What is `lambda`'s own is its count, and that grades nothing.
+    assert [entry.slug for entry in leaf.reason] == ["scope"]
+    assert leaf.stored_code is StatusCode.OK
 
 
 def test_the_lambda_report_lists_the_full_names() -> None:
@@ -2285,7 +2402,7 @@ def test_the_lambda_report_lists_the_full_names() -> None:
         "?region=eu-central-1#/functions/running-a)"]
 
 
-def test_the_lambda_leaf_declares_its_own_display_text() -> None:
+def test_the_lambda_aspect_declares_its_own_display_text() -> None:
     labels = _build().subnode_labels[LAMBDA]
     assert labels["title"] == "Lambda functions"
     assert "`Errors` metric" in labels["about"]
@@ -2332,15 +2449,18 @@ def test_a_function_reading_defaults_to_nothing_known() -> None:
 
 def _pipelines(check: AwsCheck, **stub: Any) -> CheckResult:
     _stub(check, **stub)
-    return _child(_child(run_check(check), "live"), CODEPIPELINE)
+    return _aspect(check, run_check(check), CODEPIPELINE)
 
 
 def _execution(status: str = "Succeeded", *,
                started: timedelta | None = timedelta(hours=2),
+               updated: timedelta | None = None,
                eid: str = "") -> dict[str, Any]:
     row: dict[str, Any] = {"status": status}
     if started is not None:
         row["startTime"] = NOW - started
+    if updated is not None:
+        row["lastUpdateTime"] = NOW - updated
     if eid:
         row["pipelineExecutionId"] = eid
     return row
@@ -2565,7 +2685,8 @@ def test_list_pipelines_is_paginated() -> None:
     leaf = _pipelines(_build(), pipelines={"eu-central-1": [["one"], ["two"]]},
                       executions={"one": [_execution()],
                                   "two": [_execution()]})
-    assert {entry.slug for entry in leaf.reason} == {
+    assert [node.name for node in leaf.children] == ["one", "two"]
+    assert {entry.slug for node in _nodes(leaf) for entry in node.reason} == {
         "eu-central-1-one", "eu-central-1-two", "scope"}
 
 
@@ -2583,9 +2704,11 @@ def test_pipeline_names_can_be_ignored_case_insensitively() -> None:
                       pipelines={"eu-central-1": [["my-sandbox-deploy", "real"]]},
                       executions={"my-sandbox-deploy": [_execution("Failed")],
                                   "real": [_execution()]})
-    # Out of the lines *and* out of the count: an ignored pipeline is out of
+    # Out of the nodes *and* out of the count: an ignored pipeline is out of
     # scope, not a silent zero.
-    assert "sandbox" not in " ".join(_texts(leaf))
+    assert [node.name for node in leaf.children] == ["real"]
+    assert "sandbox" not in " ".join(
+        text for node in _nodes(leaf) for text in _texts(node))
     assert leaf.reason[-1].text.startswith("1 pipeline in scope")
 
 
@@ -2593,8 +2716,7 @@ def test_the_pipeline_display_name_is_shortened_but_the_slug_is_not() -> None:
     check = _build(shorten=[{"from": "-pipeline"}, {"from": "running-"}])
     leaf = _pipelines(check, pipelines={"eu-central-1": [["running-deploy-pipeline"]]},
                       executions={"running-deploy-pipeline": [_execution()]})
-    entry = leaf.reason[0]
-    assert "[deploy]" in entry.text
+    entry = _entry(leaf, "deploy")
     assert entry.slug == "eu-central-1-running-deploy-pipeline"
 
 
@@ -2603,44 +2725,60 @@ def test_the_pipeline_link_is_the_one_the_original_built() -> None:
                       executions={"a b": [_execution()]})
     assert ("[a b](https://eu-central-1.console.aws.amazon.com/codesuite"
             "/codepipeline/pipelines/a%20b/executions?region=eu-central-1)"
-            ) in leaf.reason[0].text
+            ) in _entry(leaf, "a b").text
 
 
-def test_the_region_is_in_the_pipeline_slug_but_not_in_a_single_region_line() -> None:
+def test_the_region_is_in_the_pipeline_slug_and_never_on_its_line() -> None:
+    """The line stands on the pipeline's own node, beneath its region's where the
+    account reads several, so the level says the region and the line does not
+    (ADR-0007 §3) — and the slug keeps it, as ADR-0001 has it."""
     leaf = _pipelines(_build(), pipelines=ONE_PIPELINE,
                       executions={"running-deploy": [_execution()]})
-    assert leaf.reason[0].slug == "eu-central-1-running-deploy"
-    assert not leaf.reason[0].text.startswith("eu-central-1 / ")
+    entry = _entry(leaf, "running-deploy")
+    assert entry.slug == "eu-central-1-running-deploy"
+    assert entry.text.startswith("[running-deploy](")
 
-
-def test_two_regions_put_the_region_on_the_pipeline_line() -> None:
     check = _build(accounts=[{"name": "live",
                               "role_arn": "arn:aws:iam::111:role/m",
                               "regions": ["eu-central-1", "eu-west-1"]}])
     leaf = _pipelines(check, pipelines={"eu-west-1": [["deploy"]]},
                       executions={"deploy": [_execution()]})
-    assert leaf.reason[0].text.startswith("eu-west-1 / [deploy]")
+    (line,) = _child(_child(leaf, "eu-west-1"), "deploy").reason
+    assert line.text.startswith("[deploy](")
+    assert line.slug == "eu-west-1-deploy"
 
 
-def test_a_region_whose_pipelines_cannot_be_read_is_its_own_warn_line() -> None:
+def test_a_region_whose_pipelines_cannot_be_read_says_so_where_it_stands() -> None:
+    """On `codepipeline` where the account reads one region, and on the region's
+    own node where it reads several — a WARN either way, under the slug it had."""
+    one = _pipelines(_one_account(), pipelines_unreadable={"eu-central-1"})
+    assert [(entry.slug, entry.code) for entry in one.reason] == [
+        ("read-eu-central-1", StatusCode.WARN), ("scope", StatusCode.OK)]
+    assert one.reason[0].text.startswith("eu-central-1: pipelines cannot be read")
+
     check = _build(accounts=[{"name": "live",
                               "role_arn": "arn:aws:iam::111:role/m",
                               "regions": ["eu-central-1", "eu-west-1"]}])
     leaf = _pipelines(check, pipelines={"eu-central-1": [["survivor"]]},
                       executions={"survivor": [_execution()]},
                       pipelines_unreadable={"eu-west-1"})
-    assert leaf.reason[0].code is StatusCode.WARN
-    assert leaf.reason[0].text.startswith("eu-west-1: pipelines cannot be read")
-    assert "survivor" in " ".join(_texts(leaf))
+    read, unread = leaf.children
+    assert [node.name for node in read.children] == ["survivor"]
+    assert (unread.name, unread.stored_code, unread.children) == (
+        "eu-west-1", StatusCode.WARN, ())
+    assert unread.reason[0].slug == "read-eu-west-1"
+    assert unread.reason[0].text.startswith("eu-west-1: pipelines cannot be read")
+    assert [entry.slug for entry in leaf.reason] == ["scope"]
 
 
-def test_the_worst_pipeline_sorts_first_and_the_scope_line_last() -> None:
+def test_the_pipelines_stand_in_name_order_and_the_worst_reddens_its_own_node(
+        ) -> None:
     leaf = _pipelines(_build(), pipelines={"eu-central-1": [["quiet", "loud"]]},
                       executions={"quiet": [_execution()],
                                   "loud": [_execution("Failed")]})
-    assert leaf.reason[0].code is StatusCode.ERROR
-    assert "loud" in leaf.reason[0].text
-    assert leaf.reason[-1].slug == "scope"
+    assert [(node.name, node.stored_code) for node in leaf.children] == [
+        ("loud", StatusCode.ERROR), ("quiet", StatusCode.OK)]
+    assert [entry.slug for entry in leaf.reason] == ["scope"]
 
 
 def test_an_account_with_no_pipelines_reads_ok() -> None:
@@ -2664,7 +2802,7 @@ def test_the_pipeline_report_lists_the_full_names() -> None:
         "/codepipeline/pipelines/running-b/executions?region=eu-central-1)"]
 
 
-def test_the_codepipeline_leaf_declares_its_own_display_text() -> None:
+def test_the_codepipeline_aspect_declares_its_own_display_text() -> None:
     labels = _build().subnode_labels[CODEPIPELINE]
     assert labels["title"] == "CodePipeline"
     assert "never been executed" in labels["about"]
@@ -2700,7 +2838,7 @@ def test_bad_codepipeline_settings_are_refused(block: dict[str, Any]) -> None:
 
 def _batch(check: AwsCheck, **stub: Any) -> CheckResult:
     _stub(check, **stub)
-    return _child(_child(run_check(check), "live"), BATCH)
+    return _aspect(check, run_check(check), BATCH)
 
 
 def _queue(name: str = "nightly", *, state: str = "ENABLED",
@@ -2851,7 +2989,8 @@ def test_every_reading_meets_on_one_line() -> None:
                                        started=timedelta(minutes=4))]],
         ("nightly", "RUNNABLE"): [[_job("etl", "RUNNABLE", job_id="j-w",
                                         created=timedelta(minutes=5))]]})
-    lines = [entry for entry in leaf.reason if "etl" in entry.text]
+    lines = [entry for node in _nodes(leaf) for entry in node.reason
+             if "etl" in entry.text]
     assert len(lines) == 1
     assert lines[0].text.endswith(
         ": SUCCEEDED 2h ago, ran 1h · 1 running (4m) · 1 waiting for capacity (5m)")
@@ -2866,8 +3005,11 @@ def test_one_line_per_job_name_not_per_submission() -> None:
                  started=timedelta(hours=2), stopped=timedelta(hours=1)),
             _job("report", job_id="j-3", created=timedelta(hours=2),
                  started=timedelta(hours=2), stopped=timedelta(hours=2))]]})
-    assert sorted(entry.slug for entry in leaf.reason) == [
-        "eu-central-1-nightly-etl", "eu-central-1-nightly-report", "scope"]
+    queue = _child(leaf, "nightly")
+    assert [(node.name, [entry.slug for entry in node.reason])
+            for node in queue.children] == [
+        ("etl", ["eu-central-1-nightly-etl"]),
+        ("report", ["eu-central-1-nightly-report"])]
 
 
 def test_the_same_job_name_in_two_queues_stays_two_pins() -> None:
@@ -2876,8 +3018,11 @@ def test_the_same_job_name_in_two_queues_stays_two_pins() -> None:
                                                    created=timedelta(hours=1))]],
                         ("b", "SUCCEEDED"): [[_job("etl", job_id="j-b",
                                                    created=timedelta(hours=1))]]})
-    assert sorted(entry.slug for entry in leaf.reason) == [
-        "eu-central-1-a-etl", "eu-central-1-b-etl", "scope"]
+    assert [(queue.name, [(node.name, node.reason[0].slug)
+                          for node in queue.children])
+            for queue in leaf.children] == [
+        ("a", [("etl", "eu-central-1-a-etl")]),
+        ("b", [("etl", "eu-central-1-b-etl")])]
 
 
 def test_an_empty_queue_warns_as_the_original_did() -> None:
@@ -2915,12 +3060,13 @@ def test_an_invalid_queue_reddens_and_carries_the_reason() -> None:
 
 
 def test_a_healthy_queue_with_jobs_gets_no_line_of_its_own() -> None:
-    """Its job lines already name it; a second line would double the card and
-    say nothing."""
+    """Its job names stand beneath it; a line of its own would say nothing."""
     leaf = _batch(_build(), queues=ONE_QUEUE, jobs={
         ("nightly", "SUCCEEDED"): [[_job("etl", created=timedelta(hours=1))]]})
-    assert [entry.slug for entry in leaf.reason] == [
-        "eu-central-1-nightly-etl", "scope"]
+    queue = _child(leaf, "nightly")
+    assert (queue.stored_code, _texts(queue)) == (StatusCode.OK, [])
+    assert [entry.slug for node in _nodes(leaf) for entry in node.reason] == [
+        "scope", "eu-central-1-nightly-etl"]
 
 
 def test_reaching_the_job_cap_is_said_out_loud() -> None:
@@ -2939,8 +3085,7 @@ def test_a_reading_inside_the_cap_says_nothing_about_it() -> None:
         ("nightly", "SUCCEEDED"): [[_job("etl", job_id=f"j-{n}",
                                          created=timedelta(hours=n + 1))
                                     for n in range(3)]]})
-    assert [entry.slug for entry in leaf.reason] == [
-        "eu-central-1-nightly-etl", "scope"]
+    assert _texts(_child(leaf, "nightly")) == []
 
 
 def test_job_names_can_be_ignored_case_insensitively() -> None:
@@ -2950,14 +3095,16 @@ def test_job_names_can_be_ignored_case_insensitively() -> None:
                                                     created=timedelta(hours=1))]],
                       ("nightly", "SUCCEEDED"): [[_job("etl",
                                                        created=timedelta(hours=1))]]})
-    assert "smoke" not in " ".join(_texts(leaf))
+    assert [node.name for node in _child(leaf, "nightly").children] == ["etl"]
+    assert "smoke" not in " ".join(
+        text for node in _nodes(leaf) for text in _texts(node))
     assert _entry(leaf, "etl").code is StatusCode.OK
 
 
 def test_a_queue_can_be_ignored_whole() -> None:
     leaf = _batch(_build(batch={"ignore_queue_patterns": ["scratch"]}),
                   queues={"eu-central-1": [[_queue("scratch-q"), _queue("real")]]})
-    assert "scratch" not in " ".join(_texts(leaf))
+    assert [node.name for node in leaf.children] == ["real"]
     assert leaf.reason[-1].text == "1 job queue in scope (eu-central-1)"
 
 
@@ -2992,15 +3139,26 @@ def test_the_job_link_is_a_job_id_and_never_an_arn() -> None:
             ) in _entry(leaf, "etl").text
 
 
-def test_a_region_whose_queues_cannot_be_read_is_its_own_warn_line() -> None:
+def test_a_region_whose_queues_cannot_be_read_says_so_where_it_stands() -> None:
+    """On `batch` where the account reads one region, and on the region's own node
+    where it reads several — a WARN either way, under the slug it had."""
+    one = _batch(_one_account(), batch_unreadable={"eu-central-1"})
+    assert [(entry.slug, entry.code) for entry in one.reason] == [
+        ("read-eu-central-1", StatusCode.WARN), ("scope", StatusCode.OK)]
+    assert one.reason[0].text.startswith("eu-central-1: job queues cannot be read")
+
     check = _build(accounts=[{"name": "live",
                               "role_arn": "arn:aws:iam::111:role/m",
                               "regions": ["eu-central-1", "eu-west-1"]}])
     leaf = _batch(check, queues={"eu-central-1": [[_queue("survivor")]]},
                   batch_unreadable={"eu-west-1"})
-    assert leaf.reason[0].code is StatusCode.WARN
-    assert leaf.reason[0].text.startswith("eu-west-1: job queues cannot be read")
-    assert "survivor" in " ".join(_texts(leaf))
+    read, unread = leaf.children
+    assert [node.name for node in read.children] == ["survivor"]
+    assert (unread.name, unread.stored_code, unread.children) == (
+        "eu-west-1", StatusCode.WARN, ())
+    assert unread.reason[0].slug == "read-eu-west-1"
+    assert unread.reason[0].text.startswith("eu-west-1: job queues cannot be read")
+    assert [entry.slug for entry in leaf.reason] == ["scope"]
 
 
 def test_an_account_with_no_job_queues_reads_ok() -> None:
@@ -3009,14 +3167,16 @@ def test_an_account_with_no_job_queues_reads_ok() -> None:
     assert leaf.reason[-1].text == "no job queues in scope (eu-central-1)"
 
 
-def test_the_worst_batch_line_sorts_first_and_the_scope_line_last() -> None:
+def test_the_job_names_stand_in_name_order_and_the_worst_reddens_its_own_node(
+        ) -> None:
     leaf = _batch(_build(), queues=ONE_QUEUE, jobs={
         ("nightly", "SUCCEEDED"): [[_job("quiet", created=timedelta(hours=1))]],
         ("nightly", "FAILED"): [[_job("loud", "FAILED",
                                       created=timedelta(hours=1))]]})
-    assert leaf.reason[0].code is StatusCode.ERROR
-    assert "loud" in leaf.reason[0].text
-    assert leaf.reason[-1].slug == "scope"
+    assert [(node.name, node.stored_code)
+            for node in _child(leaf, "nightly").children] == [
+        ("loud", StatusCode.ERROR), ("quiet", StatusCode.OK)]
+    assert [entry.slug for entry in leaf.reason] == ["scope"]
 
 
 def test_the_batch_report_lists_the_queues_and_how_many_job_names() -> None:
@@ -3042,7 +3202,7 @@ def test_the_config_card_spells_out_a_rule_that_only_strips() -> None:
     assert "-pipeline (dropped)" in summary
 
 
-def test_the_batch_leaf_declares_its_own_display_text() -> None:
+def test_the_batch_aspect_declares_its_own_display_text() -> None:
     labels = _build().subnode_labels[BATCH]
     assert labels["title"] == "AWS Batch"
     assert "waiting for capacity" in labels["about"]
@@ -3295,7 +3455,8 @@ def test_a_profile_only_account_is_read_through_the_profile_itself() -> None:
     result = run_check(check)
     assert sts.calls == []                       # nothing to assume
     assert _profiles(built) == [PRIMARY]          # one session, and it is the profile's
-    assert _child(result, "live").code is StatusCode.OK
+    # Read: the one account's aspects hang beneath the check's own node.
+    assert [child.name for child in result.children] == list(AwsCheck.ASPECTS)
 
 
 def test_a_profile_only_account_proves_its_credentials_before_the_aspects() -> None:
@@ -3323,7 +3484,7 @@ def test_the_account_card_names_the_profile_and_the_role_together() -> None:
 
 
 def test_the_account_card_of_a_profile_only_account_names_the_profile() -> None:
-    check = _build(profile=PRIMARY, accounts=[{"name": "live"}])
+    check = _build(profile=PRIMARY, accounts=[{"name": "live"}, {"name": "other"}])
     _stub(check)
     assert f"profile {PRIMARY}" in _child(run_check(check), "live").config
 
@@ -3337,7 +3498,8 @@ def test_config_summary_names_the_profile_and_its_overrides() -> None:
 
 
 def test_config_summary_names_per_account_profiles_without_a_default() -> None:
-    check = _build(accounts=[{"name": "live", "profile": SECONDARY}])
+    check = _build(accounts=[{"name": "live", "profile": SECONDARY},
+                             {"name": "other"}])
     assert f"per-account profiles: {SECONDARY}" in check.config_summary()
 
 
@@ -3475,6 +3637,10 @@ def _forget_logins() -> None:
 
 
 # --- the check renews, once, and reads the account on the retry -----------
+#
+# Most of the checks below name one account, which has no node of its own: what
+# refused it is said on the check's node, and its aspects hang there once it is
+# read (ADR-0007 §2).
 
 def _sso(check: AwsCheck, problem: str = "") -> list[tuple[str, int]]:
     """Replace the one place a subprocess is started; record the attempts."""
@@ -3494,10 +3660,10 @@ def test_an_expired_login_is_renewed_and_the_account_read_on_the_retry() -> None
                               "role_arn": "arn:aws:iam::111:role/monitoring"}])
     _stub(check, _FakeSts(expire=1))
     attempts = _sso(check)
-    live = _child(run_check(check), "live")
+    node = run_check(check)
     assert attempts == [(PRIMARY, 120)]
-    assert live.code is StatusCode.OK
-    assert [child.name for child in live.children] == [
+    assert node.code is StatusCode.UNDEFINED
+    assert [child.name for child in node.children] == [
         CLOUDWATCH, EC2, LAMBDA, CODEPIPELINE, BATCH]
 
 
@@ -3507,11 +3673,11 @@ def test_a_renewal_that_does_not_help_reddens_the_account_with_the_command() -> 
                               "role_arn": "arn:aws:iam::111:role/monitoring"}])
     _stub(check, _FakeSts(expire=9))
     _sso(check)
-    live = _child(run_check(check), "live")
-    assert live.code is StatusCode.ERROR
-    assert "AWS credentials have expired" in _texts(live)[0]
-    assert f"`aws sso login --profile {PRIMARY}`" in _texts(live)[1]
-    assert "still refused" in _texts(live)[1]
+    node = run_check(check)
+    assert node.code is StatusCode.ERROR
+    assert "AWS credentials have expired" in _texts(node)[0]
+    assert f"`aws sso login --profile {PRIMARY}`" in _texts(node)[1]
+    assert "still refused" in _texts(node)[1]
 
 
 def test_a_login_that_cannot_run_here_is_the_second_line_of_the_node() -> None:
@@ -3520,9 +3686,9 @@ def test_a_login_that_cannot_run_here_is_the_second_line_of_the_node() -> None:
                               "role_arn": "arn:aws:iam::111:role/monitoring"}])
     _stub(check, _FakeSts(expire=9))
     attempts = _sso(check)
-    live = _child(run_check(check), "live")
+    node = run_check(check)
     assert attempts == []               # nothing shelled out
-    assert _texts(live)[1] == (
+    assert _texts(node)[1] == (
         f"renew it with `aws sso login --profile {PRIMARY}` — "
         "automatic login is off (`sso: login: never`)")
 
@@ -3534,10 +3700,10 @@ def test_without_a_profile_nothing_advises_running_aws_sso_login() -> None:
                               "role_arn": "arn:aws:iam::111:role/monitoring"}])
     _stub(check, _FakeSts(expire=9))
     attempts = _sso(check)
-    live = _child(run_check(check), "live")
+    node = run_check(check)
     assert attempts == []
-    assert "aws sso login" not in _texts(live)[1]
-    assert "no profile is configured" in _texts(live)[1]
+    assert "aws sso login" not in _texts(node)[1]
+    assert "no profile is configured" in _texts(node)[1]
 
 
 def test_a_refusal_is_reported_rather_than_renewed() -> None:
@@ -3547,9 +3713,9 @@ def test_a_refusal_is_reported_rather_than_renewed() -> None:
                               "role_arn": "arn:aws:iam::111:role/monitoring"}])
     _stub(check, _FakeSts(refuse={"arn:aws:iam::111:role/monitoring"}))
     attempts = _sso(check)
-    live = _child(run_check(check), "live")
+    node = run_check(check)
     assert attempts == []
-    assert _texts(live) == ["role cannot be assumed: An error occurred "
+    assert _texts(node) == ["role cannot be assumed: An error occurred "
                             "(AccessDenied) when calling the AssumeRole "
                             "operation: not allowed"]
 
@@ -3559,9 +3725,9 @@ def test_a_profile_only_account_that_is_refused_is_not_a_role_problem() -> None:
     this account does not have."""
     check = _build(profile=PRIMARY, accounts=[{"name": "live"}])
     _stub(check, _FakeSts(deny_identity=True))
-    live = _child(run_check(check), "live")
-    assert live.code is StatusCode.ERROR
-    assert _texts(live)[0].startswith("account cannot be read:")
+    node = run_check(check)
+    assert node.code is StatusCode.ERROR
+    assert _texts(node)[0].startswith("account cannot be read:")
 
 
 def test_two_stale_accounts_of_one_profile_share_one_login() -> None:
@@ -3587,9 +3753,9 @@ def test_auto_asks_the_machine_first(monkeypatch: pytest.MonkeyPatch) -> None:
     check._profile_config = lambda profile: {}      # type: ignore[method-assign]
     _stub(check, _FakeSts(expire=9))
     attempts = _sso(check)
-    live = _child(run_check(check), "live")
+    node = run_check(check)
     assert attempts == []
-    assert f"profile {PRIMARY} is not an SSO profile" in _texts(live)[1]
+    assert f"profile {PRIMARY} is not an SSO profile" in _texts(node)[1]
 
 
 def test_auto_logs_in_on_a_machine_that_can(
@@ -3606,7 +3772,7 @@ def test_auto_logs_in_on_a_machine_that_can(
         monkeypatch.delenv(marker, raising=False)
     _stub(check, _FakeSts(expire=1))
     attempts = _sso(check)
-    assert _child(run_check(check), "live").code is StatusCode.OK
+    assert run_check(check).children       # read, on the retry
     assert attempts == [(PRIMARY, 120)]
 
 
@@ -3774,8 +3940,7 @@ def test_a_readable_run_logs_nothing_of_the_kind(
     _stub(check, alarms={"eu-central-1": [[_alarm("api-5xx")]]})
     with caplog.at_level(logging.ERROR, logger="little_sister_aws.aws"):
         result = run_check(check)
-    live = _child(result, "live")
-    burning = [entry for child in live.children for entry in child.reason
+    burning = [entry for child in result.children for entry in child.reason
                if entry.code is StatusCode.ERROR]
     assert burning, "the run has to grade something badly, or this proves nothing"
     assert _unreadable_lines(caplog) == []
@@ -4043,7 +4208,7 @@ def test_a_subject_past_what_one_may_hold_is_its_kind_and_a_digest() -> None:
 
 
 def test_the_parts_of_a_subject_split_back_on_the_slash() -> None:
-    """`/` is the one character an account name — a node segment — cannot hold,
+    """`/` is the one character an account name — a node segment — must not hold,
     and AWS refuses it in regions, queue, job and pipeline names."""
     readings = _readings(_build(accounts=[{"name": "a:b;c=d",
                                            "role_arn": ROLE_LIVE}]),
@@ -4169,18 +4334,16 @@ def test_an_account_s_failure_text_lives_in_its_own_reading() -> None:
 
 def test_what_spares_no_request_is_read_and_left_to_the_grading() -> None:
     """ADR-0005 §2: an ignore list that saves no call only chooses what is said —
-    the ignored alarm, the terminated box and the hidden job name are readings."""
-    check = _one_account(batch={"ignore_name_patterns": ["etl"]})
+    the ignored alarm and the terminated box are readings."""
+    check = _one_account()
     readings = _readings(check, **EVERY_ASPECT)
     assert "TargetTracking-x" in {reading.record["name"]
                                   for reading in _kind(readings, "alarm")}
     assert "terminated" in {reading.record["state"]
                             for reading in _kind(readings, "instance")}
-    assert {reading.record["name"] for reading in _kind(readings, "job")} == {"etl"}
-    live = _child(run_check(check, measurements=readings), "live")
+    result = run_check(check, measurements=readings)
     assert not any("TargetTracking" in text
-                   for text in _texts(_child(live, CLOUDWATCH)))
-    assert not any("[etl]" in text for text in _texts(_child(live, BATCH)))
+                   for text in _texts(_child(result, CLOUDWATCH)))
 
 
 def test_what_spares_a_request_is_decided_while_reading() -> None:
@@ -4240,7 +4403,7 @@ def test_a_region_that_could_not_be_read_carries_its_reading() -> None:
     taken = measured(check)
     (unreadable,) = [reading for reading in _kind(taken, "unreadable")
                      if reading.record["aspect"] == CLOUDWATCH]
-    leaf = _child(_child(run_check(check, measurements=taken), "live"), CLOUDWATCH)
+    leaf = _aspect(check, run_check(check, measurements=taken), CLOUDWATCH)
     (line,) = [entry for entry in leaf.reason if entry.slug == "read-eu-central-1"]
     assert line.data == dict(unreadable.record)
     assert unreadable.record["error"].endswith("no cloudwatch")
@@ -4252,7 +4415,7 @@ def test_free_text_is_clipped_once_and_the_line_says_what_the_record_keeps() -> 
     taken = measured(check)
     (alarm,) = _kind(taken, "alarm")
     assert alarm.record["description"] == "x" * 300
-    leaf = _child(_child(run_check(check, measurements=taken), "live"), CLOUDWATCH)
+    leaf = _aspect(check, run_check(check, measurements=taken), CLOUDWATCH)
     assert _entry(leaf, "api").text.endswith(" — " + "x" * 300)
 
 
@@ -4287,7 +4450,8 @@ def test_the_heaviest_reading_of_each_kind_fits_the_default_record_limit(
         "instances": {"eu-central-1": [[_instance(
             EMOJI * 256, instance_id="i-" + "f" * 17, up=timedelta(days=3))]]},
         "functions": {"eu-central-1": [["f" * 64]]},
-        "metrics": {"f" * 64: {"errors": 999, "age": timedelta(minutes=1)}},
+        "metrics": {"f" * 64: {"errors": 999_999, "age": timedelta(minutes=1),
+                               "invocations": 999_999, "duration": 900_000.0}},
         "pipelines": {"eu-central-1": [["p" * 100]]},
         "executions": {"p" * 100: [_execution("InProgress",
                                               eid="00000000-0000-4000-8000-000000000000")]},
@@ -4298,7 +4462,7 @@ def test_the_heaviest_reading_of_each_kind_fits_the_default_record_limit(
                    stopped=timedelta(hours=1)),
             "statusReason": EMOJI * 1024}]]},
     }
-    readings = _readings(_build(accounts=[
+    readings = _readings(_build(series_keep=1, accounts=[
         {"name": "live", "role_arn": ROLE_LIVE}]), **heavy)
     refused = _readings(_one_account(profile=PRIMARY, sso={"login": "never"}),
                         _Wordy())
@@ -4313,8 +4477,11 @@ def test_the_heaviest_reading_of_each_kind_fits_the_default_record_limit(
     assert _kind(expired, "account")[0].record["outcome"] == "expired"
     assert _kind(readings, "function")[0].record["log_error"]
     assert set(weights) == {"estate", "account", "alarm", "instance", "function",
-                            "pipeline", "queue", "job"}
+                            "run", "pipeline", "queue", "job"}
     assert max(weights.values()) <= 2048, weights
+    # A run's record is small, so the heaviest of the others stays the heaviest
+    # (ADR-0006).
+    assert weights["run"] < 300 < weights["alarm"], weights
 
 
 def test_a_log_that_cannot_be_read_says_what_aws_answered(
@@ -4335,7 +4502,7 @@ def test_a_log_that_cannot_be_read_says_what_aws_answered(
             "DescribeLogStreams operation: no logs")
     assert function.record["log_error"] == said
     assert function.record["log_status"] is None
-    leaf = _child(_child(run_check(check, measurements=taken), "live"), LAMBDA)
+    leaf = _aspect(check, run_check(check, measurements=taken), LAMBDA)
     assert _entry(leaf, "running-collector-lambda").text.endswith(
         f" · log unreadable: {said}")
 
@@ -4378,3 +4545,2482 @@ def test_a_control_character_in_an_account_name_is_digested_not_refused() -> Non
     check = _build(accounts=[{"name": "live\u0007"}])
     assert check.subject.startswith("accounts/sha256:")
     assert _readings(check)[0].state.startswith("sha256:")
+
+
+# --- a function's runs (ADR-0006) -----------------------------------------------
+#
+# Each test below is one sentence of ADR-0006, with values that make the sentence
+# false if the code is wrong. What a check keeps of a function is bound here and no
+# engine runs: a type's own test stands in the engine's place (little-sister
+# ADR-0113 decision 4).
+
+#: The one function most of these tests read, as a subject spells it.
+COLLECTOR = "lambda/live/eu-central-1/collector"
+ONE_COLLECTOR = {"eu-central-1": [["collector"]]}
+
+
+def _point(age: timedelta, errors: int = 0, invocations: int = 1,
+           duration: float = 100.0) -> dict[str, Any]:
+    """One one-minute bucket of a function's fixture, by how long ago it began."""
+    return {"age": age, "errors": errors, "invocations": invocations,
+            "duration": duration}
+
+
+def _stamp(age: timedelta) -> str:
+    """An instant as a record keeps it — the way the seam writes one."""
+    return (NOW - age).isoformat().replace("+00:00", "Z")
+
+
+def _keeping(check: AwsCheck,
+             kept: Mapping[str, Sequence[timedelta | tuple[timedelta, timedelta]]]
+             | None = None) -> list[str]:
+    """Bind what *check* finds kept — each subject's runs, by their ages, each
+    read just now or, given as a pair, that long ago — and answer the list every
+    subject it asks for lands in."""
+    held = kept or {}
+    asked: list[str] = []
+
+    def reader(subject: str) -> tuple[SeriesRecord, ...]:
+        asked.append(subject)
+        runs = [run if isinstance(run, tuple) else (run, timedelta(0))
+                for run in held.get(subject, ())]
+        return tuple(SeriesRecord({"at": _stamp(age)}, NOW - read, _stamp(age))
+                     for age, read in sorted(runs, reverse=True))
+
+    check.bind_kept(reader)
+    return asked
+
+
+def _poll(check: AwsCheck, built: list[_FakeSession]
+          ) -> tuple[tuple[Measurement, ...], list[dict[str, Any]]]:
+    """One poll of *check*: what it read, and every ``get_metric_data`` call it
+    made — the metrics and statistics it asked, at which period, of which
+    functions, over which window, and the token it sent."""
+    before = len(built)
+    readings = measured(check)
+    calls = []
+    for session in built[before:]:
+        for queries, (start, end, token) in zip(session.metric_calls,
+                                                session.metric_windows,
+                                                strict=True):
+            stats = [query["MetricStat"] for query in queries]
+            calls.append({
+                "asked": {(stat["Metric"]["MetricName"], stat["Stat"],
+                           stat["Period"]) for stat in stats},
+                "functions": list(dict.fromkeys(
+                    stat["Metric"]["Dimensions"][0]["Value"] for stat in stats)),
+                "queries": len(queries), "span": end - start, "end": end,
+                "token": token})
+    return readings, calls
+
+
+def _at(readings: tuple[Measurement, ...]) -> list[str]:
+    """The buckets the runs among *readings* are of, in the order they were read."""
+    return [str(run.record["at"]) for run in _kind(readings, "run")]
+
+
+ERRORS = {("Errors", "Sum", 60)}
+IN_FULL = {("Invocations", "Sum", 60), ("Duration", "Maximum", 60)}
+HOUR, DAY, FIFTEEN_DAYS = timedelta(hours=1), timedelta(days=1), timedelta(days=15)
+
+
+def test_every_minute_a_function_was_invoked_in_is_one_run() -> None:
+    """ADR-0006 §1 and §2: a run is a one-minute bucket and a record of its own —
+    its invocations, its errors, and `duration_ms`, the slowest invocation of the
+    minute as a whole number of milliseconds."""
+    check = _one_account(series_keep=30)
+    _keeping(check)
+    readings = _readings(check, functions=ONE_COLLECTOR, metrics={"collector": {
+        "runs": [_point(timedelta(minutes=3), duration=120.4),
+                 _point(timedelta(minutes=2), errors=2, invocations=3,
+                        duration=1234.6)]}})
+    shared = {"aspect": LAMBDA, "kind": "run", "account": "live",
+              "region": "eu-central-1", "name": "collector"}
+    assert [dict(run.record) for run in _kind(readings, "run")] == [
+        {**shared, "at": "2026-08-10T11:57:00Z", "invocations": 1, "errors": 0,
+         "duration_ms": 120},
+        {**shared, "at": "2026-08-10T11:58:00Z", "invocations": 3, "errors": 2,
+         "duration_ms": 1235}]
+
+
+def test_a_run_names_its_function_and_the_start_of_its_bucket() -> None:
+    """§1: the subject is the function, spelled as ADR-0005 §4 spells one, and the
+    event is the bucket's start as the record keeps it — so a bucket read again is
+    the record it was."""
+    check = _one_account(series_keep=30)
+    _keeping(check)
+    built = _stub(check, functions=ONE_COLLECTOR, metrics={"collector": {
+        "runs": [_point(timedelta(minutes=3)), _point(timedelta(minutes=2))]}})
+    first, _ = _poll(check, built)
+    again, _ = _poll(check, built)
+    runs = _kind(first, "run")
+    assert [(run.subject, run.identity) for run in runs] == [
+        (COLLECTOR, "2026-08-10T11:57:00Z"), (COLLECTOR, "2026-08-10T11:58:00Z")]
+    assert all(run.identity == run.record["at"] and not run.state for run in runs)
+    assert [(run.subject, run.identity) for run in _kind(again, "run")] == [
+        (run.subject, run.identity) for run in runs]
+
+
+def test_the_function_s_reading_stays_what_it_is_and_names_no_subject() -> None:
+    """§2: asked on every poll and written as it always was — the newest bucket's
+    errors and its time, and the log's status word — with no history of its own,
+    and its runs behind it."""
+    check = _one_account(series_keep=30)
+    _keeping(check)
+    readings = _readings(
+        check, functions={"eu-central-1": [["collector", "idle"]]},
+        metrics={"collector": {"runs": [_point(timedelta(minutes=3)),
+                                        _point(timedelta(minutes=2), errors=2)]}},
+        messages={"collector": "REPORT RequestId: 1"})
+    function = _kind(readings, "function")[0]
+    assert dict(function.record) == {
+        "aspect": LAMBDA, "kind": "function", "account": "live",
+        "region": "eu-central-1", "name": "collector", "errors": 2,
+        "at": "2026-08-10T11:58:00Z", "log_status": "REPORT", "log_note": None,
+        "log_error": None}
+    assert (function.subject, function.identity, function.state) == ("", "", "")
+    assert [(reading.record["kind"], reading.record["name"])
+            for reading in readings if reading.record["aspect"] == LAMBDA] == [
+        ("function", "collector"), ("run", "collector"), ("run", "collector"),
+        ("function", "idle")]
+
+
+def test_with_a_series_kept_a_function_s_runs_are_a_fourth_history() -> None:
+    """§1 amends ADR-0005 §3: beside a Batch job's runs, a pipeline's executions
+    and the estate, a function's runs name a subject — and its own reading still
+    names none."""
+    check = _one_account(series_keep=30)
+    _keeping(check)
+    readings = _readings(check, **{**EVERY_ASPECT, "metrics": {"collector": {
+        "runs": [_point(timedelta(minutes=5))]}}})
+    assert {reading.record["kind"] for reading in readings if reading.subject} == {
+        "estate", "pipeline", "job", "run"}
+    assert {run.subject for run in _kind(readings, "run")} == {COLLECTOR}
+
+
+def test_where_a_check_keeps_no_series_no_history_is_asked_for() -> None:
+    """§3: the aspect reads what it always read — one call, the fifteen days — and
+    not even what was kept."""
+    check = _one_account()
+    asked = _keeping(check, {COLLECTOR: [timedelta(hours=2)]})
+    built = _stub(check, functions=ONE_COLLECTOR, metrics={"collector": {
+        "runs": [_point(timedelta(hours=2)), _point(timedelta(minutes=2))]}})
+    readings, calls = _poll(check, built)
+    assert _kind(readings, "run") == []
+    assert asked == []
+    assert [(call["asked"], call["span"], call["end"]) for call in calls] == [
+        (ERRORS, FIFTEEN_DAYS, NOW)]
+
+
+@pytest.mark.parametrize(("oldest", "window"), [
+    (timedelta(minutes=59), HOUR),
+    (timedelta(hours=1), HOUR),
+    (timedelta(hours=1, minutes=1), DAY),
+    (timedelta(days=1), DAY),
+    (timedelta(days=1, minutes=1), FIFTEEN_DAYS),
+    (timedelta(days=40), FIFTEEN_DAYS),
+])
+def test_a_function_is_asked_in_the_smallest_window_that_reaches_its_kept_runs(
+        oldest: timedelta, window: timedelta) -> None:
+    """§3: the last hour, the last day or the fifteen days — the smallest of the
+    three that reaches the oldest run of a series that is full."""
+    check = _one_account(series_keep=2)
+    _keeping(check, {COLLECTOR: [oldest, timedelta(minutes=30)]})
+    built = _stub(check, functions=ONE_COLLECTOR, metrics={"collector": {
+        "runs": [_point(timedelta(minutes=30))]}})
+    _, calls = _poll(check, built)
+    assert (calls[0]["asked"], calls[0]["span"], calls[0]["end"]) == (
+        ERRORS, window, NOW)
+
+
+def test_a_function_whose_kept_runs_do_not_fill_the_series_is_asked_the_fifteen_days(
+        ) -> None:
+    """§3: two runs of three, both inside the last hour — and the hour is not
+    enough, because the series has room for a run the hour does not hold."""
+    check = _one_account(series_keep=3)
+    _keeping(check, {COLLECTOR: [timedelta(minutes=30), timedelta(minutes=20)]})
+    built = _stub(check, functions=ONE_COLLECTOR, metrics={"collector": {
+        "runs": [_point(timedelta(minutes=20))]}})
+    _, calls = _poll(check, built)
+    assert calls[0]["span"] == FIFTEEN_DAYS
+
+
+def test_a_region_s_functions_are_asked_in_one_call_for_each_window() -> None:
+    """§3: one call has one window, so at most three first calls — and a second
+    call holds the functions of one window and asks from the oldest bucket it is to
+    read, not from where that window began."""
+    check = _one_account(series_keep=1)
+    subject = "lambda/live/eu-central-1/"
+    _keeping(check, {subject + "busy": [timedelta(minutes=10)],
+                     subject + "hourly": [timedelta(hours=5)],
+                     subject + "daily": [timedelta(days=3)]})
+    built = _stub(
+        check, functions={"eu-central-1": [["busy", "daily", "fresh", "hourly"]]},
+        metrics={"busy": _point(timedelta(minutes=10)),
+                 "hourly": _point(timedelta(hours=5)),
+                 "daily": _point(timedelta(days=3)),
+                 "fresh": _point(timedelta(days=2))})
+    readings, calls = _poll(check, built)
+    first = [(HOUR, ["busy"]), (DAY, ["hourly"]), (FIFTEEN_DAYS, ["daily", "fresh"])]
+    second = [(timedelta(minutes=10), ["busy"]), (timedelta(hours=5), ["hourly"]),
+              (timedelta(days=3), ["daily", "fresh"])]
+    assert [(call["asked"], call["span"], call["functions"]) for call in calls] == [
+        *((ERRORS, span, names) for span, names in first),
+        *((IN_FULL, span, names) for span, names in second)]
+    # Every function of a call is read from there: the oldest bucket decides.
+    assert [(run.record["name"], run.record["invocations"])
+            for run in _kind(readings, "run")] == [
+        ("busy", 1), ("daily", 1), ("fresh", 1), ("hourly", 1)]
+
+
+def test_a_window_ends_where_the_period_the_poll_falls_in_began(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """So that its newest bucket is a whole one, at every period: half past seven
+    minutes past the hour, the minute's window ends at seven past, the
+    five-minute one at five past and the hourly one on the hour."""
+    monkeypatch.setattr(aws_module, "_utcnow",
+                        lambda: NOW + timedelta(minutes=7, seconds=30))
+    check = _one_account()
+    built = _stub(check, functions=ONE_COLLECTOR)
+    _, calls = _poll(check, built)
+    assert [call["end"] - NOW for call in calls] == [
+        timedelta(minutes=7), timedelta(minutes=5), timedelta(0)]
+    assert [call["span"] for call in calls] == [
+        FIFTEEN_DAYS, timedelta(days=63), timedelta(days=455)]
+
+
+def test_a_second_call_holds_half_as_many_functions_as_a_first() -> None:
+    """Two queries a function against the five hundred a call takes."""
+    names = [f"fn-{n:03d}" for n in range(251)]
+    check = _one_account(series_keep=1)
+    _keeping(check)
+    built = _stub(check, functions={"eu-central-1": [names]},
+                  metrics={name: _point(timedelta(minutes=2)) for name in names})
+    readings, calls = _poll(check, built)
+    assert [(call["asked"], call["queries"]) for call in calls] == [
+        (ERRORS, 251), (IN_FULL, 500), (IN_FULL, 2)]
+    assert len(_kind(readings, "run")) == 251
+
+
+def test_a_poll_reads_in_full_the_buckets_its_history_lacks() -> None:
+    """§3: a bucket the kept runs lack is read in full, and one they hold — once
+    it is older than the overlap — is not."""
+    hours = [timedelta(hours=n) for n in (5, 4, 3, 2)]
+    check = _one_account(series_keep=5)
+    _keeping(check, {COLLECTOR: hours[:3]})
+    built = _stub(check, functions=ONE_COLLECTOR, metrics={"collector": {
+        "runs": [_point(age) for age in hours]}})
+    _poll(check, built)                 # the first poll after a start is its own
+    readings, _ = _poll(check, built)
+    assert _at(readings) == [_stamp(timedelta(hours=2))]
+
+
+def test_a_bucket_is_read_again_while_it_is_younger_than_an_hour() -> None:
+    """§4: its numbers may still grow, so a bucket younger than an hour is read in
+    full on every poll although it is kept — and one a poll has read an hour old
+    no longer."""
+    ages = [timedelta(minutes=n) for n in (61, 60, 59)]
+    check = _one_account(series_keep=5)
+    _keeping(check, {COLLECTOR: ages})
+    built = _stub(check, functions=ONE_COLLECTOR, metrics={"collector": {
+        "runs": [_point(age) for age in ages]}})
+    _poll(check, built)
+    readings, _ = _poll(check, built)
+    assert _at(readings) == [_stamp(timedelta(minutes=59))]
+
+
+@pytest.mark.parametrize(("age", "read", "again"), [
+    # Last read two minutes after it began, an hour ago: a poll every hour, or a
+    # login that expired in between.
+    (timedelta(minutes=62), timedelta(minutes=60), True),
+    (timedelta(hours=5), timedelta(hours=4, minutes=1), True),
+    # Last read an hour after it began, to the minute: that read was the last.
+    (timedelta(hours=5), timedelta(hours=4), False),
+    (timedelta(minutes=62), timedelta(minutes=1), False),
+])
+def test_what_counts_is_how_old_a_bucket_was_when_it_was_last_read(
+        age: timedelta, read: timedelta, again: bool) -> None:
+    """§4: a bucket is read again until a poll has read it an hour old — by what
+    its kept run says, and not by how old it is now. A poll that comes an hour
+    after the last one still reads again what that one saw young, where a rule by
+    the bucket's age would have kept its first numbers until the process started
+    anew."""
+    check = _one_account(series_keep=5)
+    _keeping(check, {COLLECTOR: [(age, read)]})
+    built = _stub(check, functions=ONE_COLLECTOR, metrics={"collector": {
+        "runs": [_point(age, errors=1, invocations=2)]}})
+    _poll(check, built)                 # the first poll after a start is its own
+    readings, _ = _poll(check, built)
+    assert [(run.record["at"], run.record["invocations"], run.record["errors"])
+            for run in _kind(readings, "run")] == (
+        [(_stamp(age), 2, 1)] if again else [])
+
+
+def test_a_poll_reads_no_bucket_its_series_would_not_keep() -> None:
+    """§3: of the buckets its kept runs lack, the newest and as many as the series
+    keeps — an older one would leave the series the moment it was kept."""
+    hours = [timedelta(hours=n) for n in (5, 4, 3, 2)]
+    check = _one_account(series_keep=2)
+    _keeping(check)
+    readings = _readings(check, functions=ONE_COLLECTOR, metrics={"collector": {
+        "runs": [_point(age) for age in hours]}})
+    assert _at(readings) == [_stamp(timedelta(hours=3)), _stamp(timedelta(hours=2))]
+
+
+def test_a_function_with_nothing_new_costs_the_one_metric_it_always_cost() -> None:
+    """§2: `Invocations` and `Duration` are asked only of a function that has a
+    run to read. This one's series is full of its two newest buckets, and the two
+    older ones CloudWatch still answers are no reason to ask: they would leave the
+    series at once."""
+    hours = [timedelta(hours=n) for n in (5, 4, 3, 2)]
+    check = _one_account(series_keep=2)
+    _keeping(check, {COLLECTOR: hours[2:]})
+    built = _stub(check, functions=ONE_COLLECTOR, metrics={"collector": {
+        "runs": [_point(age) for age in hours]}})
+    _poll(check, built)
+    readings, calls = _poll(check, built)
+    assert _at(readings) == []
+    assert [(call["asked"], call["queries"]) for call in calls] == [(ERRORS, 1)]
+
+
+def test_a_run_is_read_in_full_by_a_second_call_of_the_functions_that_have_one(
+        ) -> None:
+    """§2 and §5: the second call asks `Invocations` and the `Maximum` of
+    `Duration`, at the one-minute period, of the function that ran and of no
+    other."""
+    old = [timedelta(hours=3), timedelta(hours=2)]
+    check = _one_account(series_keep=2)
+    _keeping(check, {"lambda/live/eu-central-1/idle": old})
+    built = _stub(check, functions={"eu-central-1": [["idle", "ran"]]},
+                  metrics={"idle": {"runs": [_point(age) for age in old]},
+                           "ran": {"runs": [_point(timedelta(hours=2))]}})
+    _poll(check, built)
+    readings, calls = _poll(check, built)
+    assert [(call["asked"], call["functions"]) for call in calls] == [
+        (ERRORS, ["idle"]), (ERRORS, ["ran"]), (IN_FULL, ["ran"])]
+    assert {run.record["name"] for run in _kind(readings, "run")} == {"ran"}
+
+
+def test_the_first_poll_after_a_start_reads_again_what_the_series_keeps() -> None:
+    """§3: every bucket its first call answered, the newest and as many as the
+    series keeps — which repairs one whose numbers grew after its hour — and the
+    next poll is back to what its history lacks."""
+    hours = [timedelta(hours=n) for n in (5, 4, 3, 2)]
+    check = _one_account(series_keep=2)
+    _keeping(check, {COLLECTOR: hours[2:]})
+    built = _stub(check, functions=ONE_COLLECTOR, metrics={"collector": {
+        "runs": [_point(age) for age in hours]}})
+    first, _ = _poll(check, built)
+    second, _ = _poll(check, built)
+    assert _at(first) == [_stamp(timedelta(hours=3)), _stamp(timedelta(hours=2))]
+    assert _at(second) == []
+
+
+def test_a_region_that_could_not_be_read_has_its_first_poll_still_to_come() -> None:
+    """The repair is a region's first poll that read it: one that failed read no
+    bucket, so the next one reads them again."""
+    hours = [timedelta(hours=3), timedelta(hours=2)]
+    check = _one_account(series_keep=2)
+    _keeping(check, {COLLECTOR: hours})
+    built = _stub(check, lambda_unreadable={"eu-central-1"})
+    failed, _ = _poll(check, built)
+    built = _stub(check, functions=ONE_COLLECTOR, metrics={"collector": {
+        "runs": [_point(age) for age in hours]}})
+    readings, _ = _poll(check, built)
+    assert [reading.record["kind"] for reading in failed
+            if reading.record["aspect"] == LAMBDA] == ["unreadable"]
+    assert _at(readings) == [_stamp(age) for age in hours]
+
+
+def test_the_first_poll_after_a_start_is_each_region_s_own() -> None:
+    """One region read and one not: the second poll is the unread region's first,
+    and reads again what its series keeps, while the region that was read is back
+    to what its history lacks."""
+    hours = [timedelta(hours=3), timedelta(hours=2)]
+    regions = ["eu-central-1", "eu-west-1"]
+    check = _one_account(series_keep=2, regions=regions)
+    _keeping(check, {f"lambda/live/{region}/collector": hours for region in regions})
+    answers: dict[str, Any] = {
+        "functions": {region: [["collector"]] for region in regions},
+        "metrics": {"collector": {"runs": [_point(age) for age in hours]}}}
+    first, _ = _poll(check, _stub(check, lambda_unreadable={"eu-west-1"}, **answers))
+    second, _ = _poll(check, _stub(check, **answers))
+    assert [(run.record["region"], run.record["at"])
+            for run in _kind(first, "run")] == [
+        ("eu-central-1", _stamp(age)) for age in hours]
+    assert [(run.record["region"], run.record["at"])
+            for run in _kind(second, "run")] == [
+        ("eu-west-1", _stamp(age)) for age in hours]
+
+
+def test_a_function_its_window_holds_no_point_of_is_asked_the_coarser_periods(
+        ) -> None:
+    """§3: either way — with a series kept as without one — and what a coarser
+    period answers is the function's reading and never a run: a run is a
+    one-minute bucket."""
+    check = _one_account(series_keep=30)
+    _keeping(check)
+    built = _stub(check, functions=ONE_COLLECTOR, metrics={"collector": {
+        "errors": 2, "age": timedelta(days=40), "period": 3600}})
+    readings, calls = _poll(check, built)
+    assert [(call["asked"], call["span"]) for call in calls] == [
+        (ERRORS, FIFTEEN_DAYS), ({("Errors", "Sum", 300)}, timedelta(days=63)),
+        ({("Errors", "Sum", 3600)}, timedelta(days=455))]
+    (function,) = _kind(readings, "function")
+    assert (function.record["errors"], function.record["at"]) == (
+        2, _stamp(timedelta(days=40)))
+    assert _kind(readings, "run") == []
+
+
+def test_a_function_invoked_all_the_time_answers_its_last_hour() -> None:
+    """§8: it shows its newest buckets like any other function, as many as the
+    series keeps, costs three metrics on every poll, and answers an hour — not
+    the fifteen days — and, of its other two metrics, the half hour that is read."""
+    minutes = [timedelta(minutes=n) for n in range(1, 181)]
+    check = _one_account(series_keep=30)
+    _keeping(check, {COLLECTOR: minutes[:30]})
+    built = _stub(check, functions=ONE_COLLECTOR, metrics={"collector": {
+        "runs": [_point(age) for age in minutes]}})
+    _poll(check, built)
+    readings, calls = _poll(check, built)
+    assert [(call["asked"], call["span"], call["queries"]) for call in calls] == [
+        (ERRORS, HOUR, 1), (IN_FULL, timedelta(minutes=30), 2)]
+    assert _at(readings) == [_stamp(age) for age in reversed(minutes[:30])]
+
+
+def test_a_bucket_cloudwatch_sent_no_point_for_keeps_a_null() -> None:
+    """One shape for every run (little-sister ADR-0085 decision 3): a number the
+    second call did not answer stands as `null`, never as a missing key."""
+    check = _one_account(series_keep=30)
+    _keeping(check)
+    readings = _readings(check, functions=ONE_COLLECTOR, metrics={
+        "collector": {"errors": 1, "age": timedelta(minutes=2)}})
+    (run,) = _kind(readings, "run")
+    assert (run.record["invocations"], run.record["errors"],
+            run.record["duration_ms"]) == (None, 1, None)
+
+
+def test_the_newest_bucket_is_the_newest_in_whatever_order_cloudwatch_answers(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """`get_metric_data` answers newest first unless told otherwise, and in which
+    order its pages arrive is not for this check to assume."""
+    newest_first = _FakeCloudwatch._points
+    monkeypatch.setattr(
+        _FakeCloudwatch, "_points",
+        lambda self, query, start, end: newest_first(self, query, start, end)[::-1])
+    check = _one_account(series_keep=1)
+    _keeping(check)
+    readings = _readings(check, functions=ONE_COLLECTOR, metrics={"collector": {
+        "runs": [_point(timedelta(minutes=5), errors=3),
+                 _point(timedelta(minutes=2))]}})
+    (function,) = _kind(readings, "function")
+    assert (function.record["errors"], function.record["at"]) == (
+        0, "2026-08-10T11:58:00Z")
+    assert _at(readings) == ["2026-08-10T11:58:00Z"]
+
+
+def test_an_answer_cut_short_is_followed_to_its_end() -> None:
+    """CloudWatch cuts an answer and hands back a token for the rest. Followed, a
+    function the first page left out is read at the period it answered — whatever
+    the check keeps — and not as one with no point in fifteen days."""
+    check = _one_account()
+    built = _stub(check, functions={"eu-central-1": [["first", "second"]]},
+                  metrics={"first": _point(timedelta(minutes=1)),
+                           "second": _point(timedelta(minutes=2), errors=4)},
+                  metric_page=1)
+    readings, calls = _poll(check, built)
+    assert [(call["asked"], call["token"]) for call in calls] == [
+        (ERRORS, None), (ERRORS, "page-1")]
+    second = _kind(readings, "function")[1]
+    assert (second.record["errors"], second.record["at"]) == (
+        4, "2026-08-10T11:58:00Z")
+
+
+def test_a_run_s_pages_are_followed_too() -> None:
+    check = _one_account(series_keep=30)
+    _keeping(check)
+    built = _stub(check, functions=ONE_COLLECTOR, metrics={"collector": {
+        "runs": [_point(timedelta(minutes=3), invocations=7, duration=30.0),
+                 _point(timedelta(minutes=2), invocations=9, duration=40.0)]}},
+                  metric_page=3)
+    readings, calls = _poll(check, built)
+    assert [(call["asked"], call["token"]) for call in calls] == [
+        (ERRORS, None), (IN_FULL, None), (IN_FULL, "page-1")]
+    assert [(run.record["invocations"], run.record["duration_ms"])
+            for run in _kind(readings, "run")] == [(7, 30), (9, 40)]
+
+
+def test_an_answer_that_never_ends_is_a_region_that_could_not_be_read(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two hundred pages is more than fifteen days of five hundred busy functions
+    hold; past it the region says that it could not be read, and why."""
+    sent: list[str | None] = []
+
+    def endless(self: Any, **query: Any) -> dict[str, Any]:
+        sent.append(query.get("NextToken"))
+        return {"MetricDataResults": [], "NextToken": "again"}
+
+    monkeypatch.setattr(_FakeCloudwatch, "get_metric_data", endless)
+    check = _one_account()
+    leaf = _lambda(check, functions=ONE_COLLECTOR)
+    assert sent == [None, *["again"] * 199]
+    assert _texts(leaf) == [
+        "eu-central-1: functions cannot be read: CloudWatch's answer had not "
+        "ended after 200 pages",
+        "no functions in scope (eu-central-1)"]
+
+
+# --- a query CloudWatch did not answer ---------------------------------------
+
+
+def _unread(readings: tuple[Measurement, ...]) -> list[tuple[str, str]]:
+    """The regions `lambda` could not read among *readings*, each with why."""
+    return [(str(reading.record["region"]), str(reading.record["error"]))
+            for reading in _kind(readings, "unreadable")
+            if reading.record["aspect"] == LAMBDA]
+
+
+def test_a_metric_cloudwatch_did_not_answer_is_a_region_that_could_not_be_read(
+        ) -> None:
+    """CloudWatch answers each query of a call on its own, and may say of one that
+    it could not while the call succeeds. That result carries no point; taken for
+    an answer it was a function that never ran, asked again at the coarser periods
+    and billed again. It is a read that failed: the region says which metric of
+    which function was not answered, no function is read, and nothing more is
+    asked."""
+    check = _one_account()
+    built = _stub(check, functions={"eu-central-1": [["first", "second"]]},
+                  metrics={"first": _point(timedelta(minutes=1)),
+                           "second": {"refused": {"Errors": "InternalError"}}})
+    readings, calls = _poll(check, built)
+    assert [call["asked"] for call in calls] == [ERRORS]
+    assert _unread(readings) == [
+        ("eu-central-1",
+         "CloudWatch did not answer Errors of second: InternalError")]
+    assert _kind(readings, "function") == []
+
+
+def test_the_region_says_what_was_not_answered_and_its_nodes_stay() -> None:
+    """On the wall: the line a region that could not be read always was, and a
+    node that leaves unsaid that its children are complete, so the functions an
+    earlier poll wrote stay (little-sister ADR-0109)."""
+    check = _one_account()
+    leaf = _lambda(check, functions=ONE_COLLECTOR, metrics={
+        "collector": {"refused": {"Errors": "InternalError"}}})
+    assert _texts(leaf) == [
+        "eu-central-1: functions cannot be read: CloudWatch did not answer "
+        "Errors of collector: InternalError",
+        "no functions in scope (eu-central-1)"]
+    assert leaf.children == ()
+    assert leaf.children_complete is False
+
+
+def test_a_run_s_number_cloudwatch_did_not_answer_keeps_nothing_of_the_poll(
+        ) -> None:
+    """The second call's too. A run kept with an empty number would stay so once
+    its bucket is an hour old; so the region could not be read, in CloudWatch's
+    own words, no run and no reading of that poll is kept — and the next poll
+    reads the run in full."""
+    check = _one_account(series_keep=30)
+    _keeping(check)
+    built = _stub(check, functions=ONE_COLLECTOR, metrics={"collector": {
+        **_point(timedelta(minutes=2), invocations=9, duration=40.0),
+        "refused": {"Duration": (
+            "Forbidden",
+            "Authentication too complex to retrieve cross region data")}}})
+    readings, calls = _poll(check, built)
+    assert [call["asked"] for call in calls] == [ERRORS, IN_FULL]
+    assert _unread(readings) == [
+        ("eu-central-1",
+         "CloudWatch did not answer Duration of collector: Forbidden — "
+         "Authentication too complex to retrieve cross region data")]
+    assert _kind(readings, "run") == []
+    assert _kind(readings, "function") == []
+
+    built = _stub(check, functions=ONE_COLLECTOR, metrics={
+        "collector": _point(timedelta(minutes=2), invocations=9, duration=40.0)})
+    readings, _ = _poll(check, built)
+    assert _unread(readings) == []
+    assert [(run.record["invocations"], run.record["duration_ms"])
+            for run in _kind(readings, "run")] == [(9, 40)]
+
+
+@pytest.mark.parametrize("names, others", [
+    (["a", "b"], "; 1 more query likewise"),
+    (["a", "b", "c"], "; 2 more queries likewise"),
+])
+def test_the_first_query_not_answered_is_named_and_the_rest_are_counted(
+        names: list[str], others: str) -> None:
+    check = _one_account()
+    readings = _readings(
+        check, functions={"eu-central-1": [names]},
+        metrics={name: {"refused": {"Errors": "InternalError"}}
+                 for name in names})
+    assert _unread(readings) == [
+        ("eu-central-1",
+         f"CloudWatch did not answer Errors of a: InternalError{others}")]
+
+
+@pytest.mark.parametrize("refused, said", [
+    (("InternalError", "one reason", "and another"),
+     "InternalError — one reason; and another"),
+    (("InternalError", "", "a reason"), "InternalError — a reason"),
+    (("InternalError", ""), "InternalError"),
+])
+def test_what_cloudwatch_says_beside_a_refusal_is_said(
+        refused: tuple[str, ...], said: str) -> None:
+    """Every message a refused result carries, and nothing for one that is empty."""
+    check = _one_account()
+    readings = _readings(check, functions=ONE_COLLECTOR, metrics={
+        "collector": {"refused": {"Errors": refused}}})
+    assert _unread(readings) == [
+        ("eu-central-1", f"CloudWatch did not answer Errors of collector: {said}")]
+
+
+def test_a_word_cloudwatch_has_never_said_is_no_answer_either() -> None:
+    """What is listed is the words that answer, `Complete` and `PartialData`, and
+    not the words that refuse: a status this type has never seen is not a metric
+    with no points."""
+    check = _one_account()
+    readings = _readings(check, functions=ONE_COLLECTOR, metrics={
+        "collector": {"refused": {"Errors": "Throttled"}}})
+    assert _unread(readings) == [
+        ("eu-central-1",
+         "CloudWatch did not answer Errors of collector: Throttled")]
+
+
+def test_a_result_cut_by_a_page_is_an_answer_that_goes_on(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """`PartialData` says that a result's points go on behind the token, which is
+    followed: an answer, and nothing a region is refused for."""
+    said: list[str] = []
+    answered = _FakeCloudwatch.get_metric_data
+
+    def heard(self: Any, **query: Any) -> dict[str, Any]:
+        answer = answered(self, **query)
+        said.extend(result["StatusCode"] for result in answer["MetricDataResults"])
+        return answer
+
+    monkeypatch.setattr(_FakeCloudwatch, "get_metric_data", heard)
+    check = _one_account()
+    readings = _readings(check, functions=ONE_COLLECTOR, metrics={"collector": {
+        "runs": [_point(timedelta(minutes=3), errors=2),
+                 _point(timedelta(minutes=2))]}}, metric_page=1)
+    assert said == ["PartialData", "Complete"]
+    assert _unread(readings) == []
+    (function,) = _kind(readings, "function")
+    assert (function.record["errors"], function.record["at"]) == (
+        0, "2026-08-10T11:58:00Z")
+
+
+def test_a_result_that_names_no_status_is_read_as_it_always_was(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only what CloudWatch says was not answered is refused."""
+    answered = _FakeCloudwatch.get_metric_data
+
+    def silent(self: Any, **query: Any) -> dict[str, Any]:
+        answer = answered(self, **query)
+        for result in answer["MetricDataResults"]:
+            del result["StatusCode"]
+        return answer
+
+    monkeypatch.setattr(_FakeCloudwatch, "get_metric_data", silent)
+    check = _one_account()
+    readings = _readings(check, functions=ONE_COLLECTOR, metrics={
+        "collector": _point(timedelta(minutes=2), errors=4)})
+    assert _unread(readings) == []
+    (function,) = _kind(readings, "function")
+    assert function.record["errors"] == 4
+
+
+def test_what_is_left_of_an_answer_that_refused_a_query_is_not_asked_for() -> None:
+    """The refusal is raised where it is first seen: the first page hands back a
+    token for the rest, and the rest is not fetched."""
+    check = _one_account()
+    built = _stub(check, functions={"eu-central-1": [["first", "second"]]},
+                  metrics={"first": {"runs": [_point(timedelta(minutes=3)),
+                                              _point(timedelta(minutes=2))]},
+                           "second": {"refused": {"Errors": "InternalError"}}},
+                  metric_page=1)
+    readings, calls = _poll(check, built)
+    assert [(call["asked"], call["token"]) for call in calls] == [(ERRORS, None)]
+    assert _unread(readings) == [
+        ("eu-central-1",
+         "CloudWatch did not answer Errors of second: InternalError")]
+
+
+def test_a_refused_result_this_type_did_not_ask_for_is_named_by_its_id(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        _FakeCloudwatch, "get_metric_data",
+        lambda self, **query: {"MetricDataResults": [
+            {"Id": "x9", "StatusCode": "InternalError"}]})
+    check = _one_account()
+    readings = _readings(check, functions=ONE_COLLECTOR)
+    assert _unread(readings) == [
+        ("eu-central-1", "CloudWatch did not answer the query x9: InternalError")]
+
+
+def test_a_run_s_duration_is_declared_as_a_measure_in_milliseconds() -> None:
+    """§7: the type's default, so a deployment that keeps a series draws a
+    function's runs to their duration with no key of its own — and a run's counts
+    are columns of its readings and no plot."""
+    measures = _build().measures
+    assert (measures["duration_ms"].unit, measures["duration_ms"].label) == (
+        "ms", "Duration")
+    assert not {"invocations", "errors"} & set(measures)
+
+
+def test_a_deployment_takes_the_plot_away_or_adds_a_count() -> None:
+    """§7: a count is drawn beside the duration where a deployment asks for it, and
+    `duration_ms: null` takes the declared plot away, which leaves a run a tick."""
+    added = _build(measures={"invocations": "calls"}).measures
+    assert {"duration_ms", "invocations"} <= set(added)
+    assert added["invocations"].unit == "calls"
+    assert "duration_ms" not in _build(measures={"duration_ms": None}).measures
+
+
+# --- how long a run and an execution took (ADR-0008) ------------------------------
+
+def _run_record(row: dict[str, Any]) -> Mapping[str, Any]:
+    """The record of the one run a queue lists, under the status its row says."""
+    readings = _readings(_one_account(), queues=ONE_QUEUE,
+                         jobs={("nightly", row["status"]): [[row]]})
+    (run,) = _kind(readings, "job")
+    return run.record
+
+
+def _execution_record(row: dict[str, Any]) -> Mapping[str, Any]:
+    """The record of a pipeline whose newest execution is *row*."""
+    readings = _readings(_one_account(), pipelines=ONE_PIPELINE,
+                         executions={"running-deploy": [row]})
+    (pipeline,) = _kind(readings, "pipeline")
+    return pipeline.record
+
+
+def test_a_run_says_how_long_it_waited_and_how_long_it_ran() -> None:
+    """§1: `wait_s` from when the job was created to when it started, and
+    `duration_s` from then to when it stopped."""
+    record = _run_record(_job("etl", created=timedelta(minutes=10),
+                              started=timedelta(minutes=7, seconds=30),
+                              stopped=timedelta(minutes=2, seconds=15)))
+    assert (record["wait_s"], record["duration_s"]) == (150, 315)
+
+
+@pytest.mark.parametrize(("status", "times", "wait", "duration"), [
+    # Waiting: it has not started.
+    ("RUNNABLE", {"created": timedelta(minutes=9)}, None, None),
+    # Running: it has waited, and it has not stopped.
+    ("RUNNING", {"created": timedelta(minutes=9), "started": timedelta(minutes=8)},
+     60, None),
+    # Stopped before it ever started.
+    ("FAILED", {"created": timedelta(minutes=9), "stopped": timedelta(minutes=1)},
+     None, None),
+    # Batch sent no time of creation.
+    ("SUCCEEDED", {"started": timedelta(minutes=8), "stopped": timedelta(minutes=3)},
+     None, 300),
+])
+def test_a_run_s_span_is_empty_until_both_its_instants_are_known(
+        status: str, times: dict[str, timedelta], wait: int | None,
+        duration: int | None) -> None:
+    """§3: nothing is counted to the poll's own clock, so a run that is still
+    running has waited and has no duration yet — and the record keeps its shape,
+    a null where a number is not known."""
+    record = _run_record(_job("etl", status, **times))
+    assert (record["wait_s"], record["duration_s"]) == (wait, duration)
+
+
+def test_a_span_is_kept_in_whole_seconds() -> None:
+    """§4: Batch stamps a job in milliseconds, and a record keeps the seconds that
+    were completed, as a line counts a span — 29 of 29.6, and 29 of 29.4."""
+    record = _run_record(_job("etl", created=timedelta(seconds=90),
+                              started=timedelta(seconds=60, milliseconds=400),
+                              stopped=timedelta(seconds=31)))
+    assert (record["wait_s"], record["duration_s"]) == (29, 29)
+    assert type(record["wait_s"]) is type(record["duration_s"]) is int
+
+
+def test_an_instant_before_the_one_it_follows_gives_no_span() -> None:
+    """§3: a start before the creation, or a stop before the start, is no span, and
+    is not kept as one of no length."""
+    record = _run_record(_job("etl", created=timedelta(minutes=5),
+                              started=timedelta(minutes=6),
+                              stopped=timedelta(minutes=7)))
+    assert (record["wait_s"], record["duration_s"]) == (None, None)
+
+
+def test_instants_that_coincide_are_a_span_of_no_length() -> None:
+    """§3: a job that started the moment it was created waited `0`, which is a
+    number and no null."""
+    record = _run_record(_job("etl", created=timedelta(minutes=5),
+                              started=timedelta(minutes=5),
+                              stopped=timedelta(minutes=5)))
+    assert (record["wait_s"], record["duration_s"]) == (0, 0)
+
+
+@pytest.mark.parametrize("status", ["Succeeded", "Failed", "Stopped", "Superseded",
+                                    "Cancelled", "succeeded", " SUCCEEDED "])
+def test_an_execution_that_is_over_says_how_long_it_took(status: str) -> None:
+    """§2, §3: from its start to the last change CodePipeline recorded of it, in
+    each of the five statuses in which an execution is over — a status being the
+    word it is whatever its case and its padding, as `state_map` reads one."""
+    record = _execution_record(_execution(
+        status, started=timedelta(minutes=20),
+        updated=timedelta(minutes=8, seconds=20), eid="e-1"))
+    assert record["duration_s"] == 700
+
+
+@pytest.mark.parametrize("status", ["InProgress", "Stopping", "Paused"])
+def test_an_execution_that_is_not_over_has_no_duration(status: str) -> None:
+    """§3: its last change is no end. `InProgress` and `Stopping` are an execution
+    on its way, and a word CodePipeline adds ends nothing until this type knows
+    it."""
+    record = _execution_record(_execution(
+        status, started=timedelta(minutes=20),
+        updated=timedelta(minutes=8, seconds=20), eid="e-1"))
+    assert record["duration_s"] is None
+
+
+def test_an_execution_s_duration_is_whole_seconds_and_no_span_is_none() -> None:
+    """§3, §4: the 99 seconds that were completed of 99.6, and nothing where the
+    last change lies before the start."""
+    took = _execution_record(_execution(
+        started=timedelta(seconds=100), updated=timedelta(milliseconds=400)))
+    assert took["duration_s"] == 99 and type(took["duration_s"]) is int
+    backwards = _execution_record(_execution(
+        started=timedelta(minutes=1), updated=timedelta(minutes=2)))
+    assert backwards["duration_s"] is None
+
+
+@pytest.mark.parametrize("newest_first", [True, False])
+def test_an_execution_s_duration_is_counted_to_its_own_last_change(
+        newest_first: bool) -> None:
+    """§2: the newest execution's, wherever in the page it stands — and never the
+    last change of another, though that one changed later."""
+    old = _execution(started=timedelta(hours=5), updated=timedelta(minutes=5),
+                     eid="e-old")
+    new = _execution(started=timedelta(minutes=30), updated=timedelta(minutes=10),
+                     eid="e-new")
+    readings = _readings(_one_account(), pipelines=ONE_PIPELINE, executions={
+        "running-deploy": [new, old] if newest_first else [old, new]})
+    (pipeline,) = _kind(readings, "pipeline")
+    assert (pipeline.record["execution"], pipeline.record["duration_s"]) == (
+        "e-new", 1200)
+
+
+def test_an_execution_no_last_change_is_told_of_and_a_pipeline_never_run_have_none(
+        ) -> None:
+    """§3: the record keeps its shape on each path — an execution that is over and
+    names no last change, one whose last change is no instant, and a pipeline with
+    no execution at all."""
+    readings = _readings(
+        _one_account(),
+        pipelines={"eu-central-1": [["deploy", "odd", "idle"]]},
+        executions={"deploy": [_execution(eid="e-1")],
+                    "odd": [{**_execution(eid="e-2"), "lastUpdateTime": "today"}]})
+    deploy, odd, idle = _kind(readings, "pipeline")
+    assert (deploy.record["status"], deploy.record["duration_s"]) == (
+        "Succeeded", None)
+    assert (odd.record["status"], odd.record["duration_s"]) == ("Succeeded", None)
+    assert (idle.record["status"], idle.record["duration_s"]) == (None, None)
+
+
+def test_the_spans_are_declared_as_measures_in_seconds() -> None:
+    """§5: the type's default, beside a function's `duration_ms`, so a run and an
+    execution are drawn to how long they took with no key of a deployment's own,
+    which takes either away by its name."""
+    measures = _build().measures
+    assert list(measures) == ["duration_ms", "duration_s", "wait_s"]
+    assert (measures["duration_s"].unit, measures["duration_s"].label) == (
+        "s", "Duration")
+    assert (measures["wait_s"].unit, measures["wait_s"].label) == ("s", "Wait")
+    assert list(_build(measures={"wait_s": None}).measures) == [
+        "duration_ms", "duration_s"]
+
+
+def test_the_grading_reads_neither_number() -> None:
+    """No line changes: a record that carries the two numbers, one kept before a
+    run carried them, and one whose numbers are wrong all grade to the same lines
+    and the same codes (ADR-0005 §5), shown and for the record alike — under
+    thresholds a kept number would trip."""
+    check = _one_account(series_keep=30,
+                         batch={"max_wait_time": "1m", "max_run_time": "1m"})
+    _holding(check)
+    readings = _readings(
+        check, queues=ONE_QUEUE, pipelines=ONE_PIPELINE,
+        jobs={("nightly", "SUCCEEDED"): [[_job(
+                  "etl", job_id="j-1", created=timedelta(hours=3),
+                  started=timedelta(hours=2, minutes=50),
+                  stopped=timedelta(hours=2))]],
+              ("nightly", "RUNNING"): [[_job(
+                  "etl", "RUNNING", job_id="j-2", created=timedelta(minutes=9),
+                  started=timedelta(minutes=8))]],
+              ("nightly", "RUNNABLE"): [[_job(
+                  "etl", "RUNNABLE", job_id="j-3", created=timedelta(seconds=30))]]},
+        executions={"running-deploy": [
+            _execution(started=timedelta(minutes=20), updated=timedelta(minutes=5),
+                       eid="e-1"),
+            _execution("Failed", started=timedelta(hours=2),
+                       updated=timedelta(hours=1), eid="e-0")]})
+    assert {reading.identity: (reading.record.get("wait_s"),
+                               reading.record["duration_s"])
+            for reading in readings if "duration_s" in reading.record} == {
+        "j-1": (600, 3000), "j-2": (60, None), "j-3": (None, None),
+        "e-1": (None, 900), "e-0": (None, 3600)}
+
+    def with_numbers(wrong: int | None) -> list[Measurement]:
+        """The readings without their two numbers, or with each set to *wrong*."""
+        changed = []
+        for reading in readings:
+            record = dict(reading.record)
+            for key in ("wait_s", "duration_s"):
+                if key in record:
+                    if wrong is None:
+                        del record[key]
+                    else:
+                        record[key] = wrong
+            changed.append(Measurement(record=record, subject=reading.subject,
+                                       identity=reading.identity,
+                                       state=reading.state))
+        return changed
+
+    def said(result: CheckResult) -> list[tuple[Any, ...]]:
+        """Each node's name and code, its lines, and what it says for the record."""
+        return [(node.name, node.code,
+                 [(entry.text, entry.code) for entry in node.reason_entries],
+                 [(entry.text, entry.code) for entry in node.for_record])
+                for node in _nodes(result)]
+
+    graded = said(run_check(check, measurements=readings))
+    assert graded == said(run_check(check, measurements=with_numbers(None)))
+    assert graded == said(run_check(check, measurements=with_numbers(1)))
+    (line,) = [(text, code) for _, _, lines, _ in graded for text, code in lines
+               if "[etl]" in text]
+    # The line counts for itself: the run that ended took fifty minutes, and the
+    # one in flight has run for eight, past the one it may.
+    assert "ran 50m" in line[0] and "1 running (8m)" in line[0]
+    assert line[1] is StatusCode.WARN
+    # And so does what is said for the record: a span from the record's instants,
+    # an age to the instant the grading is handed.
+    assert [one for _, _, _, kept in graded for one in kept] == [
+        ("Failed", StatusCode.ERROR),
+        ("SUCCEEDED, waited 10m, ran 50m", StatusCode.OK),
+        ("RUNNING for 8m, past max_run_time", StatusCode.WARN),
+        ("RUNNABLE for < 1m", StatusCode.OK)]
+
+
+def test_a_run_s_record_and_its_line_count_one_span_alike() -> None:
+    """§4: the seconds that were completed, as the line counts them — a run of
+    3599.6 seconds is 3599 in its record and fifty-nine minutes on its line, where
+    the nearest second would have made the record an hour."""
+    ran = timedelta(seconds=3599, milliseconds=600)
+    row = _job("etl", created=timedelta(minutes=10) + ran,
+               started=timedelta(minutes=10) + ran, stopped=timedelta(minutes=10))
+    check = _one_account()
+    readings = _readings(check, queues=ONE_QUEUE,
+                         jobs={("nightly", "SUCCEEDED"): [[row]]})
+    (run,) = _kind(readings, "job")
+    assert run.record["duration_s"] == 3599
+    leaf = _aspect(check, run_check(check, measurements=readings), BATCH)
+    assert _entry(leaf, "etl").text.endswith(": SUCCEEDED 10m ago, ran 59m")
+
+
+@pytest.mark.parametrize(("fraction", "weighs", "weighed"), [
+    # Instants on the second, as ADR-0005 §8 weighed a run.
+    (timedelta(0), 1213, 1169),
+    # Instants with the milliseconds Batch stamps them with: seven bytes on each of
+    # the four a run's record keeps.
+    (timedelta(milliseconds=1), 1241, 1197),
+])
+def test_a_run_at_its_bound_with_two_long_spans_weighs_what_the_record_says(
+        fraction: timedelta, weighs: int, weighed: int) -> None:
+    """Consequences: the longest queue name, job name and reason, and two spans of
+    two hundred days, as the seam weighs a record — beside the same run without its
+    two numbers, which on the second is the 1169 of ADR-0005 §8."""
+    assert len(EMOJI) == 1
+    queue, name, reason = "q" * 128, "j" * 128, EMOJI * 1024
+    readings = _readings(_one_account(series_keep=1),
+                         queues={"eu-central-1": [[_queue(queue, reason=reason)]]},
+                         jobs={(queue, "FAILED"): [[{
+                             **_job(name, "FAILED",
+                                    job_id="00000000-0000-4000-8000-000000000000",
+                                    created=timedelta(days=400) + fraction,
+                                    started=timedelta(days=200) + fraction,
+                                    stopped=timedelta(seconds=1) + fraction),
+                             "statusReason": reason}]]})
+    (run,) = _kind(readings, "job")
+    record = dict(run.record)
+    assert (record["wait_s"], record["duration_s"]) == (17_280_000, 17_279_999)
+    assert len(json.dumps(record)) == weighs
+    del record["wait_s"], record["duration_s"]
+    assert len(json.dumps(record)) == weighed
+
+
+# --- a function's node (ADR-0006 §9) ----------------------------------------------
+
+def _collector(check: AwsCheck, **stub: Any) -> tuple[tuple[Measurement, ...],
+                                                    CheckResult]:
+    """What *check* read, and the `collector` function's node graded from it."""
+    _keeping(check)
+    taken = _readings(check, functions=ONE_COLLECTOR, **stub)
+    leaf = _aspect(check, run_check(check, measurements=taken), LAMBDA)
+    return taken, _function(leaf, "collector")
+
+
+def test_every_function_has_a_node_beneath_lambda_named_by_what_aws_calls_it(
+        ) -> None:
+    """§9: one that ran well, one that failed and one that was never invoked
+    alike — a node each, with the function's line as its only one."""
+    leaf = _lambda(_one_account(),
+                   functions={"eu-central-1": [["well", "failed", "never"]]},
+                   metrics={"well": _point(timedelta(minutes=1)),
+                            "failed": _point(timedelta(minutes=1), errors=3)})
+    assert [(node.name, node.stored_code, len(node.reason_entries))
+            for node in leaf.children] == [
+        ("failed", StatusCode.ERROR, 1), ("never", StatusCode.WARN, 1),
+        ("well", StatusCode.OK, 1)]
+    assert all(node.children == () for node in leaf.children)
+
+
+def test_a_display_name_rule_gives_the_node_its_title_and_never_its_path() -> None:
+    """§9: `shorten` reaches the title and the line's label, and neither the
+    node's name nor the slug."""
+    check = _one_account(**{"lambda": {"shorten": [{"from": "running-"}]}})
+    leaf = _lambda(check,
+                   functions={"eu-central-1": [["running-collector", "plain"]]})
+    shortened, untouched = (_function(leaf, "running-collector"),
+                            _function(leaf, "plain"))
+    assert (shortened.name, shortened.title) == ("running-collector", "collector")
+    assert shortened.reason[0].slug == "eu-central-1-running-collector"
+    assert shortened.reason[0].text.startswith("[collector](")
+    assert (untouched.name, untouched.title) == ("plain", "")
+
+
+def test_a_function_s_node_says_which_account_and_region_it_is_of() -> None:
+    """Its path may name neither — a level stands only where a configuration
+    names several — so its description does."""
+    _, node = _collector(_one_account())
+    assert node.description == "Lambda function in live, eu-central-1"
+
+
+def test_a_function_s_line_names_the_function_though_its_reading_names_none(
+        ) -> None:
+    """§9: that is what makes the node stand for the function, and what keeps the
+    function's own reading out of the series. The line still carries the reading
+    it was written from, under the slug it had."""
+    taken, node = _collector(
+        _one_account(series_keep=30),
+        metrics={"collector": {"runs": [_point(timedelta(minutes=2))]}})
+    (function,) = _kind(taken, "function")
+    (line,) = node.reason_entries
+    assert function.subject == ""
+    assert (line.subject, line.data, line.slug) == (
+        COLLECTOR, dict(function.record), "eu-central-1-collector")
+    assert line.text.endswith(": no errors, last run 2m ago · no log stream")
+
+
+def test_no_run_has_a_line_of_its_own_and_each_is_said_for_the_record() -> None:
+    """§9: how each run the poll read in full stood — `ERROR` where its errors are
+    above zero and `OK` where they are not, in a sentence that says its errors and
+    its invocations — on a line no node shows, which carries the run's record."""
+    taken, node = _collector(
+        _one_account(series_keep=30),
+        metrics={"collector": {"runs": [
+            _point(timedelta(minutes=4)),
+            _point(timedelta(minutes=3), errors=1, invocations=12),
+            _point(timedelta(minutes=2), errors=2, invocations=3)]}})
+    runs = _kind(taken, "run")
+    assert len(node.reason_entries) == 1
+    assert [(line.code, line.text, line.subject, line.data)
+            for line in node.for_record] == [
+        (StatusCode.OK, "no errors in 1 invocation", COLLECTOR,
+         dict(runs[0].record)),
+        (StatusCode.ERROR, "1 error in 12 invocations", COLLECTOR,
+         dict(runs[1].record)),
+        (StatusCode.ERROR, "2 errors in 3 invocations", COLLECTOR,
+         dict(runs[2].record))]
+    # The function's own line is graded on its newest bucket, as it always was.
+    assert node.stored_code is StatusCode.ERROR
+
+
+def test_a_run_s_verdict_is_its_own_at_any_age() -> None:
+    """§9: the gate that keeps an old error from being graded is the line's. Two
+    days after the run, with `error_max_age: 1d`, the function's line no longer
+    grades the error — and the run still failed."""
+    _, node = _collector(
+        _one_account(series_keep=30, **{"lambda": {"error_max_age": "1d"}}),
+        metrics={"collector": {"runs": [_point(timedelta(days=2), errors=1)]}})
+    (line,) = node.reason_entries
+    assert line.code is StatusCode.OK and "too old to grade" in line.text
+    assert [entry.code for entry in node.for_record] == [StatusCode.ERROR]
+
+
+def test_a_run_whose_invocations_were_not_answered_says_its_errors_alone() -> None:
+    _, node = _collector(_one_account(series_keep=30), metrics={
+        "collector": {"errors": 0, "age": timedelta(minutes=2)}})
+    assert [(entry.code, entry.text) for entry in node.for_record] == [
+        (StatusCode.OK, "no errors")]
+
+
+def test_the_node_the_functions_hang_on_says_that_its_children_are_complete(
+        ) -> None:
+    """§9: where their listing was read whole, so a function that was deleted, or
+    that a rule now ignores, leaves with the next good run; where it could not be
+    read the node leaves that unsaid, and the functions stay."""
+    read = _lambda(_one_account(), functions=ONE_COLLECTOR)
+    unread = _lambda(_one_account(), lambda_unreadable={"eu-central-1"})
+    assert (read.children_complete, [node.name for node in read.children]) == (
+        True, ["collector"])
+    assert (unread.children_complete, unread.children) == (False, ())
+
+
+def test_an_account_with_no_functions_says_that_its_none_are_all_of_them() -> None:
+    """Read whole and empty is still read whole: the last function to be deleted
+    leaves like any other."""
+    leaf = _lambda(_one_account())
+    assert (leaf.children, leaf.children_complete) == ((), True)
+    assert _texts(leaf) == ["no functions in scope (eu-central-1)"]
+
+
+def test_a_function_s_node_declares_nothing_of_the_density_trade() -> None:
+    """Its line is a function's status and no inventory: on a dense wall a quiet
+    function is a chip, and `lambda`, which holds them, keeps its box."""
+    _, node = _collector(_one_account())
+    assert node.show_when_quiet is None
+    assert _one_account().subnode_show_when_quiet[LAMBDA] is True
+
+
+def test_runs_typed_by_hand_grade_as_the_ones_a_poll_read() -> None:
+    """The grading reads the records and nothing else (little-sister ADR-0086
+    decision 6): a run this process never read is said for the record like one it
+    did, on the node of the function its record names."""
+    check = _one_account()
+    record = {"aspect": LAMBDA, "account": "live", "region": "eu-central-1",
+              "name": "collector"}
+    typed = [
+        Measurement({"aspect": None, "kind": "estate", "credentials": None,
+                     "accounts": [{"name": "live", "outcome": "read"}]},
+                    subject="accounts/live", state="live=read"),
+        Measurement({"aspect": None, "kind": "account", "account": "live",
+                     "outcome": "read", "error": None, "renewal": None}),
+        Measurement({**record, "kind": "function", "errors": 0,
+                     "at": "2026-08-10T11:58:00Z", "log_status": None,
+                     "log_note": None, "log_error": None}),
+        Measurement({**record, "kind": "run", "at": "2026-08-01T07:00:00Z",
+                     "invocations": 4, "errors": 4, "duration_ms": 900000},
+                    subject=COLLECTOR, identity="2026-08-01T07:00:00Z"),
+    ]
+    node = _function(_child(run_check(check, measurements=typed), LAMBDA),
+                     "collector")
+    (said,) = node.for_record
+    assert (said.code, said.text, said.subject, said.data) == (
+        StatusCode.ERROR, "4 errors in 4 invocations", COLLECTOR,
+        dict(typed[3].record))
+    assert node.stored_code is StatusCode.OK
+
+
+# --- the tree's shape (ADR-0007) --------------------------------------------------
+#
+# A level stands in the tree only where the configuration names several of it. Each
+# test is one sentence of that record.
+
+TWO_REGIONS = ["eu-central-1", "eu-west-1"]
+
+
+def test_a_check_that_names_one_account_hangs_its_aspects_beneath_its_own_node(
+        ) -> None:
+    """§2: the account has no node — its level would say one word in every path —
+    and the root still grades nothing and says what is watched."""
+    check = _one_account()
+    _stub(check, **EVERY_ASPECT)
+    result = run_check(check)
+    assert [child.name for child in result.children] == list(AwsCheck.ASPECTS)
+    assert result.code is StatusCode.UNDEFINED
+    assert _texts(result) == ["1 account, 1 account/region pair in scope"]
+    assert "live" not in [node.name for node in _nodes(result)]
+
+
+def test_a_check_that_names_several_accounts_keeps_the_account_s_level() -> None:
+    """§1: the tree ADR-0001 §2 drew is the one such a check still has."""
+    check = _build()
+    _stub(check, **EVERY_ASPECT)
+    result = run_check(check)
+    assert [child.name for child in result.children] == ["live", "backup"]
+    assert [[leaf.name for leaf in account.children]
+            for account in result.children] == [list(AwsCheck.ASPECTS)] * 2
+
+
+def test_what_refused_the_one_account_is_said_on_the_check_s_node() -> None:
+    """§2: the reason on a node that is then `ERROR` — a pin on it is the pin on
+    the account — with nothing beneath it written, and the scope still reported."""
+    check = _one_account()
+    _stub(check, _FakeSts(refuse={ROLE_LIVE}))
+    result = run_check(check)
+    assert result.code is StatusCode.ERROR
+    assert _texts(result) == [
+        "role cannot be assumed: An error occurred (AccessDenied) when calling "
+        "the AssumeRole operation: not allowed"]
+    assert result.children == ()
+    assert result.report == "- **live** — eu-central-1"
+
+
+def test_what_is_counted_is_the_configuration_and_never_what_aws_answers() -> None:
+    """§1: an account that could not be read is still one of those named, and a
+    region that holds nothing still has its level where there are several."""
+    two = _build()
+    _stub(two, _FakeSts(refuse={ROLE_BACKUP}))
+    assert [child.name for child in run_check(two).children] == ["live", "backup"]
+
+    regions = _one_account(regions=TWO_REGIONS)
+    leaf = _lambda(regions, functions={"eu-central-1": [["collector"]]})
+    assert [(node.name, [function.name for function in node.children],
+             node.children_complete) for node in leaf.children] == [
+        ("eu-central-1", ["collector"], True), ("eu-west-1", [], True)]
+
+
+def test_readings_that_name_one_account_keep_the_level_of_a_check_that_names_two(
+        ) -> None:
+    """§1, where a grading is run over readings this process did not take, and they
+    name fewer accounts than the check does: the level is the configuration's, so
+    the one account that was read still stands on a node of its own."""
+    typed = [
+        Measurement({"aspect": None, "kind": "estate", "credentials": None,
+                     "accounts": [{"name": "live", "outcome": "read"}]},
+                    subject="accounts/live", state="live=read"),
+        Measurement({"aspect": None, "kind": "account", "account": "live",
+                     "outcome": "read", "error": None, "renewal": None}),
+    ]
+    result = run_check(_build(), measurements=typed)
+    assert [child.name for child in result.children] == ["live"]
+
+
+def test_a_function_hangs_beneath_its_region_s_node_where_its_account_reads_several(
+        ) -> None:
+    """§3: that level is what tells two regions' functions of one name apart —
+    and nothing has to where an account reads one region."""
+    several = _lambda(_one_account(regions=TWO_REGIONS),
+                      functions={"eu-central-1": [["collector"]],
+                                 "eu-west-1": [["collector", "reporter"]]})
+    assert [(region.name, [function.name for function in region.children])
+            for region in several.children] == [
+        ("eu-central-1", ["collector"]), ("eu-west-1", ["collector", "reporter"])]
+    assert _texts(several) == ["3 functions in scope (eu-central-1, eu-west-1)"]
+    assert [line.split("(")[0] for line in several.report.splitlines()] == [
+        "- eu-central-1 / [collector]", "- eu-west-1 / [collector]",
+        "- eu-west-1 / [reporter]"]
+
+    one = _lambda(_one_account(), functions=ONE_COLLECTOR)
+    assert [node.name for node in one.children] == ["collector"]
+    assert one.report.startswith("- [collector](")
+
+
+def test_a_function_s_line_prints_no_region_and_its_slug_keeps_it() -> None:
+    """§3 and §5: the region is a level where there are several, so the line on a
+    function's own node does not repeat it — and a slug keeps every part, as
+    ADR-0001 has it."""
+    leaf = _lambda(_one_account(regions=TWO_REGIONS),
+                   functions={"eu-west-1": [["collector"]]})
+    (line,) = _function(leaf, "collector").reason_entries
+    assert line.text.startswith("[collector](https://eu-west-1.console")
+    assert line.slug == "eu-west-1-collector"
+
+
+def test_a_function_beneath_its_region_s_node_carries_its_runs_for_the_record(
+        ) -> None:
+    """A level more changes nothing of what a function's node is: its line names
+    the function, with its region, and each run it read is said for the record."""
+    check = _one_account(series_keep=30, regions=TWO_REGIONS)
+    _keeping(check)
+    taken = _readings(check, functions={"eu-west-1": [["collector"]]}, metrics={
+        "collector": {"runs": [_point(timedelta(minutes=2), errors=1)]}})
+    leaf = _aspect(check, run_check(check, measurements=taken), LAMBDA)
+    (node,) = _child(leaf, "eu-west-1").children
+    subject = "lambda/live/eu-west-1/collector"
+    assert node.reason_entries[0].subject == subject
+    assert [(line.code, line.text, line.subject) for line in node.for_record] == [
+        (StatusCode.ERROR, "1 error in 1 invocation", subject)]
+
+
+def test_a_region_s_node_declines_the_density_trade_as_lambda_does() -> None:
+    """It is the box that holds a region's functions — read or not, since a flag
+    freezes at a node's first fill — and a function's own node declares nothing."""
+    leaf = _lambda(_one_account(regions=TWO_REGIONS),
+                   functions={"eu-central-1": [["collector"]]},
+                   lambda_unreadable={"eu-west-1"})
+    assert [node.show_when_quiet for node in leaf.children] == [True, True]
+    assert _function(leaf, "collector").show_when_quiet is None
+
+
+def test_a_region_s_node_grades_nothing_unless_the_region_could_not_be_read(
+        ) -> None:
+    """§3: named by the region; it says that its children are complete where it was
+    read, and where it was not it says so, keeps the nodes it had, and leaves its
+    neighbor to remove what is gone."""
+    leaf = _lambda(_one_account(regions=TWO_REGIONS),
+                   functions={"eu-central-1": [["collector"]]},
+                   lambda_unreadable={"eu-west-1"})
+    read, unread = leaf.children
+    assert (read.name, read.stored_code, _texts(read), read.children_complete) == (
+        "eu-central-1", StatusCode.OK, [], True)
+    assert (unread.name, unread.stored_code, unread.children,
+            unread.children_complete) == ("eu-west-1", StatusCode.WARN, (), False)
+    assert _texts(unread)[0].startswith("eu-west-1: functions cannot be read")
+    # The regions are configuration: `lambda` has no child a run could find gone,
+    # says nothing of them, and keeps the count as its own.
+    assert leaf.children_complete is False
+    assert _texts(leaf) == ["1 function in scope (eu-central-1, eu-west-1)"]
+
+
+def test_a_region_s_node_says_which_account_it_is_of() -> None:
+    leaf = _lambda(_one_account(regions=TWO_REGIONS))
+    assert [node.description for node in leaf.children] == [
+        "Lambda functions in live, eu-central-1",
+        "Lambda functions in live, eu-west-1"]
+
+
+def test_a_node_this_type_does_not_name_says_that_a_run_names_it() -> None:
+    """little-sister ADR-0118: what is declared for an aspect's name reaches every
+    node of that name, unless the node says that a run names it. A function is
+    named by AWS, a region and an account by the configuration, so each says so —
+    read or not, whatever it is called — and a function its account calls `batch`
+    is not shown as the `batch` aspect. An aspect is named by this type, and says
+    nothing."""
+    regions = _one_account(regions=TWO_REGIONS)
+    _stub(regions, functions={"eu-central-1": [["batch", "collector"]]},
+          lambda_unreadable={"eu-west-1"})
+    result = run_check(regions)
+    assert result.dynamic is False
+    assert {aspect.dynamic for aspect in result.children} == {False}
+    leaf = _child(result, LAMBDA)
+    assert [(region.name, region.dynamic) for region in leaf.children] == [
+        ("eu-central-1", True), ("eu-west-1", True)]
+    assert _function(leaf, "batch").dynamic is True
+    assert _function(leaf, "collector").dynamic is True
+
+    one = _lambda(_one_account(),
+                  functions={"eu-central-1": [["batch", "collector"]]})
+    assert [(node.name, node.dynamic) for node in one.children] == [
+        ("batch", True), ("collector", True)]
+
+    several = _build()
+    _stub(several, _FakeSts(refuse={ROLE_BACKUP}))
+    result = run_check(several)
+    assert result.dynamic is False
+    assert [(account.name, account.dynamic) for account in result.children] == [
+        ("live", True), ("backup", True)]
+    assert {aspect.dynamic for aspect in _child(result, "live").children} == {False}
+
+
+def test_the_shape_is_each_account_s_own() -> None:
+    """§1: one check may hold a region's level under the account that reads two
+    regions, and none under the account that reads one."""
+    check = _build(accounts=[{"name": "wide", "regions": TWO_REGIONS},
+                             {"name": "narrow"}])
+    _stub(check, functions={"eu-central-1": [["collector"]]})
+    result = run_check(check)
+    wide = _aspect(check, result, LAMBDA, "wide")
+    narrow = _aspect(check, result, LAMBDA, "narrow")
+    assert [node.name for node in wide.children] == TWO_REGIONS
+    assert [node.name for node in narrow.children] == ["collector"]
+
+
+def test_the_aspect_is_always_a_level() -> None:
+    """§4: a function hangs beneath `lambda` where `lambda` is the one aspect its
+    check runs, too — `enabled:` is configuration, and the rule stops before it."""
+    off = {"enabled": False}
+    check = _one_account(cloudwatch=off, ec2=off, codepipeline=off, batch=off)
+    _stub(check, functions=ONE_COLLECTOR)
+    result = run_check(check)
+    assert [child.name for child in result.children] == [LAMBDA]
+    assert [node.name for node in _child(result, LAMBDA).children] == ["collector"]
+
+
+def test_only_an_aspect_whose_subjects_are_nodes_has_a_region_s_level() -> None:
+    """§3: an aspect that writes a line for each thing it reads has no levels
+    beneath it, and its lines print the region where an account reads several."""
+    check = _one_account(regions=TWO_REGIONS)
+    _stub(check, **EVERY_ASPECT)
+    result = run_check(check)
+    assert {leaf.name: [node.name for node in leaf.children]
+            for leaf in result.children} == {
+        CLOUDWATCH: [], EC2: [], LAMBDA: TWO_REGIONS, CODEPIPELINE: TWO_REGIONS,
+        BATCH: TWO_REGIONS}
+    assert _entry(_child(result, CLOUDWATCH), "api-latency").text.startswith(
+        "eu-central-1 / ")
+    assert _entry(_child(result, EC2), "web").text.startswith("eu-central-1 / ")
+
+
+def test_a_subject_keeps_every_part_whatever_shape_the_tree_has() -> None:
+    """§5: the account and the region are in a subject though neither is in the
+    path, so a history is found again after a tree has changed its shape."""
+    alone = _one_account(series_keep=30)
+    _keeping(alone)
+    flat = _readings(alone, functions=ONE_COLLECTOR,
+                     metrics={"collector": _point(timedelta(minutes=2))})
+    several = _build(series_keep=30,
+                     accounts=[{"name": "live", "regions": TWO_REGIONS},
+                               {"name": "backup"}])
+    _keeping(several)
+    deep = _readings(several, functions=ONE_COLLECTOR,
+                     metrics={"collector": _point(timedelta(minutes=2))})
+    assert {run.subject for run in _kind(flat, "run")} == {COLLECTOR}
+    assert COLLECTOR in {run.subject for run in _kind(deep, "run")}
+
+
+def test_a_region_a_reading_names_and_the_configuration_does_not_keeps_its_node(
+        ) -> None:
+    """Graded by a configuration that has moved on, no reading is graded away: a
+    region the readings name stands behind the regions the configuration names."""
+    check = _one_account(regions=TWO_REGIONS)
+    typed = [
+        Measurement({"aspect": None, "kind": "estate", "credentials": None,
+                     "accounts": [{"name": "live", "outcome": "read"}]},
+                    subject="accounts/live", state="live=read"),
+        Measurement({"aspect": None, "kind": "account", "account": "live",
+                     "outcome": "read", "error": None, "renewal": None}),
+        Measurement({"aspect": LAMBDA, "kind": "function", "account": "live",
+                     "region": "us-east-1", "name": "collector", "errors": 0,
+                     "at": "2026-08-10T11:58:00Z", "log_status": None,
+                     "log_note": None, "log_error": None}),
+        Measurement({"aspect": LAMBDA, "kind": "unreadable", "account": "live",
+                     "region": "ap-south-1", "error": "not allowed"}),
+    ]
+    leaf = _child(run_check(check, measurements=typed), LAMBDA)
+    assert [(node.name, [function.name for function in node.children],
+             node.stored_code) for node in leaf.children] == [
+        ("eu-central-1", [], StatusCode.OK), ("eu-west-1", [], StatusCode.OK),
+        ("ap-south-1", [], StatusCode.WARN),
+        ("us-east-1", ["collector"], StatusCode.OK)]
+
+
+def test_one_account_with_no_reading_of_its_own_has_nothing_hung_beneath_it(
+        ) -> None:
+    """The guard for readings no measurement of ours produced: an estate that
+    names the account as read, and no reading of the account."""
+    typed = [Measurement({"aspect": None, "kind": "estate", "credentials": None,
+                          "accounts": [{"name": "live", "outcome": "read"}]},
+                         subject="accounts/live", state="live=read")]
+    result = run_check(_one_account(), measurements=typed)
+    assert (result.code, result.children) == (StatusCode.UNDEFINED, ())
+    assert _texts(result) == ["1 account, 1 account/region pair in scope"]
+
+
+def test_an_account_s_title_and_about_are_not_shown_and_the_log_says_so_once(
+        caplog: pytest.LogCaptureFixture) -> None:
+    """§2: they label the account's node, and a check that names one account has
+    none. The configuration loads, the check's own labels stand, and the log says
+    once, when the check is loaded, which keys are read and not shown."""
+    with caplog.at_level(logging.INFO, logger="little_sister_aws.aws"):
+        check = _build(title="AWS", about="The team's account.", accounts=[
+            {"name": "live", "title": "Live", "about": "Customer-facing."}])
+        _stub(check)
+        result = run_check(check)
+        run_check(check)
+    said = [record.getMessage() for record in caplog.records
+            if "not shown" in record.getMessage()]
+    assert said == [
+        "/team/aws: the 'title' and 'about' of account 'live' are not shown: a "
+        "check that names one account has no node for it, and its aspects hang "
+        "beneath the check's own. Say them in the check's own 'title' and 'about'."]
+    assert (check.title, check.about) == ("AWS", "The team's account.")
+    assert all((node.title, node.about) == ("", "") for node in _nodes(result))
+
+
+def test_the_log_names_the_one_key_an_account_carries(
+        caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.INFO, logger="little_sister_aws.aws"):
+        _build(accounts=[{"name": "live", "about": "Customer-facing."}])
+    assert [record.getMessage() for record in caplog.records
+            if "not shown" in record.getMessage()] == [
+        "/team/aws: the 'about' of account 'live' is not shown: a check that "
+        "names one account has no node for it, and its aspects hang beneath the "
+        "check's own. Say it in the check's own 'about'."]
+
+
+def test_nothing_is_said_of_labels_that_are_shown_or_not_written(
+        caplog: pytest.LogCaptureFixture) -> None:
+    """Several accounts show theirs on their own nodes, and one account that
+    carries neither has nothing to move."""
+    with caplog.at_level(logging.INFO, logger="little_sister_aws.aws"):
+        _build(accounts=[{"name": "live", "about": "Customer-facing."},
+                         {"name": "backup", "title": "Backup"}])
+        _build(accounts=[{"name": "live", "about": "  "}])
+    assert [record.getMessage() for record in caplog.records
+            if "not shown" in record.getMessage()] == []
+
+
+def test_the_check_s_page_says_its_one_account_s_regions_and_credentials() -> None:
+    """§2: what the account's node would have said of its configuration — the
+    regions it is read in, its own where it names them, and where its credentials
+    come from — the check's page says in its place."""
+    alone = _build(profile=PRIMARY, accounts=[
+        {"name": "live", "role_arn": ROLE_LIVE, "regions": ["eu-west-1"]}])
+    summary = alone.config_summary()
+    assert "**regions:** eu-west-1" in summary
+    assert "default regions" not in summary
+    assert f"**credentials:** assumed role, from profile {PRIMARY}" in summary
+
+    several = _build(profile=PRIMARY).config_summary()
+    assert "**default regions:** eu-central-1" in several
+    assert f"**credentials:** profile {PRIMARY}" in several
+
+
+def test_an_account_read_with_configured_keys_says_so(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Static keys are neither a profile nor the ambient chain, and the line that
+    says where an account's credentials come from names them."""
+    monkeypatch.setenv("AWS_KEY", "AKIAEXAMPLE")
+    monkeypatch.setenv("AWS_SECRET", "not-a-secret")
+    secrets = {"access_key_id": "env://AWS_KEY",
+               "secret_access_key": "env://AWS_SECRET"}
+    alone = _build(secrets=secrets, accounts=[{"name": "live"}])
+    assert "**credentials:** configured keys" in alone.config_summary()
+    several = _build(secrets=secrets)
+    _stub(several)
+    live = _child(run_check(several), "live")
+    assert "**credentials:** assumed role, from configured keys" in live.config
+
+
+def test_the_pin_note_names_the_node_that_silences_the_account() -> None:
+    """The account's own where a check names several, and the check's where it
+    names one and the account has none — and an aspect whose subjects are nodes
+    says that a function's, a pipeline's or a job name's node is what is pinned."""
+    several, alone = _build(), _one_account()
+    assert several.subnode_labels[EC2]["about"].rstrip().endswith(
+        "pin the line you are working on and the rest keeps reporting. The "
+        "account node above silences the whole account.")
+    assert alone.subnode_labels[EC2]["about"].rstrip().endswith(
+        "pin the line you are working on and the rest keeps reporting. The "
+        "check's own node above silences the whole account.")
+    for aspect, subject in ((LAMBDA, "function"), (CODEPIPELINE, "pipeline"),
+                            (BATCH, "job name")):
+        assert alone.subnode_labels[aspect]["about"].rstrip().endswith(
+            f"Each {subject}'s node can be put into maintenance on its own — pin "
+            f"the {subject} you are working on and the rest keeps reporting. The "
+            "check's own node above silences the whole account."), aspect
+        assert several.subnode_labels[aspect]["about"].rstrip().endswith(
+            f"pin the {subject} you are working on and the rest keeps reporting. "
+            "The account node above silences the whole account."), aspect
+    assert alone.subnode_labels[CLOUDWATCH]["about"].rstrip().endswith(
+        "pin the line you are working on and the rest keeps reporting. The "
+        "check's own node above silences the whole account.")
+    # A token nothing declared would stand in the text as it was written.
+    assert not any("pin_note" in labels["about"]
+                   for labels in alone.subnode_labels.values())
+
+
+# --- a job name's node, a queue's and a pipeline's (ADR-0009) ---------------------
+#
+# Each test below is one sentence of ADR-0009, with values that make the sentence
+# false if the code is wrong. What a check keeps of a pipeline is bound here, as a
+# function's kept runs are, and no engine runs (little-sister ADR-0113 decision 4).
+
+#: The one job name and the one pipeline most of these tests read, as a subject
+#: spells each.
+ETL = "batch/live/eu-central-1/nightly/etl"
+DEPLOY = "codepipeline/live/eu-central-1/running-deploy"
+
+#: A page of four executions, the newest first: one on its way, one that failed, one
+#: a newer one overtook, and one that deployed.
+FOUR_EXECUTIONS = [
+    _execution("InProgress", started=timedelta(minutes=5), eid="e-4"),
+    _execution("Failed", started=timedelta(hours=1), updated=timedelta(minutes=50),
+               eid="e-3"),
+    _execution("Superseded", started=timedelta(hours=2), updated=timedelta(hours=1),
+               eid="e-2"),
+    _execution(started=timedelta(days=1), updated=timedelta(hours=23), eid="e-1")]
+
+
+def _holding(check: AwsCheck,
+             held: Mapping[str, Sequence[Any]] | None = None) -> list[str]:
+    """Bind what *check* finds kept of a pipeline, and answer the list every subject
+    it asks for lands in. An execution is given as the id it names and the status
+    its record keeps — `None` for a record that keeps none — and then started as
+    many days ago as its place from the end of the list, the last one a day ago; a
+    third value says how long ago it started instead. A record given whole is
+    handed over as it is."""
+    kept = held or {}
+    asked: list[str] = []
+
+    def reader(subject: str) -> tuple[SeriesRecord, ...]:
+        asked.append(subject)
+        executions = kept.get(subject, ())
+        records: list[SeriesRecord] = []
+        for index, one in enumerate(executions):
+            if isinstance(one, SeriesRecord):
+                records.append(one)
+                continue
+            eid, status, *started = one
+            ago = started[0] if started else timedelta(
+                days=len(executions) - index)
+            records.append(SeriesRecord(
+                {"at": _stamp(ago),
+                 **({} if status is None else {"status": status})}, NOW, eid))
+        return tuple(records)
+
+    check.bind_kept(reader)
+    return asked
+
+
+def _executions_read(check: AwsCheck, page: Sequence[dict[str, Any]],
+                     held: Sequence[Any] = ()
+                     ) -> tuple[tuple[Measurement, ...], list[str]]:
+    """One poll of the one pipeline whose executions are *page*, by a check that
+    holds *held* of it: what the poll read, and the subjects whose history it
+    asked for."""
+    asked = _holding(check, {DEPLOY: held})
+    taken = _readings(check, pipelines=ONE_PIPELINE,
+                      executions={"running-deploy": list(page)})
+    return taken, asked
+
+
+def _deploy(check: AwsCheck, taken: Sequence[Measurement]) -> CheckResult:
+    """The `running-deploy` pipeline's node, graded from what *check* read."""
+    return _node(_aspect(check, run_check(check, measurements=taken), CODEPIPELINE),
+                 "running-deploy")
+
+
+def test_a_job_name_has_a_node_beneath_its_queue_s_named_by_what_aws_calls_it(
+        ) -> None:
+    """§1: one whose newest run succeeded, one whose failed and one that only waits
+    alike — a node each beneath its queue's, with the job name's line as its only
+    one, and the queues and the job names in name order."""
+    leaf = _batch(
+        _one_account(),
+        queues={"eu-central-1": [[_queue("nightly"), _queue("hourly")]]},
+        jobs={("nightly", "SUCCEEDED"): [[_job("well", job_id="j-1",
+                                               created=timedelta(hours=1))]],
+              ("nightly", "FAILED"): [[_job("failed", "FAILED", job_id="j-2",
+                                            created=timedelta(hours=1))]],
+              ("hourly", "RUNNABLE"): [[_job("waiting", "RUNNABLE", job_id="j-3",
+                                             created=timedelta(hours=1))]]})
+    assert [(queue.name, [(node.name, node.stored_code, len(node.reason_entries))
+                          for node in queue.children])
+            for queue in leaf.children] == [
+        ("hourly", [("waiting", StatusCode.WARN, 1)]),
+        ("nightly", [("failed", StatusCode.ERROR, 1), ("well", StatusCode.OK, 1)])]
+    assert all(node.children == ()
+               for queue in leaf.children for node in queue.children)
+    # `batch` keeps the count, which is of queues, and nothing else of its own.
+    assert _texts(leaf) == ["2 job queues in scope (eu-central-1)"]
+
+
+def test_a_queue_is_a_level_where_an_account_holds_one_queue_alone() -> None:
+    """§2: a queue is nothing a configuration names, so its level does not come and
+    go with the queues AWS answers."""
+    leaf = _batch(_one_account(), queues=ONE_QUEUE, jobs={
+        ("nightly", "SUCCEEDED"): [[_job("etl", created=timedelta(hours=1))]]})
+    assert [(queue.name, [node.name for node in queue.children])
+            for queue in leaf.children] == [("nightly", ["etl"])]
+
+
+def test_a_queue_s_node_carries_what_the_queue_says_of_itself() -> None:
+    """§2: that it is invalid or disabled, holds no jobs or was read only in part —
+    on a line that carries the queue's reading and names no subject, under the slug
+    it had — and nothing at all where there is nothing to say."""
+    check = _one_account()
+    taken = _readings(
+        check,
+        queues={"eu-central-1": [[_queue("idle", state="DISABLED"), _queue()]]},
+        jobs={("nightly", "SUCCEEDED"): [[_job("etl",
+                                               created=timedelta(hours=1))]]})
+    idle, nightly = _aspect(check, run_check(check, measurements=taken),
+                            BATCH).children
+    (reading,) = [queue for queue in _kind(taken, "queue")
+                  if queue.record["name"] == "idle"]
+    (line,) = idle.reason_entries
+    assert (line.code, line.subject, line.data, line.slug) == (
+        StatusCode.WARN, "", dict(reading.record), "eu-central-1-idle")
+    assert line.text == (
+        "[idle](https://eu-central-1.console.aws.amazon.com/batch/home"
+        "?region=eu-central-1#queues): the queue is DISABLED and accepts no new "
+        "jobs · no jobs found")
+    assert (nightly.stored_code, nightly.reason_entries, nightly.for_record) == (
+        StatusCode.OK, (), ())
+
+
+def test_a_queue_s_node_says_that_its_job_names_are_complete_in_every_run_that_lists_it(
+        ) -> None:
+    """§2: so a job name that stopped running leaves with the next run — the last
+    one too. A queue read at its cap says it as well: a name whose runs are no
+    longer among those read would otherwise stand stale beneath it, and it returns
+    with its next run (little-sister ADR-0109 decision 3)."""
+    jobs = {("nightly", "SUCCEEDED"): [[
+        _job("etl", job_id="j-0", created=timedelta(hours=1)),
+        _job("etl", job_id="j-1", created=timedelta(hours=2)),
+        _job("weekly", job_id="j-2", created=timedelta(days=6))]]}
+    whole = _child(_batch(_one_account(batch={"max_jobs": 3}), queues=ONE_QUEUE,
+                          jobs=jobs), "nightly")
+    capped = _child(_batch(_one_account(batch={"max_jobs": 2}), queues=ONE_QUEUE,
+                           jobs=jobs), "nightly")
+    empty = _child(_batch(_one_account(), queues=ONE_QUEUE), "nightly")
+    assert (whole.children_complete, [node.name for node in whole.children],
+            _texts(whole)) == (True, ["etl", "weekly"], [])
+    assert (capped.children_complete, [node.name for node in capped.children]) == (
+        True, ["etl"])
+    assert _texts(capped)[0].endswith(
+        ": only the newest 2 jobs per status were read")
+    assert (empty.children_complete, empty.children) == (True, ())
+
+
+def test_the_node_the_queues_hang_on_says_that_its_children_are_complete() -> None:
+    """§8: where their listing was read, so a queue that was deleted, or that
+    `ignore_queue_patterns` now names, leaves with the next good run; where it
+    could not be read the node leaves that unsaid, and the queues stay."""
+    read = _batch(_one_account(), queues=ONE_QUEUE)
+    unread = _batch(_one_account(), batch_unreadable={"eu-central-1"})
+    none = _batch(_one_account())
+    assert (read.children_complete, [node.name for node in read.children]) == (
+        True, ["nightly"])
+    assert (unread.children_complete, unread.children) == (False, ())
+    assert (none.children_complete, none.children) == (True, ())
+
+
+def test_a_job_name_s_line_names_the_job_name_and_carries_no_run() -> None:
+    """§3: written from every run of the name, so it carries none of them — and it
+    names the one object they all are, which is what makes the node stand for the
+    job name. Its sentence is the one it had, under the slug it had."""
+    leaf = _batch(_one_account(), queues=ONE_QUEUE, jobs={
+        ("nightly", "SUCCEEDED"): [[_job("etl", job_id="j-1",
+                                         created=timedelta(hours=3),
+                                         started=timedelta(hours=3),
+                                         stopped=timedelta(hours=2))]],
+        ("nightly", "RUNNING"): [[_job("etl", "RUNNING", job_id="j-2",
+                                       started=timedelta(minutes=4))]]})
+    (line,) = _node(leaf, "etl").reason_entries
+    assert (line.subject, line.data, line.slug) == (
+        ETL, None, "eu-central-1-nightly-etl")
+    assert line.text == (
+        "[etl](https://eu-central-1.console.aws.amazon.com/batch/home"
+        "?region=eu-central-1#jobs/detail/j-1): SUCCEEDED 2h ago, ran 1h · "
+        "1 running (4m)")
+
+
+def test_a_job_name_whose_runs_neither_ended_nor_run_nor_wait_says_so() -> None:
+    """§3, §4: the measuring half asks Batch for no other status, so only a reading
+    this process did not take names one. Its job name has its node all the same,
+    since the run is kept under the name: the line says what is true of the name
+    and grades nothing against it, and nothing is said of the run for the record."""
+    batch = _batch(_one_account(), queues=ONE_QUEUE, jobs={
+        ("nightly", "RUNNING"): [[_job("etl", "STARTING", job_id="j-1",
+                                       created=timedelta(minutes=2))]]})
+    node = _node(batch, "etl")
+    (line,) = node.reason_entries
+    assert (line.subject, line.code, line.text.split("): ")[-1]) == (
+        ETL, StatusCode.OK, "no run finished, running or waiting")
+    assert node.for_record == ()
+
+
+def test_a_job_name_s_line_prints_neither_its_region_nor_its_queue() -> None:
+    """§3: the levels say both where an account reads several regions, and nothing
+    has to say the region where it reads one — and a slug keeps every part, as
+    ADR-0001 has it. A queue's own line prints no region either."""
+    leaf = _batch(_one_account(regions=TWO_REGIONS),
+                  queues={"eu-west-1": [[_queue(state="DISABLED")]]},
+                  jobs={("nightly", "SUCCEEDED"): [[
+                      _job("etl", created=timedelta(hours=1))]]})
+    queue = _child(_child(leaf, "eu-west-1"), "nightly")
+    (said,) = queue.reason_entries
+    (line,) = _child(queue, "etl").reason_entries
+    assert (said.slug, line.slug) == ("eu-west-1-nightly", "eu-west-1-nightly-etl")
+    assert said.text.startswith("[nightly](https://eu-west-1.console")
+    assert line.text.startswith("[etl](https://eu-west-1.console")
+    assert line.subject == "batch/live/eu-west-1/nightly/etl"
+
+    one = _batch(_one_account(), queues=ONE_QUEUE, jobs={
+        ("nightly", "SUCCEEDED"): [[_job("etl", created=timedelta(hours=1))]]})
+    assert _node(one, "etl").reason[0].text.startswith("[etl](")
+
+
+def test_every_run_a_poll_read_is_said_for_the_record_with_a_verdict_of_its_own(
+        ) -> None:
+    """§4: one that succeeded passes and one that failed fails, in a sentence that
+    says how long it waited and how long it ran; one that still runs or waits
+    passes, and says for how long — each on a line no node shows, which carries the
+    run's record and names its job name."""
+    check = _one_account()
+    taken = _readings(check, queues=ONE_QUEUE, jobs={
+        ("nightly", "SUCCEEDED"): [[_job(
+            "etl", job_id="j-1", created=timedelta(hours=3),
+            started=timedelta(hours=2, minutes=50), stopped=timedelta(hours=2))]],
+        ("nightly", "FAILED"): [[_job(
+            "etl", "FAILED", job_id="j-2", created=timedelta(hours=5),
+            started=timedelta(hours=4, minutes=58),
+            stopped=timedelta(hours=4, minutes=45))]],
+        ("nightly", "RUNNING"): [[_job(
+            "etl", "RUNNING", job_id="j-3", created=timedelta(minutes=9),
+            started=timedelta(minutes=4))]],
+        ("nightly", "RUNNABLE"): [[_job(
+            "etl", "RUNNABLE", job_id="j-4", created=timedelta(minutes=5))]]})
+    node = _node(_aspect(check, run_check(check, measurements=taken), BATCH), "etl")
+    runs = _kind(taken, "job")
+    assert len(node.reason_entries) == 1
+    assert [(line.code, line.text, line.subject, line.data)
+            for line in node.for_record] == [
+        (StatusCode.OK, "SUCCEEDED, waited 10m, ran 50m", ETL,
+         dict(runs[0].record)),
+        (StatusCode.ERROR, "FAILED, waited 2m, ran 13m", ETL, dict(runs[1].record)),
+        (StatusCode.OK, "RUNNING for 4m", ETL, dict(runs[2].record)),
+        (StatusCode.OK, "RUNNABLE for 5m", ETL, dict(runs[3].record))]
+
+
+@pytest.mark.parametrize(("status", "times", "code", "text"), [
+    ("RUNNING", {"started": timedelta(hours=2)}, StatusCode.OK, "RUNNING for 2h"),
+    ("RUNNING", {"started": timedelta(hours=2, seconds=1)}, StatusCode.WARN,
+     "RUNNING for 2h, past max_run_time"),
+    ("RUNNABLE", {"created": timedelta(minutes=30)}, StatusCode.OK,
+     "RUNNABLE for 30m"),
+    ("RUNNABLE", {"created": timedelta(minutes=30, seconds=1)}, StatusCode.WARN,
+     "RUNNABLE for 30m, past max_wait_time"),
+    # A wait is counted from when the job was created: it never started.
+    ("RUNNABLE", {"created": timedelta(hours=1), "started": timedelta(minutes=1)},
+     StatusCode.WARN, "RUNNABLE for 1h, past max_wait_time"),
+    # A run counts from when it started, however long it waited before.
+    ("RUNNING", {"created": timedelta(hours=9), "started": timedelta(minutes=1)},
+     StatusCode.OK, "RUNNING for 1m"),
+    # No instant to count from: nothing to hold against the bound.
+    ("RUNNING", {}, StatusCode.OK, "RUNNING"),
+    ("RUNNABLE", {}, StatusCode.OK, "RUNNABLE"),
+    # A finished run says the spans its instants give, and no more.
+    ("SUCCEEDED", {"started": timedelta(minutes=9), "stopped": timedelta(minutes=4)},
+     StatusCode.OK, "SUCCEEDED, ran 5m"),
+    ("FAILED", {"created": timedelta(minutes=9), "stopped": timedelta(minutes=4)},
+     StatusCode.ERROR, "FAILED"),
+])
+def test_a_run_in_flight_warns_for_the_record_once_it_is_past_its_bound(
+        status: str, times: dict[str, timedelta], code: StatusCode,
+        text: str) -> None:
+    """§4: past `max_run_time` where it runs and past `max_wait_time` where it
+    waits, the bounds its job name's line is graded by — *more than*, as there."""
+    leaf = _batch(_one_account(), queues=ONE_QUEUE,
+                  jobs={("nightly", status): [[_job("etl", status, **times)]]})
+    assert [(line.code, line.text) for line in _node(leaf, "etl").for_record] == [
+        (code, text)]
+
+
+def test_the_bounds_a_run_is_held_against_are_the_configuration_s() -> None:
+    check = _one_account(batch={"max_run_time": "10m", "max_wait_time": "2m"})
+    leaf = _batch(check, queues=ONE_QUEUE, jobs={
+        ("nightly", "RUNNING"): [[_job("etl", "RUNNING", job_id="j-1",
+                                       started=timedelta(minutes=20))]],
+        ("nightly", "RUNNABLE"): [[_job("etl", "RUNNABLE", job_id="j-2",
+                                        created=timedelta(minutes=3))]]})
+    assert [(line.code, line.text) for line in _node(leaf, "etl").for_record] == [
+        (StatusCode.WARN, "RUNNING for 20m, past max_run_time"),
+        (StatusCode.WARN, "RUNNABLE for 3m, past max_wait_time")]
+
+
+def test_a_run_s_verdict_for_the_record_is_measured_to_the_instant_it_is_graded(
+        ) -> None:
+    """§4: graded again three hours on, over the reading the poll took, a run that
+    was within its bound is past it."""
+    check = _one_account()
+    taken = _readings(check, queues=ONE_QUEUE, jobs={
+        ("nightly", "RUNNING"): [[_job("etl", "RUNNING",
+                                       started=timedelta(minutes=4))]]})
+    later = run_check(check, measurements=taken, now=NOW + timedelta(hours=3))
+    assert [(line.code, line.text)
+            for line in _node(_aspect(check, later, BATCH), "etl").for_record] == [
+        (StatusCode.WARN, "RUNNING for 3h 4m, past max_run_time")]
+
+
+def test_a_run_takes_its_last_verdict_from_the_poll_that_reads_it_finished(
+        ) -> None:
+    """§4: read running past its bound it warns, and read finished it is the same
+    run, by its `jobId`, and says how it ended."""
+    def said(status: str, **times: timedelta
+             ) -> list[tuple[str, StatusCode | None, str]]:
+        check = _one_account()
+        taken = _readings(check, queues=ONE_QUEUE, jobs={
+            ("nightly", status): [[_job("etl", status, job_id="j-9", **times)]]})
+        node = _node(_aspect(check, run_check(check, measurements=taken), BATCH),
+                     "etl")
+        (run,) = _kind(taken, "job")
+        return [(run.identity, line.code, line.text) for line in node.for_record]
+
+    assert said("RUNNING", created=timedelta(hours=4),
+                started=timedelta(hours=3)) == [
+        ("j-9", StatusCode.WARN, "RUNNING for 3h, past max_run_time")]
+    assert said("SUCCEEDED", created=timedelta(hours=4), started=timedelta(hours=3),
+                stopped=timedelta(minutes=1)) == [
+        ("j-9", StatusCode.OK, "SUCCEEDED, waited 1h, ran 2h 59m")]
+
+
+def test_a_retry_in_flight_passes_for_the_record_and_leaves_its_job_name_red(
+        ) -> None:
+    """§3, §4: the line is the name's, graded on its newest finished run, so a
+    retry submitted after a failure does not turn it green; each run's verdict is
+    its own."""
+    leaf = _batch(_one_account(), queues=ONE_QUEUE, jobs={
+        ("nightly", "FAILED"): [[_job("etl", "FAILED", job_id="j-1",
+                                      created=timedelta(hours=1),
+                                      started=timedelta(hours=1),
+                                      stopped=timedelta(minutes=50))]],
+        ("nightly", "RUNNING"): [[_job("etl", "RUNNING", job_id="j-2",
+                                       created=timedelta(minutes=5),
+                                       started=timedelta(minutes=4))]]})
+    node = _node(leaf, "etl")
+    assert node.stored_code is StatusCode.ERROR
+    assert [line.code for line in node.for_record] == [
+        StatusCode.ERROR, StatusCode.OK]
+
+
+def test_runs_typed_by_hand_are_said_for_the_record_as_the_ones_a_poll_read(
+        ) -> None:
+    """The grading reads the records and nothing else (little-sister ADR-0086
+    decision 6): a run this process never read stands on its job name's node like
+    one it did, kept before a record carried its two spans — and one in a status
+    this aspect does not read is said nothing of."""
+    record = {"aspect": BATCH, "account": "live", "region": "eu-central-1"}
+
+    def run(job_id: str, status: str) -> Measurement:
+        return Measurement(
+            {**record, "kind": "job", "queue": "nightly", "name": "etl",
+             "id": job_id, "status": status, "reason": None,
+             "created": {"at": "2026-08-10T09:00:00Z"},
+             "started": "2026-08-10T09:10:00Z", "ended": "2026-08-10T10:00:00Z",
+             "at": "2026-08-10T10:00:00Z"},
+            subject=ETL, identity=job_id)
+
+    typed = [
+        Measurement({"aspect": None, "kind": "estate", "credentials": None,
+                     "accounts": [{"name": "live", "outcome": "read"}]},
+                    subject="accounts/live", state="live=read"),
+        Measurement({"aspect": None, "kind": "account", "account": "live",
+                     "outcome": "read", "error": None, "renewal": None}),
+        Measurement({**record, "kind": "queue", "name": "nightly",
+                     "state": "ENABLED", "status": "VALID", "reason": None,
+                     "capped": False}),
+        run("j-1", "FAILED"), run("j-2", "PENDING")]
+    node = _node(_child(run_check(_one_account(), measurements=typed), BATCH),
+                 "etl")
+    (said,) = node.for_record
+    assert (said.code, said.text, said.subject, said.data) == (
+        StatusCode.ERROR, "FAILED, waited 10m, ran 50m", ETL,
+        dict(typed[3].record))
+    assert node.reason[0].subject == ETL
+
+
+def test_a_job_name_the_list_hides_is_not_kept() -> None:
+    """§7: the measuring half leaves out the runs of a name `ignore_name_patterns`
+    hides, so the name has no series and no node — and a run read before the list
+    named it is said nothing of, and has no node either."""
+    jobs = {("nightly", "FAILED"): [[_job("smoke-test", "FAILED", job_id="j-1",
+                                          created=timedelta(hours=1))]],
+            ("nightly", "SUCCEEDED"): [[_job("etl", job_id="j-2",
+                                             created=timedelta(hours=1))]]}
+    hiding = _one_account(batch={"ignore_name_patterns": ["SMOKE"]})
+    assert [run.record["name"] for run in _kind(
+        _readings(hiding, queues=ONE_QUEUE, jobs=jobs), "job")] == ["etl"]
+
+    before = _readings(_one_account(), queues=ONE_QUEUE, jobs=jobs)
+    assert sorted(run.record["name"] for run in _kind(before, "job")) == [
+        "etl", "smoke-test"]
+    queue = _child(_child(run_check(hiding, measurements=before), BATCH),
+                   "nightly")
+    assert [node.name for node in queue.children] == ["etl"]
+    assert {line.subject for node in _nodes(queue)
+            for line in node.for_record} == {ETL}
+
+    bare = _child(_batch(_one_account(batch={
+        "ignore_name_patterns": ["smoke", "etl"]}), queues=ONE_QUEUE, jobs=jobs),
+        "nightly")
+    assert bare.children == ()
+    assert _texts(bare)[0].endswith(": no jobs found")
+
+
+def test_a_display_name_rule_gives_a_job_name_and_a_pipeline_a_title_and_no_path(
+        ) -> None:
+    """§1: `shorten` reaches the node's title and its line's label, and neither the
+    node's name nor the slug — and a queue is named as it is, whatever the rules
+    say."""
+    check = _one_account(shorten=[{"from": "running-"}])
+    _stub(check, queues={"eu-central-1": [[_queue("running-queue")]]},
+          jobs={("running-queue", "SUCCEEDED"): [[
+              _job("running-etl", job_id="j-1", created=timedelta(hours=1)),
+              _job("plain", job_id="j-2", created=timedelta(hours=1))]]},
+          pipelines={"eu-central-1": [["running-deploy", "bare"]]},
+          executions={"running-deploy": [_execution()], "bare": [_execution()]})
+    result = run_check(check)
+    queue = _child(_child(result, BATCH), "running-queue")
+    assert (queue.name, queue.title) == ("running-queue", "")
+    short, untouched = _child(queue, "running-etl"), _child(queue, "plain")
+    assert (short.name, short.title) == ("running-etl", "etl")
+    assert short.reason[0].slug == "eu-central-1-running-queue-running-etl"
+    assert short.reason[0].text.startswith("[etl](")
+    assert (untouched.name, untouched.title) == ("plain", "")
+    pipelines = _child(result, CODEPIPELINE)
+    deploy, bare = _child(pipelines, "running-deploy"), _child(pipelines, "bare")
+    assert (deploy.name, deploy.title) == ("running-deploy", "deploy")
+    assert deploy.reason[0].slug == "eu-central-1-running-deploy"
+    assert deploy.reason[0].text.startswith("[deploy](")
+    assert (bare.name, bare.title) == ("bare", "")
+
+
+def test_a_queue_a_job_name_and_a_pipeline_say_where_they_are_and_who_names_them(
+        ) -> None:
+    """§1, §2: a path may name neither the account nor the region, so each node's
+    description does — a job name's queue is in every path. Each is named by AWS
+    and says so (little-sister ADR-0118), so a queue called `lambda` is not the
+    `lambda` aspect. A queue's node is the box its job names stand in and declines
+    the density trade; a job name's and a pipeline's declare nothing of it."""
+    check = _one_account()
+    _stub(check, queues={"eu-central-1": [[_queue("lambda")]]},
+          jobs={("lambda", "SUCCEEDED"): [[_job("ec2",
+                                                created=timedelta(hours=1))]]},
+          pipelines={"eu-central-1": [["batch"]]},
+          executions={"batch": [_execution()]})
+    result = run_check(check)
+    queue = _child(_child(result, BATCH), "lambda")
+    job, pipeline = _child(queue, "ec2"), _child(_child(result, CODEPIPELINE),
+                                                 "batch")
+    assert [(node.description, node.dynamic, node.show_when_quiet)
+            for node in (queue, job, pipeline)] == [
+        ("Batch job queue in live, eu-central-1", True, True),
+        ("Batch job name in live, eu-central-1", True, None),
+        ("CodePipeline pipeline in live, eu-central-1", True, None)]
+    assert {aspect.dynamic for aspect in result.children} == {False}
+    assert check.subnode_show_when_quiet[BATCH] is True
+    assert check.subnode_show_when_quiet[CODEPIPELINE] is True
+
+
+@pytest.mark.parametrize(("aspect", "stub", "unreadable", "noun", "described"), [
+    (BATCH, {"queues": {"eu-central-1": [[_queue("nightly")]]}},
+     "batch_unreadable", "job queues", "Batch job queues in live"),
+    (CODEPIPELINE, {"pipelines": {"eu-central-1": [["deploy"]]},
+                    "executions": {"deploy": [_execution()]}},
+     "pipelines_unreadable", "pipelines", "CodePipeline pipelines in live"),
+])
+def test_a_queue_and_a_pipeline_hang_beneath_their_region_s_node_where_several_are_read(
+        aspect: str, stub: dict[str, Any], unreadable: str, noun: str,
+        described: str) -> None:
+    """§8, by ADR-0007 §3: a region's node is named by the region and grades nothing
+    of its own unless the region could not be read; it says that its children are
+    complete where it was read, declines the density trade and says that the
+    configuration names it — and the aspect's node keeps the count and says
+    nothing of its children."""
+    check = _one_account(regions=TWO_REGIONS)
+    _stub(check, **stub, **{unreadable: {"eu-west-1"}})
+    leaf = _child(run_check(check), aspect)
+    read, unread = leaf.children
+    assert (read.name, read.stored_code, _texts(read), read.children_complete,
+            len(read.children)) == ("eu-central-1", StatusCode.OK, [], True, 1)
+    assert (unread.name, unread.stored_code, unread.children,
+            unread.children_complete) == ("eu-west-1", StatusCode.WARN, (), False)
+    assert _texts(unread)[0].startswith(f"eu-west-1: {noun} cannot be read")
+    assert [(node.description, node.show_when_quiet, node.dynamic)
+            for node in leaf.children] == [
+        (f"{described}, eu-central-1", True, True),
+        (f"{described}, eu-west-1", True, True)]
+    assert (leaf.children_complete, leaf.description, leaf.dynamic) == (
+        False, described, False)
+    assert [entry.slug for entry in leaf.reason] == ["scope"]
+
+
+def test_two_regions_queues_of_one_name_are_told_apart_by_their_region_s_level(
+        ) -> None:
+    """§8: and by nothing else in a path — while each job name's subject, and the
+    roster, name the region."""
+    leaf = _batch(_one_account(regions=TWO_REGIONS),
+                  queues={"eu-central-1": [[_queue()]], "eu-west-1": [[_queue()]]},
+                  jobs={("nightly", "SUCCEEDED"): [[
+                      _job("etl", created=timedelta(hours=1))]]})
+    assert [(region.name, [(queue.name, [node.name for node in queue.children])
+                           for queue in region.children])
+            for region in leaf.children] == [
+        ("eu-central-1", [("nightly", ["etl"])]),
+        ("eu-west-1", [("nightly", ["etl"])])]
+    assert _texts(leaf) == ["2 job queues in scope (eu-central-1, eu-west-1)"]
+    assert [line.split("]")[0] for line in leaf.report.splitlines()] == [
+        "- eu-central-1 / [nightly", "- eu-west-1 / [nightly"]
+    assert {line.subject for node in _nodes(leaf) for line in node.reason_entries
+            if line.subject} == {ETL, "batch/live/eu-west-1/nightly/etl"}
+
+
+def test_every_pipeline_has_a_node_beneath_codepipeline_named_by_what_aws_calls_it(
+        ) -> None:
+    """§1: one that deployed, one that failed and one that never ran alike — a node
+    each, in name order, with the pipeline's line as its only one."""
+    leaf = _pipelines(_one_account(),
+                      pipelines={"eu-central-1": [["well", "failed", "never"]]},
+                      executions={"well": [_execution()],
+                                  "failed": [_execution("Failed")]})
+    assert [(node.name, node.stored_code, len(node.reason_entries))
+            for node in leaf.children] == [
+        ("failed", StatusCode.ERROR, 1), ("never", StatusCode.WARN, 1),
+        ("well", StatusCode.OK, 1)]
+    assert all(node.children == () for node in leaf.children)
+
+
+def test_a_pipeline_s_line_carries_its_newest_execution() -> None:
+    """§5: the record of the reading it was written from, and the pipeline as its
+    subject — the reading's own, and what makes the node stand for the pipeline. A
+    check that keeps no series reads that execution and no other."""
+    check = _one_account()
+    taken = _readings(check, pipelines=ONE_PIPELINE, executions={"running-deploy": [
+        _execution(started=timedelta(days=1), eid="e-1"),
+        _execution("Failed", started=timedelta(hours=1), eid="e-2")]})
+    (newest,) = _kind(taken, "pipeline")
+    node = _deploy(check, taken)
+    (line,) = node.reason_entries
+    assert (newest.identity, newest.subject) == ("e-2", DEPLOY)
+    assert (line.subject, line.data, line.slug) == (
+        DEPLOY, dict(newest.record), "eu-central-1-running-deploy")
+    assert line.text.endswith(": Failed, started 1h ago")
+    assert node.for_record == ()
+
+
+@pytest.mark.parametrize("newest_first", [True, False])
+def test_a_poll_reads_every_execution_its_pipeline_s_history_lacks(
+        newest_first: bool) -> None:
+    """§5: from the page the aspect already asks for, whatever order it lists them
+    in — so a pipeline's series is whole from its first poll — the newest first,
+    each a reading of the pipeline that names its own execution and says how long
+    it took."""
+    page = FOUR_EXECUTIONS if newest_first else list(reversed(FOUR_EXECUTIONS))
+    taken, asked = _executions_read(_one_account(series_keep=30), page)
+    assert asked == [DEPLOY]
+    assert [(one.identity, one.subject, one.record["status"],
+             one.record["duration_s"]) for one in _kind(taken, "pipeline")] == [
+        ("e-4", DEPLOY, "InProgress", None), ("e-3", DEPLOY, "Failed", 600),
+        ("e-2", DEPLOY, "Superseded", 3600), ("e-1", DEPLOY, "Succeeded", 3600)]
+
+
+def test_an_execution_its_history_holds_finished_is_not_read_again() -> None:
+    """§5: one it holds unfinished is, so an execution a newer one overtook while it
+    ran is read to its end — and neither a word this type does not know nor a
+    record that keeps no status ends anything. A status is the word it is whatever
+    its case and its padding."""
+    taken, _ = _executions_read(
+        _one_account(series_keep=30), FOUR_EXECUTIONS,
+        [("e-1", "Paused"), ("e-2", "Superseded"), ("e-3", "InProgress")])
+    assert [one.identity for one in _kind(taken, "pipeline")] == [
+        "e-4", "e-3", "e-1"]
+    unsaid, _ = _executions_read(
+        _one_account(series_keep=30), FOUR_EXECUTIONS,
+        [("e-1", None), ("e-2", "Superseded"), ("e-3", "Failed"),
+         ("e-4", "InProgress")])
+    assert [one.identity for one in _kind(unsaid, "pipeline")] == ["e-4", "e-1"]
+    settled, _ = _executions_read(
+        _one_account(series_keep=30), FOUR_EXECUTIONS,
+        [("e-1", "Succeeded"), ("e-2", "superseded"), ("e-3", " FAILED "),
+         ("e-4", "InProgress")])
+    assert [one.identity for one in _kind(settled, "pipeline")] == ["e-4"]
+
+
+def test_an_execution_that_was_the_newest_is_read_once_more_behind_a_newer_one(
+        ) -> None:
+    """§5: what stood for it was its pipeline's line, so the poll that first finds a
+    newer execution reads it behind that one, and it is said for the record as any
+    execution behind the newest is. The next poll leaves it alone."""
+    check = _one_account(series_keep=30)
+    taken, _ = _executions_read(check, FOUR_EXECUTIONS, [
+        ("e-1", "Succeeded"), ("e-2", "Superseded"), ("e-3", "Failed")])
+    assert [one.identity for one in _kind(taken, "pipeline")] == ["e-4", "e-3"]
+    assert [(line.code, line.text)
+            for line in _deploy(check, taken).for_record] == [
+        (StatusCode.ERROR, "Failed")]
+    after, _ = _executions_read(_one_account(series_keep=30), FOUR_EXECUTIONS, [
+        ("e-1", "Succeeded"), ("e-2", "Superseded"), ("e-3", "Failed"),
+        ("e-4", "InProgress")])
+    assert [one.identity for one in _kind(after, "pipeline")] == ["e-4"]
+
+
+def test_two_kept_executions_of_one_instant_were_both_the_newest() -> None:
+    """§5: which of two that started at one instant carried the line, when they
+    started does not say. While one of them is the page's newest, neither is read
+    behind it; once a newer execution has started, both are read once more, and the
+    poll after that leaves both alone. An older one the history holds finished is
+    left alone throughout."""
+    hour = timedelta(hours=1)
+    first = _execution("Failed", started=hour, eid="e-a")
+    second = _execution(started=hour, eid="e-b")
+    before = _execution(started=timedelta(hours=2), eid="e-0")
+    held = [("e-0", "Succeeded", timedelta(hours=2)),
+            ("e-a", "Failed", hour), ("e-b", "Succeeded", hour)]
+    for page, newest in (([first, second, before], "e-a"),
+                         ([second, first, before], "e-b")):
+        taken, _ = _executions_read(_one_account(series_keep=30), page, held)
+        assert [one.identity for one in _kind(taken, "pipeline")] == [newest]
+    newer = _execution("InProgress", started=timedelta(minutes=5), eid="e-c")
+    taken, _ = _executions_read(_one_account(series_keep=30),
+                                [newer, first, second, before], held)
+    assert [one.identity for one in _kind(taken, "pipeline")] == [
+        "e-c", "e-a", "e-b"]
+    after, _ = _executions_read(
+        _one_account(series_keep=30), [newer, first, second, before],
+        [*held, ("e-c", "InProgress", timedelta(minutes=5))])
+    assert [one.identity for one in _kind(after, "pipeline")] == ["e-c"]
+
+
+def test_a_new_execution_of_the_kept_newest_s_own_instant_overtakes_it() -> None:
+    """§5: the page's newest is told from the history's by the execution it names
+    and not by when it started. One that started at the instant the kept newest
+    did, and that CodePipeline lists first, has overtaken it: the kept one is read
+    once more, and left alone once both are kept."""
+    hour = timedelta(hours=1)
+    new = _execution(started=hour, eid="e-n")
+    known = _execution(started=hour, eid="e-p")
+    held = [("e-p", "Succeeded", hour)]
+    taken, _ = _executions_read(_one_account(series_keep=30), [new, known], held)
+    assert [one.identity for one in _kind(taken, "pipeline")] == ["e-n", "e-p"]
+    after, _ = _executions_read(_one_account(series_keep=30), [new, known],
+                                [*held, ("e-n", "Succeeded", hour)])
+    assert [one.identity for one in _kind(after, "pipeline")] == ["e-n"]
+
+
+def test_the_history_s_newest_is_the_one_that_started_last_wherever_it_stands(
+        ) -> None:
+    """§5: found by when each kept execution started and not by its place — and a
+    record of the pipeline from before it ever ran, which names no execution and no
+    start, is none of them."""
+    never = SeriesRecord({"name": "running-deploy", "status": None, "at": None},
+                         NOW, state=NEVER_RUN)
+    taken, _ = _executions_read(_one_account(series_keep=30), FOUR_EXECUTIONS, [
+        ("e-3", "Failed", timedelta(hours=1)), never,
+        ("e-1", "Succeeded", timedelta(days=1)),
+        ("e-2", "Superseded", timedelta(hours=2))])
+    assert [one.identity for one in _kind(taken, "pipeline")] == ["e-4", "e-3"]
+
+
+def test_a_newest_execution_without_an_id_is_the_history_s_newest_all_the_same(
+        ) -> None:
+    """§5: kept, it is a record that names no execution, and the one before it is
+    read once more and then left alone — not on every poll."""
+    nameless = _execution("InProgress", started=timedelta(minutes=5))
+    known = _execution(started=timedelta(hours=1), eid="e-1")
+    held = [("e-1", "Succeeded", timedelta(hours=1))]
+    taken, _ = _executions_read(_one_account(series_keep=30), [nameless, known],
+                                held)
+    assert [one.identity for one in _kind(taken, "pipeline")] == ["", "e-1"]
+    after, _ = _executions_read(
+        _one_account(series_keep=30), [nameless, known],
+        [*held, ("", "InProgress", timedelta(minutes=5))])
+    assert [one.identity for one in _kind(after, "pipeline")] == [""]
+
+
+def test_a_success_grown_stale_is_no_warning_once_a_newer_execution_started(
+        ) -> None:
+    """§6: how old a success may get is asked of the newest execution alone. While
+    it is the newest, a success past `max_age` warns on its pipeline's line; read
+    behind a newer one, it passed."""
+    block = {"max_age_warn": "31d", "max_age_reason": "Nobody released in months."}
+    stale = _execution(started=timedelta(days=40), updated=timedelta(days=40),
+                       eid="e-1")
+    alone = _one_account(series_keep=30, codepipeline=block)
+    taken, _ = _executions_read(alone, [stale])
+    assert _deploy(alone, taken).stored_code is StatusCode.WARN
+    check = _one_account(series_keep=30, codepipeline=block)
+    taken, _ = _executions_read(
+        check, [_execution("InProgress", started=timedelta(minutes=5), eid="e-2"),
+                stale], [("e-1", "Succeeded")])
+    assert [(line.data["execution"], line.code, line.text)
+            for line in _deploy(check, taken).for_record] == [
+        ("e-1", StatusCode.OK, "Succeeded")]
+
+
+def test_an_execution_superseded_as_the_newest_loses_its_error_behind_a_newer_one(
+        ) -> None:
+    """§6: the map grades `Superseded` an error on the line of a pipeline whose
+    newest execution it is; once a newer one has started, nothing is said of it."""
+    over = _execution("Superseded", started=timedelta(hours=1), eid="e-1")
+    alone = _one_account(series_keep=30)
+    taken, _ = _executions_read(alone, [over])
+    assert _deploy(alone, taken).stored_code is StatusCode.ERROR
+    check = _one_account(series_keep=30)
+    taken, _ = _executions_read(
+        check, [_execution(started=timedelta(minutes=5), eid="e-2"), over],
+        [("e-1", "Superseded")])
+    assert [one.identity for one in _kind(taken, "pipeline")] == ["e-2", "e-1"]
+    assert _deploy(check, taken).for_record == ()
+
+
+def test_two_executions_that_started_at_one_instant_stand_in_the_order_they_came_in(
+        ) -> None:
+    """§5: the first of them is the newest, in the page the measuring half reads
+    and among the readings the grading is handed."""
+    first = _execution("Failed", started=timedelta(hours=1), eid="e-a")
+    second = _execution(started=timedelta(hours=1), eid="e-b")
+    for page, newest, other in (([first, second], "e-a", "e-b"),
+                                ([second, first], "e-b", "e-a")):
+        check = _one_account(series_keep=30)
+        taken, _ = _executions_read(check, page)
+        assert [one.identity for one in _kind(taken, "pipeline")] == [newest, other]
+        node = _deploy(check, taken)
+        assert [line.data["execution"] for line in node.reason_entries] == [newest]
+        assert [line.data["execution"] for line in node.for_record] == [other]
+
+
+def test_a_pipeline_s_history_is_asked_by_its_own_account_and_region() -> None:
+    """§5: a subject names the account and the region the pipeline was read in
+    (ADR-0005 §4), whichever comes first in the configuration."""
+    check = _build(series_keep=30)
+    asked = _holding(check)
+    _readings(check, pipelines={"eu-central-1": [["deploy"]],
+                                "eu-west-1": [["deploy"]]},
+              executions={"deploy": FOUR_EXECUTIONS})
+    assert asked == ["codepipeline/live/eu-central-1/deploy",
+                     "codepipeline/backup/eu-west-1/deploy"]
+
+
+@pytest.mark.parametrize(("keep", "read"), [
+    (1, ["e-4"]), (2, ["e-4", "e-3"]), (3, ["e-4", "e-3", "e-2"]),
+    (30, ["e-4", "e-3", "e-2", "e-1"])])
+def test_a_poll_reads_no_more_executions_than_the_series_keeps(
+        keep: int, read: list[str]) -> None:
+    """§5: the newest of the page, as many as the series keeps — an older one would
+    leave the series the moment it was kept."""
+    taken, _ = _executions_read(_one_account(series_keep=keep), FOUR_EXECUTIONS)
+    assert [one.identity for one in _kind(taken, "pipeline")] == read
+
+
+def test_a_check_that_keeps_no_series_reads_the_newest_execution_alone() -> None:
+    """§5: nothing would keep the rest, so no history is asked for — and the newest
+    is found wherever in the page it stands."""
+    taken, asked = _executions_read(_one_account(),
+                                    list(reversed(FOUR_EXECUTIONS)))
+    assert ([one.identity for one in _kind(taken, "pipeline")], asked) == (
+        ["e-4"], [])
+    single, asked = _executions_read(_one_account(series_keep=1), FOUR_EXECUTIONS)
+    assert ([one.identity for one in _kind(single, "pipeline")], asked) == (
+        ["e-4"], [])
+
+
+def test_an_older_execution_without_an_id_or_a_status_is_not_read() -> None:
+    """§5: without an id it would be a new record at every poll, without a status
+    it says nothing, and without a start it has no place — and none of them takes
+    the place of one the series would keep."""
+    page = [_execution("InProgress", started=timedelta(minutes=5), eid="e-4"),
+            _execution("Failed", started=timedelta(hours=1)),
+            _execution("", started=timedelta(hours=2), eid="e-2"),
+            _execution("Failed", started=None, eid="e-0"),
+            _execution(started=timedelta(days=1), eid="e-1")]
+    for keep in (30, 2):
+        taken, _ = _executions_read(_one_account(series_keep=keep), page)
+        assert [one.identity for one in _kind(taken, "pipeline")] == ["e-4", "e-1"]
+
+
+def test_reading_more_executions_asks_codepipeline_for_no_more() -> None:
+    """§5: one page of a pipeline's executions, as before — the page its newest was
+    always found in."""
+    check = _one_account(series_keep=30)
+    _holding(check)
+    built = _stub(check, pipelines=ONE_PIPELINE,
+                  executions={"running-deploy": FOUR_EXECUTIONS})
+    assert len(_kind(measured(check), "pipeline")) == 4
+    assert [session.execution_calls for session in built
+            if session.execution_calls] == [[("running-deploy", 100)]]
+
+
+def test_every_execution_read_beside_the_newest_is_said_for_the_record_by_its_status(
+        ) -> None:
+    """§6: the verdict its status has in `state_map`, as the line's has, in a
+    sentence that is the status — on a line no node shows, which carries the
+    execution's record and names its pipeline."""
+    check = _one_account(series_keep=30)
+    taken, _ = _executions_read(check, [
+        _execution(started=timedelta(minutes=5), eid="e-5"),
+        _execution("Failed", started=timedelta(hours=1), eid="e-4"),
+        _execution("InProgress", started=timedelta(hours=2), eid="e-3"),
+        _execution("Reticulating", started=timedelta(hours=3), eid="e-2"),
+        _execution(started=timedelta(days=1), eid="e-1")])
+    node = _deploy(check, taken)
+    older = _kind(taken, "pipeline")[1:]
+    assert len(node.reason_entries) == 1
+    assert node.stored_code is StatusCode.OK
+    assert [(line.code, line.text, line.subject, line.data)
+            for line in node.for_record] == [
+        (StatusCode.ERROR, "Failed", DEPLOY, dict(older[0].record)),
+        (StatusCode.WARN, "InProgress", DEPLOY, dict(older[1].record)),
+        (StatusCode.WARN, "Reticulating", DEPLOY, dict(older[2].record)),
+        (StatusCode.OK, "Succeeded", DEPLOY, dict(older[3].record))]
+
+
+def test_a_state_map_grades_an_older_execution_as_it_grades_the_newest() -> None:
+    """§6: a deployment that says a failure is fine says it of every execution."""
+    check = _one_account(series_keep=30,
+                         codepipeline={"state_map": {"Failed": "OK"}})
+    taken, _ = _executions_read(check, FOUR_EXECUTIONS)
+    assert [(line.text, line.code) for line in _deploy(check, taken).for_record] == [
+        ("Failed", StatusCode.OK), ("Succeeded", StatusCode.OK)]
+
+
+@pytest.mark.parametrize("state_map", [
+    {}, {"Superseded": "OK"}, {"SUPERSEDED": "ERROR"}])
+def test_nothing_is_said_for_the_record_of_an_execution_that_was_superseded(
+        state_map: dict[str, str]) -> None:
+    """§6: it neither failed nor deployed, so it gets no line, whatever the map
+    says of its status — and its reading is read and kept all the same."""
+    check = _one_account(series_keep=30, codepipeline={"state_map": state_map})
+    taken, _ = _executions_read(check, FOUR_EXECUTIONS)
+    assert "e-2" in [one.identity for one in _kind(taken, "pipeline")]
+    assert [line.data["execution"] for line in _deploy(check, taken).for_record] == [
+        "e-3", "e-1"]
+
+
+@pytest.mark.parametrize("word", ["superseded", " SUPERSEDED "])
+def test_a_superseded_execution_is_the_word_whatever_its_case_and_its_padding(
+        word: str) -> None:
+    """§6: a status is read as `state_map` reads one."""
+    check = _one_account(series_keep=30)
+    taken, _ = _executions_read(check, [
+        _execution(started=timedelta(minutes=5), eid="e-2"),
+        _execution(word, started=timedelta(hours=1), eid="e-1")])
+    assert [one.identity for one in _kind(taken, "pipeline")] == ["e-2", "e-1"]
+    assert _deploy(check, taken).for_record == ()
+
+
+def test_the_newest_execution_stands_on_the_line_whatever_order_its_readings_come_in(
+        ) -> None:
+    """§5: the grading finds it by when it started, so readings handed over in
+    another order grade to the same line and the same lines for the record."""
+    check = _one_account(series_keep=30)
+    taken, _ = _executions_read(check, FOUR_EXECUTIONS)
+
+    def said(readings: Sequence[Measurement]) -> tuple[list[str], list[str]]:
+        node = _deploy(check, readings)
+        return ([line.data["execution"] for line in node.reason_entries],
+                sorted(line.data["execution"] for line in node.for_record))
+
+    assert said(taken) == said(tuple(reversed(taken))) == (["e-4"], ["e-1", "e-3"])
+
+
+def test_a_reading_that_names_no_execution_stands_behind_one_that_does() -> None:
+    """§5: handed a pipeline's reading from before its first execution beside one of
+    that execution, the grading writes the line from the execution — and says nothing
+    for the record of a reading that names none."""
+    check = _one_account()
+    never = _readings(check, pipelines=ONE_PIPELINE, executions={})
+    ran = _readings(check, pipelines=ONE_PIPELINE, executions={"running-deploy": [
+        _execution("Failed", started=timedelta(hours=1), eid="e-1")]})
+    node = _deploy(check, [*never, *_kind(ran, "pipeline")])
+    (line,) = node.reason_entries
+    assert (line.data["execution"], line.code) == ("e-1", StatusCode.ERROR)
+    assert node.for_record == ()
+
+
+def test_the_node_the_pipelines_hang_on_says_that_its_children_are_complete(
+        ) -> None:
+    """§8: where their listing was read, so a pipeline that was deleted, or that a
+    rule now ignores, leaves with the next good run; where it could not be read the
+    node leaves that unsaid, and the pipelines stay."""
+    read = _pipelines(_one_account(), pipelines=ONE_PIPELINE)
+    unread = _pipelines(_one_account(), pipelines_unreadable={"eu-central-1"})
+    none = _pipelines(_one_account())
+    assert (read.children_complete, [node.name for node in read.children]) == (
+        True, ["running-deploy"])
+    assert (unread.children_complete, unread.children) == (False, ())
+    assert (none.children_complete, none.children) == (True, ())
+
+
+def test_a_pipeline_is_counted_once_however_many_of_its_executions_a_poll_read(
+        ) -> None:
+    """§8: the count and the roster are of pipelines."""
+    check = _one_account(series_keep=30)
+    taken, _ = _executions_read(check, FOUR_EXECUTIONS)
+    leaf = _aspect(check, run_check(check, measurements=taken), CODEPIPELINE)
+    assert _texts(leaf) == ["1 pipeline in scope (eu-central-1)"]
+    assert [node.name for node in leaf.children] == ["running-deploy"]
+    assert leaf.report.splitlines() == [
+        "- [running-deploy](https://eu-central-1.console.aws.amazon.com/codesuite"
+        "/codepipeline/pipelines/running-deploy/executions?region=eu-central-1)"]

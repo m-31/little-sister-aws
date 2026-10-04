@@ -166,8 +166,8 @@ TAKEOVER_WARN_SECONDS = 600.0
 CLAIM_HISTORY = 4
 
 #: The name this keeper claims in little-sister's registry — one keeper per
-#: instance, and this is which one, on ``/system`` and in the lines the
-#: heartbeat carries when it fails.
+#: instance, and this is which one, on ``/system/installed`` and in the lines
+#: the heartbeat carries when it fails.
 KEEPER_NAME = "s3"
 
 #: How many heartbeats may be missed before a lease is dead — the default for
@@ -324,6 +324,26 @@ class Lease:
         return f"{earlier}, the most recent at {last}" if last else earlier
 
 
+def _http_date(text: str) -> datetime:
+    """An HTTP date as the instant it names.
+
+    A date that says ``-0000`` names a time in UTC and says nothing of the zone it
+    was written in (RFC 5322 §3.3); Python answers it without a zone, and it is
+    read here as the instant it is. So no time without a zone leaves this
+    function: one is right only on the machine that reads it, a subtraction from
+    an instant refuses it, and so does the line that would show it.
+
+    :raises ValueError: the text is no date, or a date that names no zone at all.
+    :raises TypeError: it is no text.
+    """
+    moment = parsedate_to_datetime(text)
+    if moment.tzinfo is None:
+        if not text.rstrip().endswith("-0000"):
+            raise ValueError(f"an HTTP date that names no zone: {text!r}")
+        moment = moment.replace(tzinfo=UTC)
+    return moment
+
+
 def _measured_age(written: datetime | None, served: str) -> float | None:
     """How old an object was **inside S3's own answer**: the ``Date`` header of
     the response against the ``LastModified`` of the object it carried.
@@ -334,25 +354,27 @@ def _measured_age(written: datetime | None, served: str) -> float | None:
     if written is None or not served:
         return None
     try:
-        return (parsedate_to_datetime(served) - written).total_seconds()
+        return (_http_date(served) - written).total_seconds()
     except (TypeError, ValueError):
         return None
 
 
 def _instant(served: str) -> str:
     """S3's ``Date`` header as the ISO instant the lease stores; ``""`` where it
-    is not a date at all."""
+    is not a date at all, or one that names no zone."""
     try:
-        return parsedate_to_datetime(served).astimezone(UTC).strftime(_INSTANT)
+        return _http_date(served).astimezone(UTC).strftime(_INSTANT)
     except (TypeError, ValueError):
         return ""
 
 
 def _parse_instant(text: str) -> datetime | None:
-    """An ISO instant back into a moment, or ``None`` for anything else — an
-    older lease carried HTTP dates, and a hand-edited one may carry anything."""
+    """An ISO instant back into a moment that knows its zone, or ``None`` for
+    anything else — an older lease carried HTTP dates, which :func:`_http_date`
+    reads, and a hand-edited one may carry anything: a time that names no zone is
+    not an instant, and is shown as the text it is."""
     for reader in (lambda value: datetime.strptime(value, _INSTANT).replace(tzinfo=UTC),
-                   parsedate_to_datetime):
+                   _http_date):
         try:
             moment = reader(text)
         except (TypeError, ValueError):
@@ -1260,7 +1282,7 @@ class S3Keeper:
         if not served:
             return
         try:
-            moment = parsedate_to_datetime(served)
+            moment = _http_date(served)
         except (TypeError, ValueError):
             return
         with self._lock:

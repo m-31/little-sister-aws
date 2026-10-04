@@ -2,12 +2,13 @@
 
 **AWS for [little-sister](https://github.com/m-31/little-sister)**, in four parts:
 the **`aws` check type** — one or more AWS accounts on the status tree, with a node
-per account and a node per aspect beneath it — the **secret provider** behind
+per aspect, beneath a node per account where a check names several — the **secret
+provider** behind
 `aws-sm://` and `aws-ssm://` references, the **S3 keeper** that carries this
 instance's `var/state/` into a bucket, and the **identity seam** all three open their
 sessions through, which a deployment may also use on its own.
 
-- **Needs little-sister ≥ 0.3.18** (a floor, never a pin), and **boto3**.
+- **Needs little-sister ≥ 0.3.19** (a floor, never a pin), and **boto3**.
 - **Registers one check type: `aws`.**
 - **Ships the AWS secret provider** — `aws-sm://` and `aws-ssm://` secret
   references, with named reading identities — which a deployment installs by an
@@ -20,7 +21,7 @@ sessions through, which a deployment may also use on its own.
 - **Ships the identity seam** — `little_sister_aws.identity`: a session opened from
   a profile, static keys or an assumed role, with the SSO login beside it — for code
   that needs one where no check exists (see *Opening a session without a check*).
-- **Ships the leaves' display text**, so no deployment writes it: a title and an
+- **Ships the aspects' display text**, so no deployment writes it: a title and an
   `about` per aspect, and which of them stay visible on a quiet dashboard.
 
 ```
@@ -28,9 +29,12 @@ sessions through, which a deployment may also use on its own.
   /<path>/live              one node per account, its own assumed session
     /<path>/live/cloudwatch   alarms
     /<path>/live/ec2          instances, grouped by their Name tag
-    /<path>/live/lambda       functions
-    /<path>/live/codepipeline pipelines
-    /<path>/live/batch        job queues and the jobs in them
+    /<path>/live/lambda       functions, a node each
+      /<path>/live/lambda/<function>
+    /<path>/live/codepipeline pipelines, a node each
+      /<path>/live/codepipeline/<pipeline>
+    /<path>/live/batch        job queues, a node each, and their job names beneath
+      /<path>/live/batch/<queue>/<job name>
   /<path>/backup
     …
 ```
@@ -41,14 +45,43 @@ a flat list of alarms would be one pin per alarm. Each account's node also absor
 its own bad news — a role that cannot be assumed reddens that account and leaves the
 others reporting.
 
+**A level stands in the tree only where the configuration names several of it.**
+Those are reasons to tell accounts apart, so a check that names **one** account has
+no account level: its aspects hang beneath the check's own node, which then says
+what refused the account, and a pin on it is the pin on the account. A function, a
+pipeline and a job queue hang beneath their region's node where their account reads
+several regions, and directly beneath their aspect where it reads one:
+
+```
+/<path>/lambda/<function>                     one account, which reads one region
+/<path>/lambda/<region>/<function>            one account, which reads several
+/<path>/<account>/lambda/<function>           several accounts; this one reads one
+/<path>/<account>/lambda/<region>/<function>  several accounts; this one reads several
+```
+
+`codepipeline/<pipeline>` and `batch/<queue>/<job name>` take the two levels the same
+way. **A job queue is a level in every tree**: AWS names it and no configuration does,
+so it does not come and go with what an account holds
+([ADR-0009](docs/adr/0009-a-job-name-and-a-pipeline-have-nodes.md)).
+
+What is counted is what the configuration names, never what AWS answers — an account
+that could not be read is still one of those named — so a tree changes its shape
+when its configuration does and at no other time. The day a check names a second
+account, or an account a second region, every path beneath the new level moves, and
+with it what is keyed by a path: a pin, a `nodes.yaml` entry, a path a client
+watches, and a node's own status history, which starts again. A history of runs is
+keyed by the account's name and the region, and is found again whatever shape the
+tree has
+([ADR-0007](docs/adr/0007-a-level-stands-only-where-the-configuration-names-several.md)).
+
 ## Install
 
 ```toml
 dependencies = [
     # Pin them: an upgrade is then a deliberate edit rather than drift. The library
     # number is the floor this release was built against.
-    "little-sister==0.3.18",
-    "little-sister-aws==0.1.4",
+    "little-sister==0.3.19",
+    "little-sister-aws==0.1.5",
 ]
 ```
 
@@ -68,7 +101,7 @@ comment per knob; the short version:
 type: aws
 path: /team/aws
 frequency: 60s
-timeout: 120s
+timeout: 120s                    # no bound in this type: a run is never cut off
 
 regions: [eu-central-1]          # the default every account inherits
 
@@ -83,6 +116,12 @@ batch:
   enabled: false                 # off: no node, and no API call
 ```
 
+**An account's `title` and `about`** are this installation's own words for the
+account, and they label the account's node. A check that names one account has no
+such node: say them in the check's own `title:` and `about:`. Written on the one
+account they are read and not shown, and the log says so once when the check is
+loaded.
+
 **Credentials.** By default the ambient AWS credential chain — an instance profile,
 a task role, an SSO session, the `AWS_*` variables — and each account's `role_arn`
 is assumed from it. `profile:` names an `~/.aws/config` profile to assume *from*
@@ -95,13 +134,14 @@ not carry that service needs. An aspect that says nothing is on; every aspect of
 refused at startup; and the check's card names what is off, because an absent node
 otherwise reads exactly like a broken check.
 
-## What the leaves already say
+## What the aspects already say
 
-The aspect leaves arrive with their own display text, so a deployment writes none
+The aspects arrive with their own display text, so a deployment writes none
 of it: each ships a **title** and an **about** — what that aspect reads, what it
 grades, and what it deliberately does not count — and each `about` ends with the
-same note that a single line can be put into maintenance on its own while the rest
-keeps reporting.
+same note that a single line — for `lambda`, `codepipeline` and `batch`, the node of
+a single function, pipeline or job name — can be put into maintenance on its own
+while the rest keeps reporting.
 
 The text is **declared, not applied**. little-sister resolves it per field against
 whatever the check's own `subnodes:` block says, so replacing one sentence keeps
@@ -115,39 +155,178 @@ subnodes:
 
 and a `nodes.yaml` entry keyed by path still beats both.
 
+The block names **aspects**. A function, a pipeline, a job queue, a job name, a
+region or an account that happens to be called like one — a function named `batch` —
+is not an aspect and is not reached by it: such a node shows what is its own, a
+`shorten` rule's title or the account's `title` and `about`, and a deployment labels
+it by its path, in `nodes.yaml`.
+
 **Four of the five stay visible while they are quiet.** `ec2`, `lambda`, `batch`
 and `codepipeline` report a *roster* — they name everything they found, every run,
 whether or not anything is wrong — so the list is read precisely **because**
-nothing is, and a dense dashboard that folds a quiet leaf into a chip takes away
+nothing is, and a dense dashboard that folds a quiet node into a chip takes away
 the thing worth looking at. That is a fact about the aspect and true in every
 installation, so the type declares it once (`show_when_quiet`) rather than each
-deployment declaring it per aspect per account. `cloudwatch` is deliberately not
-among them: its own `show_healthy: false` makes the opposite claim about its own
-lines, and drops the alarms that are fine.
+deployment declaring it per aspect per account. The roster of `lambda`, of
+`codepipeline` and of `batch` is its nodes: each function, pipeline and job name is a
+chip while it is quiet, inside its aspect's box — a job name inside its queue's — or,
+where its account reads several regions, inside its region's, and none of those boxes
+is folded away. `cloudwatch` is deliberately not among them: its own `show_healthy:
+false` makes the opposite claim about its own lines, and drops the alarms that are
+fine.
 
 A deployment that disagrees says `show_when_quiet: false` for that name in the
-check's `subnodes:` block, or per path in `nodes.yaml`. Both still win.
+check's `subnodes:` block, or per path in `nodes.yaml`. Both still win. A region's
+box and a queue's are no aspects, so for them the path in `nodes.yaml` is the one
+place to say it.
 
 ## What a run records
 
-Each run records what it read, one reading per thing: whether the credentials opened
-and what became of each account, then every alarm, instance, function, pipeline, job
-queue and Batch job run it read, and every region an aspect could not read. Every line
+Each run records what it read, one reading per thing: whether the credentials opened and
+what became of each account, then every alarm, instance, function, job queue and Batch
+job run it read, each pipeline's newest execution, and every region an aspect could not
+read — and, where a series is kept, every run of a function that the poll read in full,
+and the executions it read behind a pipeline's newest, for their histories. Every line
 made from one reading carries that reading's record as its `data` — an alarm's, a
 function's, a pipeline's, a queue's, a name's where one instance carries it — so a line
 template or a client can read what the line read; a job name's line is made from all of
 its runs, and carries none of them. Free text is clipped once, at 300 characters, and
 the line says exactly what the record keeps.
 
-`series_keep:` — little-sister's setting, **0 by default** — keeps three histories on
+`series_keep:` — little-sister's setting, **0 by default** — keeps four histories on
 this check: each **Batch job**'s runs, one record per run however many polls saw it,
 in its final state once it has finished; each **pipeline**'s executions, one record per
-execution; and the accounts' own — one record each time an account opens or stops
-opening. Alarms, instances, functions and queues keep none. A history is keyed by the
+execution; each **Lambda function**'s runs; and the accounts' own — one record each
+time an account opens or stops opening. Alarms, instances and queues keep none, and
+neither does a job name `ignore_name_patterns` hides. A history is keyed by the
 account's configured `name`, so renaming an account starts it again. The accounts' own
 history is of the accounts the configuration lists, so adding or removing an account
 starts that one again too. Why it is shaped this way is
 [ADR-0005](docs/adr/0005-a-run-is-its-readings-and-the-runs-keep-a-history.md).
+
+### A job name's runs and a pipeline's executions
+
+**A job name, a pipeline and a function each stand on a node of their own**, and that
+node is where little-sister shows the history: its page and its Series view draw the
+runs at their own times, each marked by how it stood, and its History page lists them
+with a sentence each. A job name has its node for as long as Batch lists a run of it,
+which is about a week after its last one, and for as long as its runs are among the
+newest `max_jobs` its queue is read to. The runs that are read are those that finished,
+run or wait for capacity: a name whose only listed run is being started — past
+`RUNNABLE`, not yet `RUNNING` — is without its node for that poll. Without a node its
+history is not lost: until the name runs again, little-sister lists it on the check's
+History page and draws its plots on the check's own node, as it does for a pipeline that
+was deleted.
+
+**A Batch run is marked by how it ended, or by how long it has been going.** One that
+succeeded passes and one that failed fails. One that still runs or waits passes until
+it is past `max_run_time` or `max_wait_time`, warns from then on, and takes its last
+mark from the poll that reads it finished. The job name's own line is not any one
+run's: it says how the newest finished run ended, how many run and how many wait, as it
+did, so a retry submitted after a failure does not turn the name green.
+
+**A pipeline's line is its newest execution's**, as it was. Where the check keeps a
+series, a poll reads more than that one: out of the one page of executions the aspect
+already asks for, every execution the pipeline's history lacks or holds unfinished, as
+many as `series_keep` and no more than the hundred a page holds. So a pipeline's
+history is whole from its first poll, and an execution that a newer one overtook while
+it ran is read to its end. The newest is marked as the pipeline's line stands, so a
+success past `max_age_warn` warns and one past `max_age_error` fails. Every execution
+read behind it is marked by what its status means in `state_map`, and the one that was
+the newest is read once more for that, by the poll that first finds a newer one: a
+success is then a success, however stale it had grown. One that a newer execution
+overtook — `Superseded` — is marked as neither failed nor passed: it did not fail, and
+it did not deploy. Nothing more is asked of AWS for any of this. Why it is shaped this
+way is
+[ADR-0009](docs/adr/0009-a-job-name-and-a-pipeline-have-nodes.md).
+
+### How long a run and an execution took
+
+A kept **Batch run** carries two numbers beside its times: `wait_s`, from when the job
+was created to when it started, and `duration_s`, from then to when it stopped. A
+**pipeline**'s record carries `duration_s`, from its execution's start to the last
+change CodePipeline recorded of it. Each is whole seconds, and each stands once it is
+known: a run that is still running has waited and has no duration yet, and an
+execution has one once it is over — `Succeeded`, `Failed`, `Stopped`, `Superseded` or
+`Cancelled`. Nothing is counted to the moment of a poll; a job's line says how long it
+has run so far, as it did.
+
+Both are declared as measures, in `s`, beside a function's `duration_ms` below, so
+little-sister draws a kept run as a stem to each, once a run has the number: a job
+name's *Wait* and *Duration* on the job name's node, and a pipeline's *Duration* on the
+pipeline's. `wait_s: null` or `duration_s: null` in the `measures:` block takes a plot
+away — `duration_s` a run's and an execution's alike — and leaves the record its
+number. Why it is shaped this way is
+[ADR-0008](docs/adr/0008-a-run-and-an-execution-say-how-long-they-took.md).
+
+### A function's runs
+
+AWS lists no invocations, so **a run is a one-minute bucket of CloudWatch's metric in
+which the function was invoked**, kept as a record of its own beside the function's
+reading: `name`, `at` — the minute's start — `invocations`, `errors`, and
+`duration_ms`, the slowest invocation of that minute in whole milliseconds. A run
+failed where it counted an error, at any age: `error_max_age` gates the function's
+line and never a run. A function's node draws its runs at the times they ran, and
+`lambda`'s Series view shows every function's on one time axis.
+
+`duration_ms` is declared as a measure, in `ms`, so a function's runs are drawn as
+stems to their duration with no key of your own. little-sister's `measures:` block is
+how a deployment disagrees — `duration_ms: null` leaves a run a tick, and
+`invocations: calls` draws the count as well.
+
+Where a function is invoked all the time, a bucket is no single run: it shows its
+newest buckets like any other function, as many as `series_keep` says — half an hour
+of them at 30. Nothing is configured for it.
+
+**What it asks of CloudWatch**, which bills `GetMetricData` by the metric requested and
+not by the call. Every poll asks one metric of every function, `Errors`, as it always
+did, and nothing more of a function that did not run. `Invocations` and `Duration` are
+asked only of a function that has a run to read: a bucket the kept runs lack, or one no
+poll has read since it was an hour old, because its numbers may grow until then — which
+is every poll of the hour after a run, and the one after it. A function that runs once a
+day therefore costs about 8% more at a poll every minute and a sixth more at a poll
+every hour, and one that runs at least hourly three times as much. The first poll after
+a start reads again what the series keeps, once.
+
+**How much CloudWatch answers** is another matter than what it bills, and it follows
+`series_keep`. A function whose kept runs fill its series is asked no further back than
+they reach — its last hour, its last day, or the fifteen days CloudWatch keeps a
+one-minute point for — and every other function the fifteen days, as it always was. At
+`series_keep: 30`, and a poll more often than every half hour, a function invoked every
+minute answers an hour's points and not fifteen days'; from about sixty kept runs on its
+series reaches past the hour and it answers a day's, and from 1,440 on the fifteen days'
+again, 21,600 points a poll. That is `Errors`; `Invocations` and `Duration` are asked
+from the oldest bucket a poll is to read and no further back — ordinarily the last hour
+or so of a function invoked every minute, and less where the series keeps less. With
+`series_keep` unset no run is asked for: the aspect asks `Errors` of every function over
+the fifteen days, as it did.
+
+**How many requests that takes.** CloudWatch hands an answer back in pages, and a poll
+follows them to the end, whatever the check keeps. A page ends where its part of the
+window *could* hold 100,800 points — the functions asked times the minutes in it —
+whatever they hold: one request for the functions asked their hour, one for every
+seventy asked their day, and three for every fourteen asked their fifteen days, however
+seldom they run. A function that did not run in fifteen days is asked a coarser period
+as well, or both, up to half a request in all; a check that keeps a series makes one
+request more for each window in which a run is to be read, 250 functions to a call; and
+a region's first poll after a start, which reads again what the series keeps, takes up
+to six more for every fourteen functions. A region of a hundred functions that run now
+and then is 22 requests a poll, and one of five hundred 108: where this was measured a
+page took a third of a second with a hundred functions and 2.8 s with five hundred, so
+some seven seconds for the one region and some five minutes for the other. A poll takes
+as long as AWS takes to answer — `timeout:` bounds nothing in this type — and one that
+outgrows its `frequency:` is reported late on `/little-sister/engine`, so a longer
+`frequency:` is what gives it time. Whether CloudWatch bills a metric again for each
+page was not measured: the figures above count it once for each call that asks it.
+
+**What the runs weigh.** A check that keeps a series keeps one more for every function
+it reads: some 340 bytes a kept run as little-sister weighs it against its
+`series_limit`, 10 KB a function at `series_keep: 30`, so the default ceiling of 8 MiB
+holds the runs of some eight hundred functions, less what else the instance keeps.
+`/little-sister/engine` warns as soon as the configuration would need more than the
+ceiling, which is the moment to lower `series_keep` or to raise `series_limit` in
+`settings.yaml`. Why it is shaped this way is
+[ADR-0006](docs/adr/0006-a-functions-runs-are-kept-and-a-function-has-a-node.md).
 
 ## The IAM policy
 
@@ -164,9 +343,10 @@ region the account is watched in:
 
 The deployment's own identity needs `sts:AssumeRole` on each role, and
 `sts:GetCallerIdentity` is spent once per profile-only account. The **keeper**, if
-one is configured, needs its own: `s3:GetObject` and `s3:PutObject` on the keys
-under its prefix, `s3:ListBucket` on the bucket, and — optionally, for the check
-that says whether versioning is on — `s3:GetBucketVersioning`.
+one is configured, needs its own: `s3:GetObject`, `s3:PutObject` and
+`s3:DeleteObject` on the keys under its prefix, `s3:ListBucket` on the bucket, and —
+optionally, for the check that says whether versioning is on —
+`s3:GetBucketVersioning`.
 
 ## Resolving secrets from AWS
 
@@ -184,8 +364,8 @@ register_aws_secret_resolvers()          # before `little_sister.app` is importe
 ```
 
 Because the registration is made from here, little-sister records **this package**
-as the one that answers for every scheme the call claims: `/system` lists
-`aws-sm://`, `aws-ssm://` and each identity's pair with this installation's
+as the one that answers for every scheme the call claims: `/system/installed`
+lists `aws-sm://`, `aws-ssm://` and each identity's pair with this installation's
 version beside them, and a second package claiming one of those names refuses at
 startup naming both — a scheme is where a credential is read from, and import
 order may not decide it.
@@ -484,8 +664,22 @@ suite replaces it.
   instead of the frozen identity seam growing a refresh.
 - [`docs/adr/0005-a-run-is-its-readings-and-the-runs-keep-a-history.md`](docs/adr/0005-a-run-is-its-readings-and-the-runs-keep-a-history.md)
   — how a run measures and then grades: one reading per thing it read, which of them
-  keep a history (a Batch job's runs, a pipeline's executions, the accounts' own), and
-  why a history names an account by its configured name.
+  keep a history (a Batch job's runs, a pipeline's executions, a function's runs, the
+  accounts' own), and why a history names an account by its configured name.
+- [`docs/adr/0006-a-functions-runs-are-kept-and-a-function-has-a-node.md`](docs/adr/0006-a-functions-runs-are-kept-and-a-function-has-a-node.md)
+  — a Lambda function's runs: why a run is a one-minute bucket, what a poll asks of
+  CloudWatch and what that costs, and why a function has a node of its own.
+- [`docs/adr/0007-a-level-stands-only-where-the-configuration-names-several.md`](docs/adr/0007-a-level-stands-only-where-the-configuration-names-several.md)
+  — the tree's shape: why a check that names one account has no account level, where
+  a region is a level, and what moves the day a configuration names a second.
+- [`docs/adr/0008-a-run-and-an-execution-say-how-long-they-took.md`](docs/adr/0008-a-run-and-an-execution-say-how-long-they-took.md)
+  — the two numbers a kept Batch run carries and the one a pipeline's execution does:
+  when each stands, why none is counted to a poll's clock, and why they are whole
+  seconds.
+- [`docs/adr/0009-a-job-name-and-a-pipeline-have-nodes.md`](docs/adr/0009-a-job-name-and-a-pipeline-have-nodes.md)
+  — a pipeline's node and a job name's: why a queue is a level in every Batch path,
+  what a job name's line says and what is said of each run, which of a pipeline's
+  executions a poll reads, and why nothing is said of one that was superseded.
 
 ## License
 

@@ -171,9 +171,9 @@ def test_a_file_that_is_not_yaml_is_refused(tmp_path: Path) -> None:
 
 
 def test_the_aspect_is_declared_under_this_packages_name() -> None:
-    """`/system` says whose `config/aws.yaml` an operator is looking at, and the
-    answer is the package that owns the file's **shape** — a deployment owns its
-    contents, and a deployment's own suite is what watches that file still parse
+    """`/system/installed` says whose `config/aws.yaml` an operator is looking at,
+    and the answer is the package that owns the file's **shape** — a deployment owns
+    its contents, and a deployment's own suite is what watches that file still parse
     against us."""
     declare_aspect()
 

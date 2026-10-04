@@ -1,12 +1,17 @@
 # ADR-0001 — The `aws` check type: account nodes, aspect leaves, and boto3
 
 - **Status:** Accepted
-- **Date:** 2026-09-27 (the type was accepted 2026-08-09)
+- **Date:** 2026-10-04 (the type was accepted 2026-08-09)
 - **Related:** [ADR-0002](0002-aws-secret-references.md) (the secret references the
-  identities on this package's seam are read with), little-sister **ADR-0042**
-  (coded entries), little-sister **ADR-0043** / little-sister **ADR-0044** (the
-  coverage reading and the roster), little-sister **ADR-0025** (subnode text); the
-  lift-out this record promised has happened, and this package is the result
+  identities on this package's seam are read with),
+  [ADR-0007](0007-a-level-stands-only-where-the-configuration-names-several.md)
+  (where the account's level stands),
+  [ADR-0006](0006-a-functions-runs-are-kept-and-a-function-has-a-node.md) and
+  [ADR-0009](0009-a-job-name-and-a-pipeline-have-nodes.md) (the aspects that hand back
+  nodes), little-sister **ADR-0042** (coded entries), little-sister **ADR-0043** /
+  little-sister **ADR-0044** (the coverage reading and the roster), little-sister
+  **ADR-0025** (subnode text); the lift-out this record promised has happened, and this
+  package is the result
 
 > This record was written in the deployment whose AWS checks this type replaced and
 > traveled here with the code: *that codebase* in the Context below is that
@@ -44,8 +49,9 @@ one check, one credential, one frequency, one child per aspect.
 
 ### 2. Account first, aspect second
 
-The tree is `/<path>/<account>/<aspect>`, not `/<path>/<aspect>` with the account
-in each line. Three reasons, in the order they mattered:
+Where a check names several accounts the tree is `/<path>/<account>/<aspect>`, not
+`/<path>/<aspect>` with the account in each line. Three reasons, in the order they
+mattered:
 
 - **A pin needs a node.** "Staging is down for the migration" is one maintenance
   pin on one node. Flat, it is one pin per alarm, and the next deploy invents new
@@ -57,18 +63,30 @@ in each line. Three reasons, in the order they mattered:
   with the environment it came from is what a flat list does when it cannot branch.
   This one can, so the label becomes the node.
 
-The aspect leaf itself stays **flat**: an alarm carries its own verdict, so the
-finding is what an operator acts on, and each line is a coded `Entry`
-(little-sister ADR-0042). Where an estate sorts alarms by a name prefix, that
-becomes one word on the line (`tag_prefix`) rather than a second node — the account
-is what such a split is usually carrying, and the tree carries the account.
+**Those are reasons to tell accounts apart, so the account's level stands where a check
+names several.** A check that names one account hangs its aspects beneath its own node,
+`/<path>/<aspect>`, and says there what refuses the account
+([ADR-0007](0007-a-level-stands-only-where-the-configuration-names-several.md) §2).
 
-**The credential half of the same decision: from where, into what.** An account has
-its own node and its own session; where the session the role is assumed *from* comes
-from is the other half of that, and the ambient chain — one for all accounts — is
-right on a server and wrong on the machine this is developed on, where one config's
-roles and another's can live in **different organizations**, reachable only as two
-different `~/.aws/config` profiles.
+The aspect leaf itself stays **flat** for `cloudwatch` and `ec2`: an alarm carries its
+own verdict, so the finding is what an operator acts on, and each line is a coded
+`Entry` (little-sister ADR-0042). Where an estate sorts alarms by a name prefix, that
+becomes one word on the line (`tag_prefix`) rather than a second node — the account is
+what such a split is usually carrying, and the tree carries the account.
+
+**Three aspects hand back nodes** for what they read: `lambda` a node for each function
+([ADR-0006](0006-a-functions-runs-are-kept-and-a-function-has-a-node.md) §9),
+`codepipeline` one for each pipeline, and `batch` one for each job queue with a node for
+each job name beneath it ([ADR-0009](0009-a-job-name-and-a-pipeline-have-nodes.md)). An
+alarm's line and an instance name's stay on their aspect's node, and the region stays in
+their slugs.
+
+**The credential half of the same decision: from where, into what.** An account has its
+own session, and its own node where a check names several; where the session the role is
+assumed *from* comes from is the other half of that, and the ambient chain — one for all
+accounts — is right on a server and wrong on the machine this is developed on, where one
+config's roles and another's can live in **different organizations**, reachable only as
+two different `~/.aws/config` profiles.
 
 - **`profile:` is readable at the check and on an account**, exactly like
   `regions:`, and it **composes** with `role_arn` rather than replacing it —
@@ -242,11 +260,16 @@ which is exactly why it sits *beside* the seam and never in it.
 
 - `boto3` is this package's dependency, declared as a **floor** beside the library's
   own — the first in the family to have one beyond little-sister.
-- A maintenance pin is keyed `(path, slug)`. The path carries the account, so the
-  slug does not; it carries the **region**, always, even where the line does not
-  print it — otherwise every pin re-points the day a second region is configured.
-  Neither carries the alarm ARN, because that carries the account id and a private
-  string in a `?reason=` value is a private string in somebody's bookmark.
+- A maintenance pin is keyed `(path, slug)`. The path carries the account, or is the
+  check's own where the check names one, so the slug does not; it carries the
+  **region**, always, even where the line does not print it — otherwise every pin on an
+  aspect's own line re-points the day a second region is configured. A pin on a
+  function's, a pipeline's, a queue's or a job name's node is keyed by a path that gains
+  the region's level that day, and moves with it
+  ([ADR-0007](0007-a-level-stands-only-where-the-configuration-names-several.md) §6).
+  Neither the path nor the slug carries the alarm ARN, because that carries the account
+  id and a private string in a `?reason=` value is a private string in somebody's
+  bookmark.
 - Two gradings are deliberate and worth knowing on the first run, because the
   cheaper reading of each is the one people expect: `INSUFFICIENT_DATA` is a
   **WARN**, not an OK, since an alarm with no data is usually an alarm whose metric

@@ -12,6 +12,9 @@ advances that clock rather than sleeping.
 from __future__ import annotations
 
 import json
+import os
+import time
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 from pathlib import Path
@@ -72,6 +75,16 @@ def _instants_shown_plainly():
 
 
 @pytest.fixture
+def new_york_clock() -> Iterator[None]:
+    """A machine whose own clock is four hours from UTC on the days these tests
+    name, so that a time read as the machine's is told from one read as UTC."""
+    with mock.patch.dict(os.environ, {"TZ": "America/New_York"}):
+        time.tzset()
+        yield
+    time.tzset()
+
+
+@pytest.fixture
 def config_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """A configuration root of this test's own — borrowing the working
     directory's would be a test that passes only where it happens to run."""
@@ -118,6 +131,13 @@ class _FakeS3:
         self.fail_lease_always: Exception | None = None
         #: Answer gets without S3's clock — the case the keeper must read as alive.
         self.silent_clock = False
+        #: The zone every answer's ``Date`` names: ``GMT``, as S3 says it — or
+        #: ``-0000``, which names the same time, or nothing, which names none.
+        self.date_zone = "GMT"
+
+    def _date(self) -> str:
+        """The store's clock as a ``Date`` header says it."""
+        return format_datetime(self.now, usegmt=True).replace("GMT", self.date_zone)
 
     def _etag(self) -> str:
         self._next_etag += 1
@@ -146,7 +166,7 @@ class _FakeS3:
         if not self.silent_clock:
             answer["LastModified"] = written_at
             answer["ResponseMetadata"] = {
-                "HTTPHeaders": {"date": format_datetime(self.now, usegmt=True)}}
+                "HTTPHeaders": {"date": self._date()}}
         return answer
 
     def put_object(self, *, Bucket: str, Key: str, Body: bytes,
@@ -167,7 +187,7 @@ class _FakeS3:
         answer: dict[str, Any] = {"ETag": etag}
         if not self.silent_clock:
             answer["ResponseMetadata"] = {
-                "HTTPHeaders": {"date": format_datetime(self.now, usegmt=True)}}
+                "HTTPHeaders": {"date": self._date()}}
         return answer
 
     def list_objects_v2(self, *, Bucket: str, Prefix: str, Delimiter: str,
@@ -186,7 +206,7 @@ class _FakeS3:
             "NextContinuationToken": "more" if rest else ""}
         if not self.silent_clock:
             answer["ResponseMetadata"] = {
-                "HTTPHeaders": {"date": format_datetime(self.now, usegmt=True)}}
+                "HTTPHeaders": {"date": self._date()}}
         return answer
 
     def delete_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:
@@ -1770,6 +1790,75 @@ class TestTwoClocks:
         keeper.changed_since_sync()
         assert "the latest at <2026-09-05T08:14:00+00:00>" in _line(
             keeper, "takeover").text
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="no tzset on this platform")
+class TestADateThatNamesNoOffset:
+    """An HTTP date that says ``-0000`` names a time in UTC and says nothing of the
+    zone it was written in (RFC 5322 §3.3), and Python answers it as a time without
+    a zone. The keeper reads it as the instant it is — on a machine in any zone, in
+    a line as in a subtraction — and a date that names no zone at all is no
+    instant: it is shown as the text it is, and measures nothing."""
+
+    SAID = "Fri, 04 Sep 2026 20:32:39 -0000"
+    BARE = "Fri, 04 Sep 2026 20:32:39"
+
+    def test_a_claim_that_says_it_is_shown_as_the_instant_it_is(self) -> None:
+        keeper, fake = _keeper(holding=False)
+        _held_by(fake, OTHER, ttl=0,
+                 claims=[{"instance": "host-c:3", "at": self.SAID}])
+        keeper.tick(INTERVAL)
+        assert "the most recent at <2026-09-04T20:32:39+00:00>" in keeper.report()
+
+    def test_it_is_stored_as_that_instant_on_a_machine_in_any_zone(
+            self, new_york_clock: None) -> None:
+        assert aws_keeper._instant(self.SAID) == "2026-09-04T20:32:39Z"
+
+    def test_an_objects_age_is_measured_against_it(self) -> None:
+        written = datetime(2026, 9, 4, 20, 32, 9, tzinfo=UTC)
+        assert aws_keeper._measured_age(written, self.SAID) == 30.0
+
+    def test_a_store_that_says_it_is_read_as_one_that_says_gmt(
+            self, new_york_clock: None) -> None:
+        # the same three minutes on two stores, each spelling its Date its way: a
+        # lease another instance let lapse is taken, and what is written, said
+        # and logged of it is the same
+        told = []
+        for zone in ("GMT", "-0000"):
+            keeper, fake = _keeper(holding=False)
+            fake.date_zone = zone
+            _held_by(fake, OTHER, ttl=180)
+            fake.advance(181)
+            took = keeper.tick(INTERVAL)
+            told.append((took, fake.lease(), keeper.report(),
+                         [(line.slug, line.code, line.text)
+                          for line in keeper.lines()]))
+        assert told[0][0] is True
+        assert told[1] == told[0]
+
+    def test_a_date_that_names_no_zone_is_no_instant(
+            self, new_york_clock: None) -> None:
+        assert aws_keeper._instant(self.BARE) == ""
+        assert aws_keeper._measured_age(EPOCH, self.BARE) is None
+        keeper, fake = _keeper(holding=False)
+        _held_by(fake, OTHER, ttl=0,
+                 claims=[{"instance": "host-c:3", "at": self.BARE}])
+        keeper.tick(INTERVAL)
+        assert f"the most recent at {self.BARE}" in keeper.report()
+
+    def test_a_store_whose_date_names_no_zone_is_one_that_says_no_time(
+            self, new_york_clock: None) -> None:
+        # nothing to measure a lease's age against: it is read as alive, as it is
+        # where an answer carries no Date at all, and nothing is raised
+        told = []
+        for silent, zone in ((True, "GMT"), (False, "")):
+            keeper, fake = _keeper(holding=False)
+            fake.silent_clock, fake.date_zone = silent, zone
+            _held_by(fake, OTHER, ttl=180)
+            fake.advance(181)
+            told.append((keeper.tick(INTERVAL), keeper.holding,
+                         "clock" in _slugs(keeper)))
+        assert told == [(False, False, False), (False, False, False)]
 
 
 class TestTheInstanceLog:

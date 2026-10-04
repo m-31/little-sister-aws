@@ -1,18 +1,33 @@
-# The `aws` check: one node per account, one node per aspect beneath it.
+# The `aws` check: one node per aspect, beneath one node per account where the check
+# names several.
 #
 #   /team/aws
 #     /team/aws/live
 #       /team/aws/live/cloudwatch
 #       /team/aws/live/ec2
 #       /team/aws/live/lambda
+#         /team/aws/live/lambda/<function>     a node for every function
 #       /team/aws/live/codepipeline
+#         /team/aws/live/codepipeline/<pipeline>     and for every pipeline
 #       /team/aws/live/batch
+#         /team/aws/live/batch/<queue>               for every job queue
+#           /team/aws/live/batch/<queue>/<job name>  and every job name in it
 #     /team/aws/backup
 #       …
 #
 # Account first because the account is what you act on as a group: one maintenance
 # pin on /team/aws/live silences a migration, where the same thing on a flat list of
 # alarms would be one pin per alarm.
+#
+# A level stands only where the configuration names several of it. This file names
+# two accounts, so each has a node. A check that names ONE account has no account
+# level: its aspects hang beneath the check's own node — /team/aws/ec2 — and a
+# function, a pipeline and a job queue hang beneath their region's node,
+# /team/aws/…/lambda/eu-west-1/<function>, only where their account reads several
+# regions. A job queue is the one level AWS names, and it stands in every tree. The
+# day a file names a second account, or an account a second region, every path
+# beneath the new level moves, and a pin or a `nodes.yaml` entry keyed by an old path
+# does not follow.
 #
 # Every value below is a placeholder. This file is the *shape* — every key the type
 # accepts, with a comment saying what it decides — not anybody's configuration.
@@ -22,15 +37,35 @@ title: AWS
 about: |
   The team's AWS accounts, one node each.
 frequency: 60s
+# No bound in this type: a run takes as long as AWS takes to answer, and one that
+# outgrows `frequency:` is reported late on /little-sister/engine. Longer than
+# `frequency:`, as here, the key is a warning in the log when the check is loaded and
+# a sentence in that node's report: the check may run late.
 timeout: 120s
-# How many readings of each history to keep, the oldest out. This check keeps three:
+# How many readings of each history to keep, the oldest out. This check keeps four:
 # each Batch job name's runs, one record per run, in its final state once it has
-# finished; each pipeline's executions, one record per execution; and the accounts'
-# own, one record each time an account opens or stops opening. Alarms, instances,
-# functions and queues keep none. A history is keyed by the account's `name` below, so
-# renaming an account starts its histories again, and adding or removing an account
-# starts the accounts' own again. The default, 0, keeps nothing.
-# series_keep: 200
+# finished; each pipeline's executions, one record per execution; each Lambda
+# function's runs, one record per minute it was invoked in; and the accounts' own, one
+# record each time an account opens or stops opening. Alarms, instances and queues
+# keep none. A job name's, a pipeline's and a function's history is drawn on the node
+# of the job name, the pipeline or the function, each run marked by how it stood — and
+# on this check's own node for one that has no node at the moment. A history is keyed
+# by the account's `name` below, so renaming an account starts its histories again, and
+# adding or removing an account starts the accounts' own again.
+# Every function adds a history, some 340 bytes a kept run against little-sister's
+# `series_limit` (`settings.yaml`, 8 MiB by default): about 10 KB a function at 30.
+# The default, 0, keeps nothing — and asks CloudWatch nothing of a function's runs.
+# series_keep: 30
+#
+# Which numbers of a kept record are drawn. The type declares three: `duration_ms`, a
+# function's run's slowest invocation, in ms; `duration_s`, how long a Batch run ran
+# and how long a pipeline's execution took; and `wait_s`, how long a Batch run waited
+# before it started, both in s. Name a field to take it whole, write `null` to take a
+# plot away, and add a count where you want one drawn.
+# measures:
+#   duration_ms: null
+#   wait_s: null
+#   invocations: calls
 
 # --- Credentials -------------------------------------------------------------
 # With no `secrets:` block the ambient AWS credential chain is used — an instance
@@ -72,7 +107,9 @@ regions: [eu-central-1]
 # under this check hangs off it. `role_arn` may be omitted for an account reachable
 # with the ambient credentials directly. `regions` and `profile` each **replace**
 # the default rather than adding to it. `title` / `about` are this installation's
-# own words for the account.
+# own words for the account, and label its node — so a check that names ONE account,
+# which has no such node, says them in its own `title:` / `about:` above. Written on
+# that one account they are read and not shown, and the log says so once at load.
 accounts:
   - name: live
     role_arn: arn:aws:iam::000000000000:role/application/monitoring-role
@@ -218,6 +255,13 @@ ec2:
 lambda:
   enabled: true
 
+  # Every function has a node of its own beneath `lambda`, named by what AWS calls
+  # it; its line stands there. With `series_keep` set above, every minute a function
+  # was invoked in is kept as one run of it — invocations, errors, duration_ms — and
+  # drawn on the function's node. CloudWatch bills by the metric asked: `Errors` of
+  # every function on every poll, as always, and `Invocations` and `Duration` only
+  # of a function that has a run to read. Nothing here configures any of it.
+
   # An error older than this is reported but not graded: by then CloudWatch has
   # condensed it into a bucket with the successful runs around it, so the count no
   # longer means "the last run failed". A **gate**, not a threshold with levels —
@@ -262,6 +306,12 @@ lambda:
 codepipeline:
   enabled: true
 
+  # Every pipeline has a node of its own beneath `codepipeline`, named by what AWS
+  # calls it; its line stands there and says what its newest execution did. With
+  # `series_keep` set above, a poll also reads, out of the one page of executions it
+  # asks for anyway, every execution the pipeline's history lacks or holds
+  # unfinished, and the pipeline's node draws them. Nothing here configures that.
+
   # How long a *successful* run stays evidence that the pipeline still works, as a
   # pair of levels with no defaults — how long a success lasts depends on how often
   # the pipeline is meant to run, which is a fact about your estate. It only ever
@@ -288,7 +338,10 @@ codepipeline:
       max_age: null                # runs when we release, so never stale
 
   # PipelineExecutionStatus -> the code that line reports, matched case-insensitively.
-  # A pipeline that has never been executed warns rather than being left out.
+  # A pipeline that has never been executed warns rather than being left out. A kept
+  # execution that is no longer the newest is marked by this map too — except one a
+  # newer execution overtook: `Superseded` is an error on the line of a pipeline
+  # whose newest execution it is, and behind the newest it is marked as neither.
   state_map:
     Succeeded: OK
     InProgress: WARN
@@ -301,7 +354,14 @@ codepipeline:
 batch:
   enabled: true
 
+  # Every job queue has a node of its own beneath `batch`, and every job name one
+  # beneath its queue's, each named by what AWS calls it. A job name's line stands on
+  # its node; a queue's node speaks only where the queue has something to say. With
+  # `series_keep` set above, every run is kept and drawn on its job name's node.
+
+  # A job name that contains one of these has no node, and none of its runs is kept.
   ignore_name_patterns: []
+  # A queue whose name contains one of these is not read at all.
   ignore_queue_patterns: []
 
   # Whether a queue holding no jobs at all warns.
@@ -318,7 +378,8 @@ batch:
   max_wait_time: 30m
 
   # How many jobs are read per queue per status, newest first. Reaching this bound
-  # is said out loud on the queue's line rather than silently truncating.
+  # is said out loud on the queue's node rather than silently truncating, and a job
+  # name whose runs are no longer among those read has no node until it runs again.
   max_jobs: 100
 
 # --- Display-name substitutions ----------------------------------------------
@@ -332,12 +393,15 @@ shorten:
   - {from: "-lambda"}
   - {from: "-reporter", to: "-rp"}
 
-# --- Display text for the aspect leaves (title / about) ----------------------
+# --- Display text for the aspects (title / about) ----------------------------
 # Built into the type, so it is not copied per account. Add a `subnodes:` block
 # only to change one: your text replaces the built-in default, or extends it where
 # you write {default} inside your own. little-sister itself reads this block, so
-# an entry here applies to the leaf of that name under **every** account this
-# check watches — the built-in text names no account for the same reason.
+# an entry here applies to the node of that name under **every** account this
+# check watches — the built-in text names no account for the same reason. The
+# block names aspects: a function, a pipeline, a job queue, a job name, a region or
+# an account that is called like one is not reached by it, and is labeled by its
+# path, in `nodes.yaml`.
 #
 # subnodes:
 #   batch:
@@ -350,7 +414,9 @@ shorten:
 # `ec2`, `lambda`, `batch` and `codepipeline`: those four report a roster — every
 # instance, function, queue or pipeline they found, whether or not anything is
 # wrong — so a dense dashboard must not fold their lines away for being quiet
-# (little-sister ADR-0063). `cloudwatch` deliberately does not declare it: with
+# (little-sister ADR-0063); the roster of `lambda`, `codepipeline` and `batch` is
+# its nodes, each function, pipeline and job name a chip in a box that is not
+# folded away. `cloudwatch` deliberately does not declare it: with
 # `show_healthy: false` above it drops its quiet lines instead of showing them.
 # You need write nothing for any of this. To decline one, say so:
 #

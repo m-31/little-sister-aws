@@ -6,6 +6,255 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-10-04
+
+**Paths move, and the library goes first.** This release needs little-sister 0.3.19 (see
+*Requires*). **Every Lambda function's line becomes a node of its own** beneath
+`lambda`, **every pipeline's beneath `codepipeline`, and every Batch job name's beneath
+a node for its queue**, inside `batch`; and **a check that names one account loses the
+account's level** — `/<path>/live/ec2` becomes `/<path>/ec2`. A maintenance pin, a
+`nodes.yaml` entry and a path a client watches are keyed by a path and do not follow: a
+pin set on a path that moved stays listed as one whose node is no longer reported, until
+it expires, and is set again on the new path; a `nodes.yaml` entry left at an old path
+keeps a node there that nothing reports. A node's own status history — when it changed,
+and how long each status stood — is keyed by its path as well, and a node that moved
+starts it again. A check that names several accounts keeps every path it had: there it
+is lines that move, onto the new nodes. No `type:` name, no configuration key and no
+slug changes, and every history of runs is found again: it is keyed by the account's
+name and the region, never by a path. The first three entries under *Changed* name each
+move and the fourth what a hidden job name no longer keeps; one under *Fixed* asks for
+an edit where a `subnodes:` block names an account, and another says what a poll now
+asks of CloudWatch in requests.
+
+### Added
+
+- **A Lambda function's runs are kept, where the check keeps a series.** With
+  `series_keep:` set, every one-minute bucket of CloudWatch's metric in which a function
+  was invoked is one run of that function, a record of its own: `name`, `at` — the
+  minute's start — `invocations`, `errors`, and `duration_ms`, the slowest invocation of
+  the minute in whole milliseconds. A run failed where it counted an error, and keeps
+  that verdict at any age. little-sister draws a function's runs on the function's node
+  at the times they ran, and every function's on one time axis in `lambda`'s Series view
+  ([ADR-0006](docs/adr/0006-a-functions-runs-are-kept-and-a-function-has-a-node.md)).
+  The function's own reading is what it was, and its line says what it said, from the
+  function's node (see *Changed*). With `series_keep` unset — the default — nothing is
+  kept and no metric more is asked.
+- **What a function's runs ask of CloudWatch**, which bills `GetMetricData` by the
+  metric requested. Every poll asks `Errors` of every function, as before; `Invocations`
+  and `Duration` are asked only of a function that has a run to read — a minute its kept
+  runs lack, or one no poll has read since it was an hour old, because its numbers may
+  grow until then. That is every poll of the hour after a run, and the one after it. A
+  function that did not run is asked nothing more; one that runs once a day costs about
+  8% more at a poll every minute, and a sixth more at a poll every hour; and one that
+  runs at least hourly three times as much. The first poll after a start reads again
+  every run the series keeps, once. How much CloudWatch answers follows `series_keep`: a
+  function whose kept runs fill its series is asked no further back than they reach —
+  the last hour, the last day, or the fifteen days — and every other function the
+  fifteen days, as it was. So at `series_keep: 30`, and a poll more often than every
+  half hour, a function invoked every minute answers an hour's points where it answered
+  fifteen days'. A series of sixty runs or more reaches past such a function's hour, and
+  it then answers a day's; one of 1,440 or more, the fifteen days' again. That is
+  `Errors`: `Invocations` and `Duration` are asked from the oldest minute a poll is to
+  read, ordinarily the last hour or so of such a function, and less where the series
+  keeps less. Every figure here counts a metric once for each call that asks it: whether
+  CloudWatch bills it again for each page of an answer that takes several (see *Fixed*)
+  was not measured. The role needs nothing new: `cloudwatch:GetMetricData` was already
+  on its list.
+- **A function's runs weigh on little-sister's `series_limit`.** A check that keeps a
+  series keeps one more for every function it reads, and nothing is configured for it:
+  some 340 bytes a kept run as the library weighs it, 10 KB a function at
+  `series_keep: 30`. The library's default ceiling of 8 MiB therefore holds the runs of
+  some eight hundred functions, less what else the instance keeps, and of some hundred
+  and twenty at `series_keep: 200`. little-sister measures it: a line on
+  `/little-sister/engine` warns as soon as the configuration would need more than the
+  ceiling — the moment to lower `series_keep` or to raise `series_limit` in
+  `settings.yaml`, since past the ceiling the series written to longest ago is let go.
+- **A run's duration is declared as a measure**: `duration_ms`, in `ms`, labeled
+  *Duration*. A deployment that keeps a series draws a function's runs as stems to their
+  duration with no key of its own. little-sister's `measures:` block disagrees per
+  field: `duration_ms: null` leaves a run a tick, and naming `invocations` or `errors`
+  draws a count.
+- **A Batch run says how long it waited and ran, and a pipeline's execution how long it
+  took.** A run's record gains `wait_s`, from when the job was created to when it
+  started, and `duration_s`, from then to when it stopped; a pipeline's record gains
+  `duration_s`, from its execution's start to the last change CodePipeline recorded of
+  it. Each is whole seconds and stands once it is known: a run that is still running has
+  waited and has no duration yet, and an execution has one once it is over. Both are
+  declared as measures, in `s`, labeled *Duration* and *Wait*, so **a check that keeps a
+  series shows plots it did not**: little-sister draws a job name's *Wait* and
+  *Duration* on the job name's node and a pipeline's *Duration* on the pipeline's, once
+  a run has the number — and on the check's own node for a job name or a pipeline that
+  has no node at the moment. `wait_s: null` or `duration_s: null` in the `measures:`
+  block takes a plot away, `duration_s` a run's and an execution's alike. A record an
+  earlier release kept carries neither number and draws no stem: a run gains its two
+  while Batch still lists it, seven days at least, and of the finished executions a
+  pipeline's history holds, the newest alone. Nothing more is asked of AWS, and a record
+  gains fields and loses none
+  ([ADR-0008](docs/adr/0008-a-run-and-an-execution-say-how-long-they-took.md)).
+- **A kept Batch run and a kept execution say how they stood.** Where the check keeps a
+  series, every run a poll reads is marked on its job name's node, and listed on its
+  History page with a sentence — `SUCCEEDED, waited 10m, ran 50m`: one that succeeded
+  passes and one that failed fails, and one that still runs or waits passes until it is
+  past `max_run_time` or `max_wait_time`, warns from then on, and takes its last mark
+  from the poll that reads it finished. A kept run carried no mark before. A pipeline's
+  newest execution is marked as the pipeline's line stands, and every execution read
+  behind it by what its status means in `state_map`; the one that was the newest is read
+  once more for that, by the poll that first finds a newer one — so a success that had
+  grown past `max_age_warn` is a success again. One that a newer execution overtook,
+  `Superseded`, is marked as neither: it did not fail, and it did not deploy. The map
+  itself is what it was, and still grades the line of a pipeline whose newest execution
+  was superseded. A finished execution an earlier release kept is not read again, except
+  the newest of them: it keeps the sentence and the mark its pipeline's line had while
+  it was the newest, until it leaves the series
+  ([ADR-0009](docs/adr/0009-a-job-name-and-a-pipeline-have-nodes.md)).
+- **A pipeline's history is whole from its first poll.** Where the check keeps a series,
+  a poll reads more than a pipeline's newest execution: out of the one page of
+  executions the aspect already asked for, every execution the pipeline's history lacks
+  or holds unfinished, as many as `series_keep` and no more than the hundred a page
+  holds. An execution that a newer one overtook while it ran is read to its end, where
+  it kept the record of its last read, and so gains its `duration_s`. Nothing more is
+  asked of AWS, and with `series_keep` unset the newest is read and nothing else.
+
+### Changed
+
+- **Every Lambda function has a node of its own.** `lambda` wrote a line for each
+  function; it now hands back a node for each, named by what AWS calls the function,
+  with the function's line on it — the same sentence under the same slug. A `shorten`
+  rule gives the node its title and never reaches its path, and what a `subnodes:` block
+  says for an aspect is not said of a function that carries the aspect's name. Where an
+  account reads several regions, a function hangs beneath its region's node,
+  `…/lambda/<region>/<function>`, and its line no longer prints the region; where it
+  reads one, directly beneath `lambda`. `lambda` itself keeps the count of functions in
+  scope. The line that says a region could not be read stays on `lambda` where its
+  regions have no nodes; where they have, it stands on the region's node, under the slug
+  it had. A region's node is not folded away on a dense dashboard, as `lambda`'s is not,
+  unless `nodes.yaml` says so for its path. A function that is deleted, or that a rule
+  now ignores, leaves the tree with the next run that lists its region whole. **A pin on
+  a function's line stops matching**: set it again on the function's node. So does a pin
+  on the line of a region that could not be read, where the account reads several: set
+  it again on the region's node.
+- **Every pipeline, every job queue and every job name has a node of its own.**
+  `codepipeline` and `batch` wrote a line for each; they now hand back nodes, each named
+  by what AWS calls it: a pipeline beneath `codepipeline`, a queue beneath `batch`, and
+  a job name beneath its queue — `…/batch/<queue>/<job name>`, also where an account
+  holds one queue. A pipeline's line and a job name's stand on their nodes, under the
+  slugs they had, and say what they said less the region and the queue that stood in
+  front (below); a queue's node carries the line the queue had where it had one —
+  `INVALID`, `DISABLED`, no jobs found, or read only as far as `max_jobs` — and is quiet
+  otherwise. A `shorten` rule gives a pipeline's and a job name's node its title and
+  never reaches its path, and what a `subnodes:` block says for an aspect is not said of
+  a node that carries the aspect's name. Where an account reads several regions, a
+  pipeline and a queue hang beneath their region's node, as a function does. **No line
+  on such a node prints its region, and a job name's no longer prints its queue**: the
+  levels above it say both. `codepipeline` and `batch` keep their counts and their
+  rosters, and the line of a region that could not be read where their regions have no
+  nodes. A queue's node and a region's are not folded away on a dense dashboard, unless
+  `nodes.yaml` says so for the path. A pipeline or a queue that is deleted, or that the
+  configuration now ignores, leaves the tree with the next run that lists its region; a
+  job name leaves with the first run in which Batch lists no run of it, about a week
+  after its last one — and, in a queue read at `max_jobs`, as soon as its runs are no
+  longer among those read, until it runs again. A name whose only listed run is being
+  started — past `RUNNABLE`, not yet `RUNNING` — is not read, as it was not, and is
+  without its node for that poll. What was kept of a job name or a pipeline whose node
+  has left is listed on the check's History page and drawn on the check's own node until
+  the node returns. **A pin on a pipeline's line, a queue's or a job name's stops
+  matching**: set it again on the node — a queue's on the line its node carries, since a
+  pin on a queue's node silences its job names as well. So does a pin on the line of a
+  region that could not be read, where the account reads several: set it again on the
+  region's node ([ADR-0009](docs/adr/0009-a-job-name-and-a-pipeline-have-nodes.md)).
+- **A check that names one account has no account level.** A level stands in the tree
+  only where the configuration names several of it
+  ([ADR-0007](docs/adr/0007-a-level-stands-only-where-the-configuration-names-several.md)):
+  such a check hangs its aspects beneath its own node, and says there what refused the
+  account — the reason and the command that renews an expired login — on a node that is
+  then `ERROR`. A pin on that node is the pin on the account. **Edit what names the old
+  paths**: a pin, a `nodes.yaml` entry or a watched path under `/<path>/<account>/…` is
+  now under `/<path>/…`, and an entry left in `nodes.yaml` at the old path is not passed
+  over: it keeps a node there that nothing reports. The account's `title` and `about`
+  labeled the node it no longer has, so they are read and not shown — the log says so
+  once when the check is loaded — and belong in the check's own `title:` and `about:`.
+  The check's card says the regions the account is read in and where its credentials
+  come from, as the account's card did. A check that names several accounts keeps its
+  accounts' level. The day a configuration names a second account, or an account a
+  second region, every path beneath the new level moves the same way.
+- **A job name `ignore_name_patterns` hides is no longer kept.** Its runs were read and,
+  with `series_keep` set, kept, though no line showed them. They are left out where the
+  runs are read now, so a hidden name has no node, no plots and no history. What was
+  kept of one before stays, listed and drawn on the check's own node as it was, until
+  the library lets it go.
+- **The README names the page that lists this package's schemes.** little-sister's
+  System page is two views now, and what an installation registered — the schemes
+  this package claims among it, and its keeper — is on the one called *Installed*,
+  `/system/installed` (little-sister ADR-0100); the README says so where it said
+  `/system`. Prose only: no code moved.
+
+### Fixed
+
+- **An answer CloudWatch hands back in pages is read to its end.** `GetMetricData`
+  answers in pages, each with a token for the next, and `lambda` read the first alone. A
+  page ends where its part of the window *could* hold 100,800 data points — the metrics
+  asked times the minutes in it — whatever they hold, so in a region of five functions
+  or more the first page did not reach back the fifteen days that were asked: fourteen
+  days with five functions, seventeen hours with a hundred. A function that last ran
+  before that read as one with no data in fifteen days, was asked again at a coarser
+  period, billed again, and its line named a coarser last run — or none, where it had
+  last run before the first page of every period: `no recent invocations`, which warns
+  where a run is expected. The token is followed now, whatever the check keeps, for at
+  most 200 pages; past that the region says that it could not be read, and why. **A poll
+  makes more requests for it**: three for every fourteen functions asked their fifteen
+  days — and for one that did not run in them, which is asked a coarser period as well,
+  or both, up to half a request in all. A region of a hundred functions that ran is 22
+  requests where it was one for each period asked, and a region of five hundred 108.
+  Where this was measured a page took a third of a second with a hundred functions and
+  2.8 s with five hundred: some seven seconds a poll for the one region, and some five
+  minutes for the other, which a check that polls every minute does not have. A poll
+  that outgrows its `frequency:` is reported late on `/little-sister/engine`, and it is
+  `frequency:` that gives it time: `timeout:` bounds nothing in this type. Whether
+  CloudWatch bills a metric again for each page was not measured.
+- **A metric CloudWatch could not answer is a region that could not be read.**
+  `GetMetricData` answers each query of a call on its own, and may say of one that it
+  could not — `InternalError`, `Forbidden` — while the call succeeds. `lambda` took that
+  result's empty list of points for a function with no data: it asked again at the
+  coarser periods, was billed again, and showed an older last run, or a function never
+  invoked. It is a read that failed now. The region's line says which metric of which
+  function CloudWatch did not answer, and what CloudWatch said; the functions' nodes
+  stay as they were; and the next poll asks again.
+- **An account called like an aspect shows its own title and `about`.** Where a check
+  names several accounts, one called `ec2`, `lambda`, `batch`, `cloudwatch` or
+  `codepipeline` was shown under that aspect's title and `about`, and stayed in view on
+  a dense dashboard where the aspect does: little-sister applies what is declared for a
+  name to every node of that name. An account's node now says that the configuration
+  names it (little-sister ADR-0118), and shows the `title` and `about` the account was
+  given, or none. **A `subnodes:` entry written under an account's own name no longer
+  labels the account**: say it in the account's `title:` and `about:`, and a
+  `show_when_quiet` for it under the account's path in `nodes.yaml`.
+- **The README's policy section names `s3:DeleteObject` for the keeper.** *The IAM
+  policy* listed the keeper's actions without it, where the keeper's own section, its
+  record and the annotated example name it. A role written from that list cannot delete
+  a presence file: it stays in the bucket once its standby is gone, the log warns of it
+  every interval, and of a standby that died the instance log never says when it stood
+  by. Prose only.
+- **An account read with configured keys says so on its card.** The line that says where
+  an account's credentials come from named the ambient credential chain where the check
+  reads with a `secrets:` block's static keys.
+- **A date that says `-0000` is read as the time in UTC it names.** The S3 keeper read an
+  HTTP date with Python's own reader, which answers one that says `-0000` without a
+  zone. The lease's instant was then stored on the machine's clock, the age of a lease
+  measured against such a date was unknown — so the lease read as alive — and noting the
+  store's clock raised. S3 says `GMT`, so it took a proxy, or a lease edited by hand. A
+  date that names no zone at all is no instant: a line shows it as the text it is.
+  (little-sister ADR-0120)
+
+### Requires
+
+- **little-sister 0.3.19 or newer.** The floor rises from 0.3.18 because that release is
+  the first that lets a check read what it kept (little-sister ADR-0113), write a line
+  for the record alone (little-sister ADR-0111), say that a node's children are complete
+  (little-sister ADR-0109) and say that a run names a node (little-sister ADR-0118) —
+  what a function's runs and the nodes of a function, a pipeline and a job name are
+  built on. Against an older library the check fails at its first run. Upgrade the
+  library first.
+
 ## [0.1.4] - 2026-09-27
 
 **Upgrade the library first:** this release speaks little-sister's check API epoch 3 and

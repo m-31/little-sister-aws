@@ -1,6 +1,6 @@
 [project]
 name = "little-sister-aws"
-version = "0.1.4"
+version = "0.1.5"
 # **Every surface, not one.** The old summary named only the check type, which was
 # true when this package was only that; it now also carries the AWS secret provider,
 # the S3 keeper and the identity seam all three open sessions through, and a summary
@@ -43,26 +43,28 @@ requires-python = ">=3.11"
 # a release. The upgrade a floor cannot see, the library moving *past* the
 # surface, is caught by `require_api()` in `__init__.py`.
 #
-# **0.3.18** is the release that speaks **check API epoch 3**: `run()` became
-# `measure()` and `grade()` (little-sister ADR-0086), and a type written for the old
-# shape cannot be adapted at runtime. `require_api()` catches that direction — but only
-# at startup, and a floor naming an older release would let a resolver install the
-# very library that call is about to reject.
+# **0.3.19** is the release that lets a check read what it kept (`Check.kept()`,
+# little-sister ADR-0113), write a line for the record alone (`for_record`, its
+# ADR-0111), say that a node's children are complete (`children_complete`, its
+# ADR-0109) and say that a run names a node (`dynamic`, its ADR-0118) — the four a
+# function's runs and the nodes of a function, a pipeline and a job name are built
+# on (ADR-0006, ADR-0009).
+# Every one of them is an **added** name, which is exactly the mismatch
+# `require_api()` cannot catch: an epoch says what was **removed** and nothing about
+# what arrived, so the floor is the only thing standing between an older library and
+# a `TypeError` at this check's first run.
 #
-# The floor's other job is unchanged and is why it names a real number rather than the
-# first release with the epoch: the **keeper seam** this package fills
-# (`little_sister.keeper`, little-sister architecture.md §11 and its ADR-0071 §5) and
-# `little_sister.instance`, the mark it writes into a bucket (its ADR-0074), arrived
-# together in 0.3.15. An *added* name is exactly the mismatch `require_api()` cannot
-# catch — an epoch says what was **removed** and nothing about what arrived — so the
-# floor is the only thing standing between an older library and an `ImportError` at
-# the deployment's registration call.
+# What the floor named before still holds beneath it: 0.3.18 speaks **check API epoch
+# 3** — `run()` became `measure()` and `grade()` (little-sister ADR-0086) — and the
+# **keeper seam** this package fills (`little_sister.keeper`, little-sister
+# architecture.md §11 and its ADR-0071 §5) and `little_sister.instance`, the mark it
+# writes into a bucket (its ADR-0074), arrived together in 0.3.15.
 #
 # A local checkout that wants the library from beside it uses the development
 # redirect further down — and restores `uv.lock` with it. See `### Requires` in the
 # CHANGELOG for when the floor last moved.
 dependencies = [
-    "little-sister>=0.3.18",
+    "little-sister>=0.3.19",
     # boto3, and the reason this package is the first in the family with a
     # dependency beyond the library (ADR-0001 §3). A **floor**, like the one
     # above: boto3 releases daily and a pin here would fight every consumer.
@@ -157,16 +159,18 @@ target-version = "py311"
 # ruff-selection:begin
 # One selection for the whole family, so every project lints identically and a
 # fix argued in one of them is a fix in all of them. Beyond ruff's default (E, F):
-# import sorting (I), pyupgrade (UP), bugbear (B), comprehensions (C4) and Ruff's
-# own rules (RUF). Selecting explicitly also pins the gate against ruff's own
-# defaults shifting between releases.
+# import sorting (I), pyupgrade (UP), bugbear (B), comprehensions (C4), the
+# time-zone rules (DTZ) and Ruff's own rules (RUF). DTZ refuses a clock read and a
+# time built without a zone, and a time that is meant as a wall time says so with
+# a `noqa` and its reason (little-sister ADR-0120). Selecting explicitly also pins
+# the gate against ruff's own defaults shifting between releases.
 #
 # The ambiguous-unicode rules are off, and stay off. This family's user-facing
 # text — reasons, subnode titles, chip labels — uses typographic "—", "…", "×" and
 # "·" on purpose, and a rule that flags them would be answered with a `noqa` on
 # every line that has an opinion about punctuation.
 # ruff-selection:end
-select = ["E", "F", "W", "I", "UP", "B", "C4", "RUF"]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "DTZ", "RUF"]
 ignore = ["RUF001", "RUF002", "RUF003"]
 
 [tool.mypy]
