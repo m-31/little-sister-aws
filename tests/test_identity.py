@@ -237,9 +237,15 @@ def test_the_defaults_name_this_package_and_a_regional_endpoint() -> None:
 
 
 def test_the_boto3_seam_turns_an_empty_string_into_no_argument_at_all(
-        monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """boto3 reads ``None`` as *look it up* and an empty string as *this is the
-    value*, so the difference is the whole ambient chain."""
+    value*, so the difference is the whole ambient chain. The core session the seam
+    builds for boto3 resolves the profile before boto3 sees it, and refuses one the
+    machine lacks as boto3 would — so this machine has the one the test names."""
+    (tmp_path / "config").write_text(f"[profile {PRIMARY}]\nregion = eu-central-1\n")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "config"))
+    for name in ("AWS_PROFILE", "AWS_DEFAULT_PROFILE", "AWS_DATA_PATH"):
+        monkeypatch.delenv(name, raising=False)
     built: list[dict[str, Any]] = []
     monkeypatch.setattr(identity_module.boto3, "Session",
                         lambda **kwargs: built.append(kwargs))
@@ -247,9 +253,14 @@ def test_the_boto3_seam_turns_an_empty_string_into_no_argument_at_all(
     identity_module.new_session()
     identity_module.new_session(profile_name=PRIMARY)
 
-    assert built[0] == {"aws_access_key_id": None, "aws_secret_access_key": None,
-                        "aws_session_token": None, "profile_name": None}
+    for name in ("aws_access_key_id", "aws_secret_access_key",
+                 "aws_session_token", "profile_name"):
+        assert built[0][name] is None
     assert built[1]["profile_name"] == PRIMARY
+    assert built[1]["botocore_session"].profile == PRIMARY
+    for kwargs in built:          # both on the process's one loader of service models
+        assert (kwargs["botocore_session"].get_component("data_loader")
+                is identity_module.SERVICE_MODELS.loader(None))
 
 
 # --- what the ambient chain turns out to be --------------------------------

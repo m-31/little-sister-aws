@@ -1,12 +1,14 @@
 # ADR-0003 — A graded threshold is a pair, and a rule owns names
 
 - **Status:** Accepted
-- **Date:** 2026-08-29
-- **Related:** [ADR-0001](0001-the-aws-check-type.md) (the type these aspects
-  belong to, and the line between what is true of the type and what is true of an
-  installation), little-sister **ADR-0042** (an entry carries its own status),
-  little-sister **ADR-0050** (a declared slug is an identity claim), little-sister
-  **ADR-0013** (a check reports its own configuration)
+- **Date:** 2026-10-10 (accepted 2026-08-29)
+- **Related:** [ADR-0001](0001-the-aws-check-type.md) (the type these aspects belong to,
+  and the line between what is true of the type and what is true of an installation),
+  little-sister **ADR-0042** (an entry carries its own status),
+  little-sister **ADR-0050** (a declared slug is an identity claim),
+  little-sister **ADR-0013** (a check reports its own configuration),
+  [ADR-0014](0014-a-pipelines-line-keeps-its-verdict-while-an-execution-is-in-flight.md)
+  (the one pair with a default)
 
 ## Context
 
@@ -75,6 +77,15 @@ half of what a reader came for.
 The alternative was to keep the numbers that were there. They were an opinion about
 how often an estate replaces its boxes, held by a package with no way to know, and
 the one installation that ran them had never chosen them.
+
+**One pair has a default, and only one**: `codepipeline`'s `max_run_time` warns above
+thirty minutes
+([ADR-0014](0014-a-pipelines-line-keeps-its-verdict-while-an-execution-is-in-flight.md) §3).
+It took over a judgment the type already shipped — `InProgress` warned from an
+execution's first second — and moving that to thirty minutes takes no warning from an
+installation that had one. The default is a pair like any other: a block that writes one
+level takes the pair as it is written, as a rule takes one from its block (§4), and
+`max_run_time: null` grades nothing (§2).
 
 ### 4. A rule owns a set of names
 
@@ -165,9 +176,9 @@ being replaced, so the box that has run longest is the security fact.
   them: a hint naming each replacement would be a permanent line in the parser for a
   one-time reading of one error message, and what a version changed is what a
   CHANGELOG is for.
-- **An installation that wrote nothing down loses its grading**, deliberately and
-  visibly: it gets an inventory and a log line saying so, rather than an opinion it
-  never chose.
+- **An installation that wrote nothing down loses its grading**, but for the one default
+  of §3, deliberately and visibly: it gets an inventory and a log line saying so, rather
+  than an opinion it never chose.
 - **The vocabulary is the type's, not this aspect's.** The parsing is shared from
   the first commit, and `codepipeline` and `lambda` adopt it: levels where there is
   a threshold to grade, rules and reasons everywhere. `lambda`'s `error_max_age` is
@@ -176,10 +187,10 @@ being replaced, so the box that has run longest is the security fact.
   it would produce `error_max_age_warn`, which means nothing.
 - **`cloudwatch` stays outside the graded half.** It grades on the alarm's own state
   through `state_map`, so it has no threshold to split into levels.
-- **The card carries more, and has to.** With no defaults left, a check's own
-  configuration report is the only place a reader can see what an installation
-  actually grades on — so it lists the effective levels, the sentence each judgment
-  says, and the rules in the order they are consulted.
+- **The card carries more, and has to.** With one default left, a check's own
+  configuration report is the only place a reader can see what an installation actually
+  grades on — so it lists the effective levels, that default among them, the sentence
+  each judgment says, and the rules in the order they are consulted.
 
 ## Alternatives considered
 

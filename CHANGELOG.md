@@ -6,6 +6,209 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-10-10
+
+**The process gets lighter, a function's node holds an error it saw, a job name keeps
+its node while its job starts, a pipeline keeps its color while it deploys, a console
+link can open the account its node stands for, boto3's sentence at every run leaves your
+log, and the library goes first.** This release needs little-sister 0.3.20, and one IAM
+action more where the check keeps a series of its pipelines (see *Requires*). Nothing
+you configure moves — no `type:` name, no configuration key, no path and no slug; six
+keys are new and optional. What changes is what the process weighs, what a function's
+node shows after an error, what a job name's node shows while its job starts or waits,
+what a pipeline's node shows while it deploys, and what your log holds of the AWS SDK.
+The first entry under *Added* is two of the keys: `console_link`, a template that wraps
+every link of an account in the address your people sign in to that account through, and
+`account_id`, for an account that has no role to read its id from. Until you set one
+every link is what it was, and an account's card says where its links open. Every
+session this package builds now shares one loader of service models, so a process
+reading three accounts that stood at 424 MiB stands at 95 — on a small instance that was
+running out of memory, the reason to take this release; the first entry under *Changed*
+has the numbers. The second is a **grading change**: a function that errs once between
+two clean runs stands ERROR for an hour, saying so, where it stood for one poll and then
+read *no errors*; `error_hold` is the knob, and `0s` is the old line. The third is one
+as well: a job held by another, and an array job while its children run, now counts as
+waiting and warns past `max_wait_time`. So is the fourth: a pipeline keeps the color it
+had while it deploys — and, where the check keeps a series, while a failed stage is
+retried — in italics, and warns once an execution has been in flight for thirty minutes;
+a `state_map` that writes `InProgress: WARN`, as the example did, keeps its yellow
+deployments until it says `InProgress: OK`. The fifth says what is capped in your log
+and how one variable has it back, and the one under *Security* what a `LOG_LEVEL=DEBUG`
+session held, and where it still does.
+
+### Added
+
+- **A console link can open the account it names.** A name on a line links to its page
+  in the AWS console, and that address carries a region, a service's page and a name:
+  nothing of the account, which the console takes from your browser's session. So a link
+  on one account's node opened the resource of that name in whichever account you were
+  signed in to, and where two of your accounts carry a resource of one name, it opened
+  the other account's and looked right. `console_link:` is a template that wraps every
+  link of an account — a line's and a roster's, an alarm's, an instance name's, a
+  function's, a pipeline's, a job's and a queue's — in an address that signs in to that
+  account first, in the shape IAM Identity Center's access portal takes:
+  `console_link: "https://example.awsapps.com/start/#/console?account_id={account_id}&destination={url}"`.
+  `{url}` is the console's address and `{account_id}` the account's id, each
+  percent-encoded as it goes in. A template has to name `{url}`; one that names any
+  other token, or holds whitespace, a backtick, a backslash, a parenthesis or an angle
+  bracket, is refused when the check loads. The key is the check's, and an account's own
+  replaces it, as `regions:` and `profile:` do. The id is read out of the account's
+  `role_arn`; an account that names no role says `account_id:`, the twelve digits in
+  quotes. An `account_id` beside a `role_arn` in another account is refused, and so is a
+  template that names `{account_id}` over an account that says neither. **Set nothing
+  and no line, slug or record moves.** One row is new on a card: *console links*, on an
+  account's card or on the check's own where it names one account, says that a link
+  opens in whichever account the browser is signed in to, or shows the template. **Set a
+  template that names `{account_id}`, and the account's id is in every link of that
+  account** wherever its line goes — an event, History, what a client polls, what the
+  series keeps of a pipeline's line, a line pasted into a ticket. It is in no path, slug
+  or subject, and in no field of a reading, either way
+  ([ADR-0013](docs/adr/0013-a-console-link-opens-the-account-it-names.md)).
+
+- **`docs/decisions.md` ships with the package** — every design record in `docs/adr/`,
+  digested in a few lines with a link to the record that argues it. It takes the place
+  of the list at the end of `docs/architecture.md`, which now points at it.
+
+### Changed
+
+- **Every session this package builds shares one loader of service models, and the
+  process weighs a fraction of what it did.** boto3 gives every session a loader of its
+  own, and a loader parses a service's model — its JSON and the endpoint ruleset beside
+  it — for the first client of that service. The check opens its sessions anew at every
+  run, so a run parsed the models of every service it reads once for each account and
+  left them to the cycle collector, which frees them when it chooses. Now
+  `little_sister_aws.identity.new_session` builds every session on a botocore core
+  session that carries the process's one loader (`SERVICE_MODELS`, beside `SSO_LOGINS`),
+  and the models are parsed once in a process. Measured over thirty runs of three
+  accounts: the process stood at 424 MiB at its highest and stands at 95, and a run's
+  build fell from a quarter of a second to three hundredths. Nothing you configure or
+  pin moves — no `type:` name, no configuration key, no slug, no setting of the identity
+  file or the keeper's — and `AWS_DATA_PATH` and a profile's `data_path` keep their
+  meaning, with one loader for each search path your sessions resolve. The keeper and
+  the secret provider share the loader, and so does your own code where it opens its
+  sessions through `open_session` or `new_session`; code that builds `boto3.Session`
+  itself does not. A session is still a run's: nothing of a run's sessions outlives it,
+  and its credentials are proven at the top of each run
+  ([ADR-0011](docs/adr/0011-one-loader-of-service-models-for-every-session.md)).
+- **A function's line holds an error it saw, for an hour by default.** The `lambda` line
+  said what the function's newest run did, so an error between two clean runs was ERROR
+  for one poll and *no errors, last run 2m ago* the next: two events and nothing left on
+  the node, while the error sat in the run's record until `series_keep` let it go. Now
+  the line keeps the newest error it saw for `error_hold` once clean runs have followed,
+  at ERROR and with `error_reason`, and says what the hold holds:
+  *3 errors in the last 1h, the newest 23m ago · 2 clean runs since, the last 2m ago*.
+  The newest run being the error reads as it always did, with *· 3 in the last 1h*
+  beside it where the hold holds more. `error_hold` is a duration on the `lambda:` block
+  and on each of its rules, inherited by a rule that does not name it, `1h` by default —
+  or the gate, where `error_max_age` is shorter, so a configuration with a gate under an
+  hour loads as it is; `0s` is no hold — the newest run alone decides, as before. A hold
+  you write longer than `error_max_age`, or than the 15 days CloudWatch keeps a
+  one-minute point for, is refused when the check loads, naming both. **What your nodes
+  show changes on the first run after you take this release**, with nothing configured:
+  a function's node may stand ERROR for an hour where it stood two minutes. Nothing is
+  asked of CloudWatch for it within the hour — the newest error is in the answer every
+  poll already has — and a longer hold asks the function's day or its fifteen days at
+  one minute, as a deeper series would. The function's reading, which its line carries,
+  gains one field, `error`, with the newest error's `at`, `held` and `clean_since`; the
+  card shows the hold beside the gate
+  ([ADR-0012](docs/adr/0012-a-functions-line-holds-an-error-it-saw.md)).
+- **A job name keeps its node while its job is starting, held or just submitted.**
+  `batch` asked Batch for four of the seven statuses a job can be in — `SUCCEEDED`,
+  `FAILED`, `RUNNING` and `RUNNABLE` — and a queue's node says that its job names are
+  complete in every run that lists it. So a name whose one listed job was `SUBMITTED`,
+  `PENDING` or `STARTING` — every job passes `STARTING` on its way to running — lost its
+  node for that poll and had it back with the next: an event that said *removed* and its
+  return, its plots on the check's own node, a pin on it suspended. Now every status is
+  read, three `ListJobs` calls more for every queue on every poll, each under the same
+  `max_jobs`. A job that is starting counts as running. One that is submitted or held
+  counts as waiting, from its submission: **a job held by one it depends on warns past
+  `max_wait_time`, and so does an array job, which Batch holds `PENDING` while its
+  children run** — where your arrays run longer than the default 30 minutes, set
+  `max_wait_time` above their run. The line says *waiting for capacity* where every
+  waiting job is `RUNNABLE`, as it did, and *waiting* where one is not, and while a job
+  of the name waits or runs the line is set in italics, little-sister's mark for work in
+  flight; its code stays what the newest finished run made it
+  ([ADR-0009](docs/adr/0009-a-job-name-and-a-pipeline-have-nodes.md)).
+- **A pipeline keeps the color it had while it deploys, and an execution in flight warns
+  once it has run for thirty minutes.** `codepipeline` graded `InProgress` a warning by
+  default, so a pipeline stood yellow from the moment a deployment started until it
+  ended: every deployment was two events, and a failed pipeline being run again turned
+  yellow while its fix deployed. Now `InProgress` passes, and while an execution is in
+  flight — `InProgress` or `Stopping` — a pipeline's line keeps what the newest finished
+  execution did and says what is in flight beside it, set in italics, little-sister's
+  mark for work in flight: *Failed, started 3h ago · InProgress, started 2m ago* stays
+  red until an execution succeeds. A retry of the failed stage runs the failed execution
+  again under its own id, so no page of executions shows the failure while it runs;
+  where the check keeps a series, the history does, and the line stays red through the
+  retry as well — *Failed, started 2h ago · InProgress, retried 3m ago* — with the bound
+  counted from the retry's start. What is in flight can make the line worse and never
+  better: `Stopping` is still an error, and an execution in flight for longer than
+  `max_run_time` warns — **thirty minutes by default**, the one `_warn` / `_error` pair
+  this type sets for you, in place of the warning `InProgress` gave from an execution's
+  first second. `max_run_time_warn`, `max_run_time_error` and `max_run_time_reason` are
+  new keys of the `codepipeline:` block and of its rules — one that writes a single
+  level takes the pair as written, so `max_run_time_error: 2h` alone warns at nothing —
+  and `max_run_time: null` switches the bound off, for a pipeline that waits at a manual
+  approval for as long as it takes. **What your nodes show changes on the first run
+  after you take this release**, with nothing configured: a deploying pipeline stays
+  green or red where it stood yellow, and one whose execution has been in flight for
+  more than thirty minutes warns. A configuration that writes `InProgress: WARN` in its
+  `state_map` keeps a yellow deployment — the example did, so a copy of it does: write
+  `InProgress: OK`, or leave the word out. Where a series is kept, the execution the
+  line is written from is marked as the line stands, and one in flight past
+  `max_run_time` warns in its own mark. The one call more is a retry's: one page of the
+  retried execution's action executions at every poll while it runs, which needs
+  `codepipeline:ListActionExecutions` (see *Requires*); a role without it has a line
+  that warns while a retry runs and says why
+  ([ADR-0014](docs/adr/0014-a-pipelines-line-keeps-its-verdict-while-an-execution-is-in-flight.md)).
+- **What boto3 writes into your log is capped, by declaration.** Importing this package
+  declares four noise caps through little-sister's `noise.cap`, and little-sister sets
+  them where your `wsgi.py` imports the application: `botocore.credentials` and
+  `botocore.tokens` at `WARNING`, `botocore` and `urllib3` at `INFO`. A log no longer
+  holds *Found credentials in shared credentials file: …* at every run of the check, nor
+  *Loading cached SSO token for …* on a machine signed in through an SSO session.
+  Nothing the SDK says as a warning or as an error is taken out, and the package sets no
+  level itself. To read what a cap hides, name its logger in `LOG_LEVEL`, in `.env` or
+  in the environment, and restart: `LOG_LEVEL=INFO,botocore.credentials=DEBUG`. A level
+  your own startup file sets on one of these loggers stands — a deployment that capped
+  the SDK there keeps what it wrote, and may take it out — and little-sister's
+  `/system/installed` lists every cap under *Logging* with what it hides. The README's
+  *What the SDK writes into your log* has the table
+  ([ADR-0010](docs/adr/0010-the-package-declares-what-its-sdk-writes.md)).
+
+### Security
+
+- **A `LOG_LEVEL=DEBUG` session no longer holds a session's token or a secret's value,
+  from where the application is imported.** At `DEBUG`, botocore writes each request as
+  it is sent and what each call answered. Measured: the token of temporary credentials,
+  an assumed role's among them, in two lines of every call, and the value of a Secrets
+  Manager secret and of a Parameter Store parameter in one line each. little-sister's
+  default keeps its log in a file. The cap on `botocore` at `INFO` takes those lines out
+  of a bare `LOG_LEVEL=DEBUG`. An entry that names the logger, `botocore=DEBUG`, has
+  them back, so name the narrowest logger that answers your question. **What your
+  startup file reads from AWS before it imports the application is under no cap** — the
+  secret provider resolving the credential of a login, say — and at a bare
+  `LOG_LEVEL=DEBUG` those lines are written as before, the value among them. An entry of
+  the variable holds from the first line, so this is a `DEBUG` session without the SDK:
+  `LOG_LEVEL=DEBUG,botocore=WARNING,urllib3=WARNING`.
+
+### Requires
+
+- **little-sister 0.3.20 or newer.** The floor rises from 0.3.19 because 0.3.20 is the
+  first release with `little_sister.noise.cap`, the call this package declares its caps
+  with (little-sister ADR-0121). The call is made where the package is imported, so
+  against an older library every import of this package fails — for the check type, the
+  secret provider, the keeper and the identity seam alike. Upgrade the library first; no
+  configuration changes with it.
+- **`codepipeline:ListActionExecutions` on each account's role, where `codepipeline` is
+  on and the check keeps a series.** While a failed or stopped execution is retried,
+  every poll asks for one page of its action executions; that is how its pipeline's line
+  stays red through the retry
+  ([ADR-0014](docs/adr/0014-a-pipelines-line-keeps-its-verdict-while-an-execution-is-in-flight.md) §5).
+  A role without the action loses nothing else: while a retry runs, the line is written
+  from the execution before it and warns, saying the call was refused. The README's
+  *The IAM policy* has the row.
+
 ## [0.1.5] - 2026-10-04
 
 **Paths move, and the library goes first.** This release needs little-sister 0.3.19 (see

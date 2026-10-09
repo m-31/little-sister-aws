@@ -9,23 +9,28 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import urllib.parse
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import pytest
+import yaml
 from botocore.exceptions import ClientError, NoCredentialsError
 from little_sister.checks import CHECK_TYPES, CheckError, CheckResult, Measurement
 from little_sister.reasons import RECORD_TIMESTAMP_KEYS
 from little_sister.series import SeriesRecord
 from little_sister.status import StatusCode, effective_code
+from mypy_boto3_batch.literals import JobStatusType
 from running import measured, run_check
 
 from little_sister_aws import aws as aws_module
 from little_sister_aws import identity as identity_module
 from little_sister_aws.aws import (
     BATCH,
+    BATCH_STATUSES,
     CLOUDWATCH,
     CODEPIPELINE,
     CREDENTIALS_UNUSABLE,
@@ -391,10 +396,16 @@ class _FakeCodePipeline:
 
     def __init__(self, pages: list[list[str]],
                  executions: dict[str, list[dict[str, Any]]],
-                 calls: list[tuple[str, int]]) -> None:
+                 calls: list[tuple[str, int]],
+                 actions: dict[str, list[dict[str, Any]]] | None = None,
+                 refused: set[str] | None = None,
+                 action_calls: list[tuple[str, str, int]] | None = None) -> None:
         self._pages = pages
         self._executions = executions
         self._calls = calls
+        self._actions = actions or {}
+        self._refused = refused or set()
+        self._action_calls = action_calls if action_calls is not None else []
 
     def get_paginator(self, name: str) -> _FakePipelinePaginator:
         assert name == "list_pipelines"
@@ -405,6 +416,19 @@ class _FakeCodePipeline:
         self._calls.append((pipelineName, maxResults))
         return {"pipelineExecutionSummaries":
                 list(self._executions.get(pipelineName, []))}
+
+    def list_action_executions(self, *, pipelineName: str,
+                               filter: dict[str, Any],
+                               maxResults: int) -> dict[str, Any]:
+        execution = filter["pipelineExecutionId"]
+        self._action_calls.append((pipelineName, execution, maxResults))
+        if execution in self._refused:
+            raise ClientError(
+                {"Error": {"Code": "AccessDeniedException",
+                           "Message": "not authorized to perform: "
+                                      "codepipeline:ListActionExecutions"}},
+                "ListActionExecutions")
+        return {"actionExecutionDetails": list(self._actions.get(execution, []))}
 
 
 class _FakeQueuePaginator:
@@ -467,8 +491,14 @@ class _FakeSession:
                  batch_unreadable: set[str] | None = None,
                  log_pages: dict[str, list[tuple[list[str], str]]] | None = None,
                  metric_page: int | None = None,
+                 actions: dict[str, list[dict[str, Any]]] | None = None,
+                 actions_refused: set[str] | None = None,
                  ) -> None:
         self.sts = sts
+        self.actions = actions or {}
+        self.actions_refused = actions_refused or set()
+        #: Each `list_action_executions` call: the pipeline, the execution, the page.
+        self.action_calls: list[tuple[str, str, int]] = []
         self.credentials = credentials
         self.alarms = alarms
         self.unreadable = unreadable
@@ -508,7 +538,9 @@ class _FakeSession:
                                "Message": "no pipelines"}},
                     "ListPipelines")
             return _FakeCodePipeline(self.pipelines.get(region_name, []),
-                                     self.executions, self.execution_calls)
+                                     self.executions, self.execution_calls,
+                                     self.actions, self.actions_refused,
+                                     self.action_calls)
         if name == "batch":
             if region_name in self.batch_unreadable:
                 raise ClientError(
@@ -561,6 +593,8 @@ def _stub(check: AwsCheck, sts: _FakeSts | None = None, *,
           batch_unreadable: set[str] | None = None,
           log_pages: dict[str, list[tuple[list[str], str]]] | None = None,
           metric_page: int | None = None,
+          actions: dict[str, list[dict[str, Any]]] | None = None,
+          actions_refused: set[str] | None = None,
           ) -> list[_FakeSession]:
     """Replace the one place boto3 is constructed; record what was built."""
     shared_sts = sts if sts is not None else _FakeSts()
@@ -576,7 +610,8 @@ def _stub(check: AwsCheck, sts: _FakeSts | None = None, *,
                                pipelines_unreadable=pipelines_unreadable,
                                queues=queues, jobs=jobs,
                                batch_unreadable=batch_unreadable,
-                               log_pages=log_pages, metric_page=metric_page)
+                               log_pages=log_pages, metric_page=metric_page,
+                               actions=actions, actions_refused=actions_refused)
         built.append(session)
         return session
 
@@ -2107,6 +2142,187 @@ def test_the_grace_is_configurable() -> None:
     assert _entry(strict, "running-collector-lambda").code is StatusCode.ERROR
 
 
+# --- a function's line holds an error it saw (ADR-0012) -----------------------
+#
+# The claim: an error between two clean runs is not ERROR for one poll and OK the
+# next. The line holds the newest error it saw for `error_hold` — an hour unless the
+# configuration says otherwise — and says how many errors the hold holds, when the
+# newest was, and what ran clean since. The newest run being the error reads as it
+# always did, a hold of nothing is the old line, and a hold longer than the gate is
+# refused where the check loads.
+
+def _held(*ages_and_errors: tuple[int, int]) -> dict[str, Any]:
+    """A function's buckets, each by its age in minutes and its errors."""
+    return {"runs": [{"age": timedelta(minutes=age), "errors": errors,
+                      "invocations": 1}
+                     for age, errors in ages_and_errors]}
+
+
+BETWEEN_CLEAN_RUNS = _held((23, 1), (18, 0), (13, 0), (8, 0), (2, 0))
+
+
+def test_an_error_between_two_clean_runs_holds_the_line_for_an_hour() -> None:
+    leaf = _lambda(_build(), functions=ONE_FUNCTION,
+                   metrics={"running-collector-lambda": BETWEEN_CLEAN_RUNS})
+    entry = _entry(leaf, "running-collector-lambda")
+    assert entry.code is StatusCode.ERROR
+    assert ("1 error in the last 1h, 23m ago · 4 clean runs since, the last 2m ago"
+            in entry.text)
+
+
+def test_several_errors_in_the_hold_are_counted_and_the_newest_dated() -> None:
+    leaf = _lambda(_build(), functions=ONE_FUNCTION,
+                   metrics={"running-collector-lambda":
+                            _held((50, 2), (40, 0), (23, 1), (8, 0), (2, 0))})
+    entry = _entry(leaf, "running-collector-lambda")
+    assert entry.code is StatusCode.ERROR
+    assert ("3 errors in the last 1h, the newest 23m ago · 2 clean runs since, "
+            "the last 2m ago") in entry.text
+
+
+def test_errors_older_than_the_hold_are_not_counted_in_it() -> None:
+    leaf = _lambda(_build(), functions=ONE_FUNCTION,
+                   metrics={"running-collector-lambda":
+                            _held((90, 5), (70, 0), (23, 1), (2, 0))})
+    assert "1 error in the last 1h, 23m ago · 1 clean run since" in _line(
+        leaf, "running-collector-lambda")
+
+
+def test_past_the_hold_the_line_is_clean_again() -> None:
+    leaf = _lambda(_build(), functions=ONE_FUNCTION,
+                   metrics={"running-collector-lambda":
+                            _held((61, 1), (30, 0), (2, 0))})
+    entry = _entry(leaf, "running-collector-lambda")
+    assert entry.code is StatusCode.OK
+    assert "no errors, last run 2m ago" in entry.text
+
+
+def test_the_newest_run_being_the_error_reads_as_before() -> None:
+    leaf = _lambda(_build(), functions=ONE_FUNCTION,
+                   metrics={"running-collector-lambda":
+                            _held((30, 2), (10, 0), (2, 1))})
+    entry = _entry(leaf, "running-collector-lambda")
+    assert entry.code is StatusCode.ERROR
+    assert "1 error, last run 2m ago · 3 in the last 1h" in entry.text
+
+
+def test_a_held_error_says_the_configured_reason() -> None:
+    leaf = _lambda(_build(**{"lambda": {"error_reason": "Check the queue."}}),
+                   functions=ONE_FUNCTION,
+                   metrics={"running-collector-lambda": BETWEEN_CLEAN_RUNS})
+    assert _line(leaf, "running-collector-lambda").endswith("Check the queue.")
+
+
+def test_a_hold_of_nothing_is_the_old_line() -> None:
+    leaf = _lambda(_build(**{"lambda": {"error_hold": "0s"}}),
+                   functions=ONE_FUNCTION,
+                   metrics={"running-collector-lambda": BETWEEN_CLEAN_RUNS})
+    entry = _entry(leaf, "running-collector-lambda")
+    assert entry.code is StatusCode.OK
+    assert "no errors, last run 2m ago" in entry.text
+
+
+def test_the_hold_is_the_blocks_and_a_rule_may_set_its_own() -> None:
+    """The block holds for ten minutes, the rule for a day: the same buckets read
+    OK under the block and ERROR under the rule."""
+    check = _build(**{"lambda": {
+        "error_hold": "10m",
+        "rules": [{"name": "nightly", "prefixes": ["batch-"], "error_hold": "1d"}]}})
+    five_hours = _held((300, 1), (240, 0), (120, 0), (2, 0))
+    leaf = _lambda(check, functions={"eu-central-1": [["batch-load", "api-handler"]]},
+                   metrics={"batch-load": five_hours, "api-handler": five_hours})
+    assert _entry(leaf, "batch-load").code is StatusCode.ERROR
+    assert "1 error in the last 1d, 5h ago" in _line(leaf, "batch-load")
+    assert _entry(leaf, "api-handler").code is StatusCode.OK
+
+
+def test_a_rule_may_switch_the_hold_off_for_one_function() -> None:
+    check = _build(**{"lambda": {
+        "rules": [{"name": "allowed to fail", "names": ["flaky"],
+                   "error_hold": "0s"}]}})
+    leaf = _lambda(check, functions={"eu-central-1": [["flaky", "steady"]]},
+                   metrics={"flaky": BETWEEN_CLEAN_RUNS,
+                            "steady": BETWEEN_CLEAN_RUNS})
+    assert _entry(leaf, "flaky").code is StatusCode.OK
+    assert _entry(leaf, "steady").code is StatusCode.ERROR
+
+
+def test_a_hold_longer_than_the_gate_is_refused() -> None:
+    with pytest.raises(CheckError,
+                       match=r"error_hold.*15d.*longer than.*error_max_age.*14d"):
+        _build(**{"lambda": {"error_hold": "15d"}})
+
+
+def test_a_rules_hold_is_held_against_the_gate_it_inherits() -> None:
+    with pytest.raises(CheckError,
+                       match=r"nightly.*error_hold.*15d.*error_max_age.*14d"):
+        _build(**{"lambda": {"rules": [
+            {"name": "nightly", "prefixes": ["batch-"], "error_hold": "15d"}]}})
+
+
+def test_a_rules_hold_may_reach_the_gate_the_rule_raises() -> None:
+    check = _build(**{"lambda": {"rules": [
+        {"name": "nightly", "prefixes": ["batch-"], "error_hold": "14d",
+         "error_max_age": "15d"}]}})
+    assert check.lambda_.hold_for(check.lambda_.rule_for("batch-x")) == 14 * 86400
+
+
+def test_a_hold_nobody_wrote_is_the_gate_where_the_gate_is_shorter() -> None:
+    """A configuration whose gate is under an hour loaded before the hold existed,
+    and loads after it: the default holds for the gate, and an error past the gate
+    is not held, as it is not graded."""
+    check = _build(**{"lambda": {"error_max_age": "30m"}})
+    assert check.lambda_.hold_for(None) == 30 * 60
+    held = _lambda(check, functions=ONE_FUNCTION,
+                   metrics={"running-collector-lambda": BETWEEN_CLEAN_RUNS})
+    assert _entry(held, "running-collector-lambda").code is StatusCode.ERROR
+    assert "1 error in the last 30m, 23m ago" in _line(held,
+                                                       "running-collector-lambda")
+    past = _lambda(check, functions=ONE_FUNCTION,
+                   metrics={"running-collector-lambda":
+                            _held((40, 1), (20, 0), (2, 0))})
+    assert _entry(past, "running-collector-lambda").code is StatusCode.OK
+
+
+def test_a_rules_shorter_gate_takes_the_default_hold_up_to_it() -> None:
+    check = _build(**{"lambda": {"rules": [
+        {"name": "fresh", "names": ["fresh-fn"], "error_max_age": "30m"}]}})
+    assert check.lambda_.hold_for(check.lambda_.rule_for("fresh-fn")) == 30 * 60
+    assert check.lambda_.hold_for(check.lambda_.rule_for("other-fn")) == 3600
+
+
+def test_a_written_hold_is_held_against_a_rules_shorter_gate() -> None:
+    with pytest.raises(CheckError,
+                       match=r"fresh.*error_hold.*1h.*error_max_age.*30m"):
+        _build(**{"lambda": {"error_hold": "1h", "rules": [
+            {"name": "fresh", "names": ["fresh-fn"], "error_max_age": "30m"}]}})
+
+
+def test_the_card_says_the_hold_in_force_where_nobody_wrote_one() -> None:
+    summary = _build(**{"lambda": {"error_max_age": "30m"}}).config_summary()
+    assert "**lambda error held for:** 30m" in summary
+    assert "**lambda error graded within:** 30m" in summary
+
+
+def test_a_hold_below_nothing_is_refused() -> None:
+    with pytest.raises(CheckError, match=r"error_hold.*duration, or 0s for none"):
+        _build(**{"lambda": {"error_hold": "-1h"}})
+
+
+def test_a_hold_past_what_cloudwatch_keeps_at_one_minute_is_refused() -> None:
+    with pytest.raises(CheckError, match=r"error_hold.*16d.*15d"):
+        _build(**{"lambda": {"error_hold": "16d", "error_max_age": "30d"}})
+
+
+def test_the_card_says_the_hold_beside_the_gate() -> None:
+    summary = _build(**{"lambda": {
+        "error_hold": "30m",
+        "rules": [{"name": "nightly", "prefixes": ["batch-"],
+                   "error_hold": "1d"}]}}).config_summary()
+    assert "**lambda error held for:** 30m" in summary
+    assert "errors graded within 14d, held for 1d" in summary
+
+
 def test_a_function_with_no_data_point_anywhere_warns() -> None:
     """Not the same as zero errors: a scheduled job nobody has invoked in 455
     days is not a healthy one."""
@@ -2477,12 +2693,15 @@ def test_a_succeeded_pipeline_says_when_that_run_started() -> None:
     assert entry.text.endswith(": Succeeded, started 2h ago")
 
 
-def test_an_in_progress_pipeline_warns_as_the_original_did() -> None:
+def test_an_in_progress_pipeline_passes_and_says_what_runs_in_italics() -> None:
+    """ADR-0014 §1, §2: an execution in flight is a deployment under way, where the
+    original warned. With none finished, the line says what runs and nothing else,
+    and is marked as work in flight."""
     leaf = _pipelines(_build(), pipelines=ONE_PIPELINE,
                       executions={"running-deploy": [
                           _execution("InProgress", started=timedelta(minutes=12))]})
     entry = _entry(leaf, "running-deploy")
-    assert entry.code is StatusCode.WARN
+    assert (entry.code, entry.running) == (StatusCode.OK, True)
     assert entry.text.endswith(": InProgress, started 12m ago")
 
 
@@ -2803,20 +3022,32 @@ def test_the_pipeline_report_lists_the_full_names() -> None:
 
 
 def test_the_codepipeline_aspect_declares_its_own_display_text() -> None:
+    """And says what ADR-0014 changed: shipped prose is what rots when no test
+    fails."""
     labels = _build().subnode_labels[CODEPIPELINE]
+    about = " ".join(labels["about"].split())
     assert labels["title"] == "CodePipeline"
-    assert "never been executed" in labels["about"]
+    for present in ("never been executed", "While an execution is in flight",
+                    "`max_run_time`, 30 minutes unless the check says otherwise"):
+        assert present in about, present
+    assert "warns while it is in flight" not in about
 
 
-def test_codepipeline_grades_a_status_by_default_and_an_age_never() -> None:
+def test_codepipeline_grades_a_status_and_a_run_by_default_and_an_age_never(
+        ) -> None:
     """What a status *means* is a fact about CodePipeline, so the state map keeps
-    its defaults. How long a success stays evidence that the pipeline still works
-    depends on how often it is meant to run, so that has none."""
+    its defaults, `InProgress` passing among them (ADR-0014 §1). How long an
+    execution may be in flight has one too: the warning `InProgress` gave, moved to
+    thirty minutes (§3). How long a success stays evidence that the pipeline still
+    works depends on how often it is meant to run, so that has none."""
     settings = _build().codepipeline
     assert (settings.age.warn, settings.age.error) == (None, None)
+    assert (settings.run_time.warn, settings.run_time.error,
+            settings.run_time.reason) == (1800, None, "")
     assert settings.rules == ()
     assert settings.code_for("Succeeded") is StatusCode.OK
-    assert settings.code_for("InProgress") is StatusCode.WARN
+    assert settings.code_for("InProgress") is StatusCode.OK
+    assert settings.code_for("Stopping") is StatusCode.ERROR
     assert settings.code_for("Superseded") is StatusCode.ERROR
 
 
@@ -2825,6 +3056,10 @@ def test_codepipeline_grades_a_status_by_default_and_an_age_never() -> None:
     {"ignore_name_patterns": ["sandbox"]}, {"shorten": "strip"},
     {"max_age_seconds": "1d"}, {"max_age": "31d"},
     {"max_age_warn": "31d", "max_age_error": "7d"},
+    {"max_run_time": "30m"}, {"max_run_time_warn": "soon"},
+    {"max_run_time_warn": "1h", "max_run_time_error": "30m"},
+    {"max_run_time_reason": "Deployments are quick."},
+    {"rules": [{"name": "slow", "names": ["build"], "max_run_time": "2h"}]},
 ])
 def test_bad_codepipeline_settings_are_refused(block: dict[str, Any]) -> None:
     with pytest.raises(CheckError):
@@ -3108,14 +3343,20 @@ def test_a_queue_can_be_ignored_whole() -> None:
     assert leaf.reason[-1].text == "1 job queue in scope (eu-central-1)"
 
 
-def test_all_four_job_statuses_are_read() -> None:
-    """Three were the original's; RUNNABLE is the one it never asked for."""
+def test_every_job_status_batch_has_is_read() -> None:
+    """Three were the original's and RUNNABLE the one it never asked for; STARTING,
+    PENDING and SUBMITTED are the three a queue whose job names are complete was
+    still missing (ADR-0009 §2 and §3). Held against the statuses the SDK's
+    own stubs know, so a status Batch adds is a red test rather than a name that
+    leaves the tree."""
     check = _build()
     built = _stub(check, queues=ONE_QUEUE)
     run_check(check)
     assert built[1].job_calls == [
         ("nightly", "SUCCEEDED"), ("nightly", "FAILED"),
-        ("nightly", "RUNNING"), ("nightly", "RUNNABLE")]
+        ("nightly", "RUNNING"), ("nightly", "STARTING"),
+        ("nightly", "RUNNABLE"), ("nightly", "PENDING"), ("nightly", "SUBMITTED")]
+    assert sorted(BATCH_STATUSES) == sorted(get_args(JobStatusType))
 
 
 def test_batch_timestamps_are_read_as_milliseconds() -> None:
@@ -3205,7 +3446,8 @@ def test_the_config_card_spells_out_a_rule_that_only_strips() -> None:
 def test_the_batch_aspect_declares_its_own_display_text() -> None:
     labels = _build().subnode_labels[BATCH]
     assert labels["title"] == "AWS Batch"
-    assert "waiting for capacity" in labels["about"]
+    assert "**waiting**" in labels["about"]
+    assert "for a job they depend on" in labels["about"]
 
 
 def test_batch_defaults() -> None:
@@ -4248,12 +4490,14 @@ def test_a_pipeline_names_the_execution_it_last_ran() -> None:
                              eid="e-new")]
     readings = _readings(_one_account(), pipelines=ONE_PIPELINE,
                          executions={"running-deploy": executions})
-    (running,) = _kind(readings, "pipeline")
+    # Beside the newest, the one its line is written from (ADR-0014 §2).
+    running, before = _kind(readings, "pipeline")
     done = _readings(_one_account(), pipelines=ONE_PIPELINE, executions={
         "running-deploy": [_execution(started=timedelta(minutes=3),
                                       eid="e-new")]})
     (finished,) = _kind(done, "pipeline")
-    assert (running.identity, running.state) == ("e-new", "")
+    assert (running.identity, running.state, before.identity) == (
+        "e-new", "", "e-old")
     assert (finished.subject, finished.identity) == (running.subject, "e-new")
     assert datetime.fromisoformat(running.record["at"]) == NOW - timedelta(minutes=3)
 
@@ -4663,8 +4907,9 @@ def test_a_run_names_its_function_and_the_start_of_its_bucket() -> None:
 
 def test_the_function_s_reading_stays_what_it_is_and_names_no_subject() -> None:
     """§2: asked on every poll and written as it always was — the newest bucket's
-    errors and its time, and the log's status word — with no history of its own,
-    and its runs behind it."""
+    errors and its time, and the log's status word — and, since ADR-0012, the
+    newest error's time, what the hold holds and the clean runs since, from the
+    same answer; with no history of its own, and its runs behind it."""
     check = _one_account(series_keep=30)
     _keeping(check)
     readings = _readings(
@@ -4676,8 +4921,9 @@ def test_the_function_s_reading_stays_what_it_is_and_names_no_subject() -> None:
     assert dict(function.record) == {
         "aspect": LAMBDA, "kind": "function", "account": "live",
         "region": "eu-central-1", "name": "collector", "errors": 2,
-        "at": "2026-08-10T11:58:00Z", "log_status": "REPORT", "log_note": None,
-        "log_error": None}
+        "at": "2026-08-10T11:58:00Z",
+        "error": {"at": "2026-08-10T11:58:00Z", "held": 2, "clean_since": 0},
+        "log_status": "REPORT", "log_note": None, "log_error": None}
     assert (function.subject, function.identity, function.state) == ("", "", "")
     assert [(reading.record["kind"], reading.record["name"])
             for reading in readings if reading.record["aspect"] == LAMBDA] == [
@@ -4726,6 +4972,23 @@ def test_a_function_is_asked_in_the_smallest_window_that_reaches_its_kept_runs(
     three that reaches the oldest run of a series that is full."""
     check = _one_account(series_keep=2)
     _keeping(check, {COLLECTOR: [oldest, timedelta(minutes=30)]})
+    built = _stub(check, functions=ONE_COLLECTOR, metrics={"collector": {
+        "runs": [_point(timedelta(minutes=30))]}})
+    _, calls = _poll(check, built)
+    assert (calls[0]["asked"], calls[0]["span"], calls[0]["end"]) == (
+        ERRORS, window, NOW)
+
+
+@pytest.mark.parametrize(("hold", "window"), [
+    ("1h", HOUR), ("61m", DAY), ("1d", DAY), ("25h", FIFTEEN_DAYS), ("0s", HOUR),
+])
+def test_the_window_asked_reaches_the_hold_as_well(hold: str,
+                                                  window: timedelta) -> None:
+    """ADR-0012: a function whose kept runs the hour reaches is still asked the day
+    where its hold is longer than an hour — the newest error has to be in the
+    answer for the hold to stand on it."""
+    check = _one_account(series_keep=2, **{"lambda": {"error_hold": hold}})
+    _keeping(check, {COLLECTOR: [timedelta(minutes=40), timedelta(minutes=30)]})
     built = _stub(check, functions=ONE_COLLECTOR, metrics={"collector": {
         "runs": [_point(timedelta(minutes=30))]}})
     _, calls = _poll(check, built)
@@ -6130,6 +6393,13 @@ FOUR_EXECUTIONS = [
                eid="e-2"),
     _execution(started=timedelta(days=1), updated=timedelta(hours=23), eid="e-1")]
 
+#: The same page once its newest execution has succeeded: nothing is in flight, so
+#: the line is written from the newest, as it always was (ADR-0014 §2).
+FOUR_FINISHED = [
+    _execution(started=timedelta(minutes=5), updated=timedelta(minutes=1),
+               eid="e-4"),
+    *FOUR_EXECUTIONS[1:]]
+
 
 def _holding(check: AwsCheck,
              held: Mapping[str, Sequence[Any]] | None = None) -> list[str]:
@@ -6297,18 +6567,145 @@ def test_a_job_name_s_line_names_the_job_name_and_carries_no_run() -> None:
 
 
 def test_a_job_name_whose_runs_neither_ended_nor_run_nor_wait_says_so() -> None:
-    """§3, §4: the measuring half asks Batch for no other status, so only a reading
-    this process did not take names one. Its job name has its node all the same,
-    since the run is kept under the name: the line says what is true of the name
-    and grades nothing against it, and nothing is said of the run for the record."""
+    """§3, §4: the measuring half asks Batch for every status it has, so only a
+    status Batch adds, or a reading this process did not take, names one. Its job
+    name has its node all the same, since the run is kept under the name: the line
+    says what is true of the name and grades nothing against it, and nothing is said
+    of the run for the record."""
     batch = _batch(_one_account(), queues=ONE_QUEUE, jobs={
-        ("nightly", "RUNNING"): [[_job("etl", "STARTING", job_id="j-1",
+        ("nightly", "RUNNING"): [[_job("etl", "PAUSED", job_id="j-1",
                                        created=timedelta(minutes=2))]]})
     node = _node(batch, "etl")
     (line,) = node.reason_entries
     assert (line.subject, line.code, line.text.split("): ")[-1]) == (
         ETL, StatusCode.OK, "no run finished, running or waiting")
     assert node.for_record == ()
+
+
+# --- a job name being started keeps its node (ADR-0009 §3) -------------------------
+#
+# Batch has seven job statuses and the aspect asked for four, while a queue's node says
+# that its job names are complete in every run that lists it: a name whose only listed
+# job was starting, held or just submitted had no node for that poll. Now every status
+# is read, and the three are written in the words there were — starting as running,
+# submitted and held as waiting.
+
+
+def test_a_job_that_is_starting_counts_as_running() -> None:
+    """A job that is starting has no start yet, so it is counted and not timed: the
+    line counts it among those running, and the record says what it is."""
+    leaf = _batch(_one_account(), queues=ONE_QUEUE, jobs={
+        ("nightly", "STARTING"): [[_job("etl", "STARTING", job_id="j-1",
+                                        created=timedelta(minutes=3))]]})
+    node = _node(leaf, "etl")
+    (line,) = node.reason_entries
+    assert (line.code, line.text.split("): ")[-1]) == (StatusCode.OK, "1 running")
+    assert [(entry.code, entry.text) for entry in node.for_record] == [
+        (StatusCode.OK, "STARTING")]
+
+
+def test_one_running_and_one_starting_are_two_running_timed_by_the_one_that_ran(
+        ) -> None:
+    leaf = _batch(_one_account(), queues=ONE_QUEUE, jobs={
+        ("nightly", "RUNNING"): [[_job("etl", "RUNNING", job_id="j-1",
+                                       started=timedelta(minutes=7))]],
+        ("nightly", "STARTING"): [[_job("etl", "STARTING", job_id="j-2",
+                                        created=timedelta(minutes=1))]]})
+    (line,) = _node(leaf, "etl").reason_entries
+    assert line.text.split("): ")[-1] == "2 running (7m)"
+
+
+@pytest.mark.parametrize("status", ["PENDING", "SUBMITTED"])
+def test_a_job_submitted_or_held_counts_as_waiting_from_its_submission(
+        status: str) -> None:
+    """It waits as a RUNNABLE job waits, counted from its submission and held
+    against `max_wait_time` — but not *for capacity*, which is not what holds it."""
+    within = _batch(_one_account(), queues=ONE_QUEUE, jobs={
+        ("nightly", status): [[_job("etl", status, job_id="j-1",
+                                    created=timedelta(minutes=12))]]})
+    past = _batch(_one_account(), queues=ONE_QUEUE, jobs={
+        ("nightly", status): [[_job("etl", status, job_id="j-1",
+                                    created=timedelta(hours=2))]]})
+    assert [(line.code, line.text.split("): ")[-1])
+            for line in _node(within, "etl").reason_entries] == [
+        (StatusCode.OK, "1 waiting (12m)")]
+    assert [(line.code, line.text.split("): ")[-1])
+            for line in _node(past, "etl").reason_entries] == [
+        (StatusCode.WARN, "1 waiting (2h)")]
+    assert [(line.code, line.text) for line in _node(past, "etl").for_record] == [
+        (StatusCode.WARN, f"{status} for 2h, past max_wait_time")]
+
+
+def test_for_capacity_is_said_where_every_waiting_job_is_runnable() -> None:
+    """The words a RUNNABLE job had are the words it keeps; beside a job that is held
+    by another, the two are waiting, the oldest deciding for how long."""
+    runnable = {("nightly", "RUNNABLE"): [[_job("etl", "RUNNABLE", job_id="j-1",
+                                                 created=timedelta(minutes=4))]]}
+    alone = _batch(_one_account(), queues=ONE_QUEUE, jobs=runnable)
+    beside = _batch(_one_account(), queues=ONE_QUEUE, jobs={
+        **runnable,
+        ("nightly", "PENDING"): [[_job("etl", "PENDING", job_id="j-2",
+                                       created=timedelta(minutes=9))]]})
+    assert _node(alone, "etl").reason_entries[0].text.split("): ")[-1] == (
+        "1 waiting for capacity (4m)")
+    assert _node(beside, "etl").reason_entries[0].text.split("): ")[-1] == (
+        "2 waiting (9m)")
+
+
+def test_a_job_name_keeps_its_node_in_every_status_its_job_passes_through() -> None:
+    """The case the update is for: a name whose one listed job is walked through
+    every status Batch gives it, a poll each, stands beneath its queue at every one
+    of them while the queue says that its names are complete — so the library
+    neither removes the node nor suspends a pin on it — and says at each what the
+    job is doing."""
+    steps = [("SUBMITTED", {"created": timedelta(seconds=20)}, "1 waiting (< 1m)"),
+             ("PENDING", {"created": timedelta(minutes=1)}, "1 waiting (1m)"),
+             ("RUNNABLE", {"created": timedelta(minutes=2)},
+              "1 waiting for capacity (2m)"),
+             ("STARTING", {"created": timedelta(minutes=3)}, "1 running"),
+             ("RUNNING", {"created": timedelta(minutes=4),
+                          "started": timedelta(minutes=1)}, "1 running (1m)"),
+             ("SUCCEEDED", {"created": timedelta(minutes=9),
+                            "started": timedelta(minutes=6),
+                            "stopped": timedelta(minutes=1)},
+              "SUCCEEDED 1m ago, ran 5m")]
+    seen = []
+    for status, times, _ in steps:
+        queue = _child(_batch(_one_account(), queues=ONE_QUEUE, jobs={
+            ("nightly", status): [[_job("weekly", status, job_id="j-1",
+                                        **times)]]}), "nightly")
+        (line,) = _node(queue, "weekly").reason_entries
+        seen.append((status, queue.children_complete,
+                     [node.name for node in queue.children],
+                     line.code, line.text.split("): ")[-1], line.running))
+    assert seen == [(status, True, ["weekly"], StatusCode.OK, said,
+                     status != "SUCCEEDED")
+                    for status, _, said in steps]
+
+
+def test_a_job_name_s_line_is_marked_as_work_in_flight_while_a_job_runs_or_waits(
+        ) -> None:
+    """Little-sister marks a line whose subject has work in flight — an italic,
+    display only (its ADR-0042 decision 6) — and a job of the name in flight is
+    one that waits or runs. The code stays what the newest finished run made it,
+    so a name whose last run failed and that runs again stays red, visibly
+    rebuilding; one whose runs have all finished is not marked."""
+    failed = {("nightly", "FAILED"): [[_job("etl", "FAILED", job_id="j-1",
+                                             created=timedelta(hours=2),
+                                             started=timedelta(hours=2),
+                                             stopped=timedelta(hours=1))]]}
+    def line(jobs: dict[tuple[str, str], Any]) -> tuple[StatusCode | None, bool]:
+        (entry,) = _node(_batch(_one_account(), queues=ONE_QUEUE, jobs=jobs),
+                         "etl").reason_entries
+        return entry.code, entry.running
+
+    assert line(failed) == (StatusCode.ERROR, False)
+    assert line({**failed, ("nightly", "RUNNING"): [[_job(
+        "etl", "RUNNING", job_id="j-2", started=timedelta(minutes=3))]]}) == (
+        StatusCode.ERROR, True)
+    assert line({**failed, ("nightly", "PENDING"): [[_job(
+        "etl", "PENDING", job_id="j-2", created=timedelta(minutes=3))]]}) == (
+        StatusCode.ERROR, True)
 
 
 def test_a_job_name_s_line_prints_neither_its_region_nor_its_queue() -> None:
@@ -6381,6 +6778,15 @@ def test_every_run_a_poll_read_is_said_for_the_record_with_a_verdict_of_its_own(
     # No instant to count from: nothing to hold against the bound.
     ("RUNNING", {}, StatusCode.OK, "RUNNING"),
     ("RUNNABLE", {}, StatusCode.OK, "RUNNABLE"),
+    # Starting is running with no start yet, however long ago it was submitted.
+    ("STARTING", {"created": timedelta(hours=3)}, StatusCode.OK, "STARTING"),
+    # Submitted and held by another job are waiting, from submission, as RUNNABLE is.
+    ("PENDING", {"created": timedelta(minutes=30)}, StatusCode.OK,
+     "PENDING for 30m"),
+    ("PENDING", {"created": timedelta(minutes=30, seconds=1)}, StatusCode.WARN,
+     "PENDING for 30m, past max_wait_time"),
+    ("SUBMITTED", {"created": timedelta(seconds=10)}, StatusCode.OK,
+     "SUBMITTED for < 1m"),
     # A finished run says the spans its instants give, and no more.
     ("SUCCEEDED", {"started": timedelta(minutes=9), "stopped": timedelta(minutes=4)},
      StatusCode.OK, "SUCCEEDED, ran 5m"),
@@ -6470,7 +6876,7 @@ def test_runs_typed_by_hand_are_said_for_the_record_as_the_ones_a_poll_read(
     """The grading reads the records and nothing else (little-sister ADR-0086
     decision 6): a run this process never read stands on its job name's node like
     one it did, kept before a record carried its two spans — and one in a status
-    this aspect does not read is said nothing of."""
+    this aspect does not know is said nothing of."""
     record = {"aspect": BATCH, "account": "live", "region": "eu-central-1"}
 
     def run(job_id: str, status: str) -> Measurement:
@@ -6491,7 +6897,7 @@ def test_runs_typed_by_hand_are_said_for_the_record_as_the_ones_a_poll_read(
         Measurement({**record, "kind": "queue", "name": "nightly",
                      "state": "ENABLED", "status": "VALID", "reason": None,
                      "capped": False}),
-        run("j-1", "FAILED"), run("j-2", "PENDING")]
+        run("j-1", "FAILED"), run("j-2", "PAUSED")]
     node = _node(_child(run_check(_one_account(), measurements=typed), BATCH),
                  "etl")
     (said,) = node.for_record
@@ -6692,46 +7098,58 @@ def test_an_execution_its_history_holds_finished_is_not_read_again() -> None:
     record that keeps no status ends anything. A status is the word it is whatever
     its case and its padding."""
     taken, _ = _executions_read(
-        _one_account(series_keep=30), FOUR_EXECUTIONS,
-        [("e-1", "Paused"), ("e-2", "Superseded"), ("e-3", "InProgress")])
+        _one_account(series_keep=30), FOUR_FINISHED,
+        [("e-1", "Paused"), ("e-2", "Superseded"), ("e-3", "InProgress"),
+         ("e-4", "Succeeded")])
     assert [one.identity for one in _kind(taken, "pipeline")] == [
         "e-4", "e-3", "e-1"]
     unsaid, _ = _executions_read(
-        _one_account(series_keep=30), FOUR_EXECUTIONS,
+        _one_account(series_keep=30), FOUR_FINISHED,
         [("e-1", None), ("e-2", "Superseded"), ("e-3", "Failed"),
-         ("e-4", "InProgress")])
+         ("e-4", "Succeeded")])
     assert [one.identity for one in _kind(unsaid, "pipeline")] == ["e-4", "e-1"]
     settled, _ = _executions_read(
-        _one_account(series_keep=30), FOUR_EXECUTIONS,
+        _one_account(series_keep=30), FOUR_FINISHED,
         [("e-1", "Succeeded"), ("e-2", "superseded"), ("e-3", " FAILED "),
-         ("e-4", "InProgress")])
+         ("e-4", "Succeeded")])
     assert [one.identity for one in _kind(settled, "pipeline")] == ["e-4"]
 
 
-def test_an_execution_that_was_the_newest_is_read_once_more_behind_a_newer_one(
+def test_the_execution_the_line_was_written_from_is_read_once_more_once_it_is_not(
         ) -> None:
-    """§5: what stood for it was its pipeline's line, so the poll that first finds a
-    newer execution reads it behind that one, and it is said for the record as any
-    execution behind the newest is. The next poll leaves it alone."""
+    """§5, ADR-0014 §4: while the newest execution is in flight, the line is written
+    from the one that failed before it, which is read at every poll as the line's.
+    Once the newest has finished, the line is its own: the one it was written from
+    is read once more behind it and said for the record by its own status, and the
+    poll after that leaves it alone."""
+    held = [("e-1", "Succeeded"), ("e-2", "Superseded"), ("e-3", "Failed")]
     check = _one_account(series_keep=30)
-    taken, _ = _executions_read(check, FOUR_EXECUTIONS, [
-        ("e-1", "Succeeded"), ("e-2", "Superseded"), ("e-3", "Failed")])
+    taken, _ = _executions_read(check, FOUR_EXECUTIONS, held)
     assert [one.identity for one in _kind(taken, "pipeline")] == ["e-4", "e-3"]
-    assert [(line.code, line.text)
-            for line in _deploy(check, taken).for_record] == [
+    node = _deploy(check, taken)
+    assert [line.data["execution"] for line in node.reason_entries] == ["e-3"]
+    assert [(line.code, line.text) for line in node.for_record] == [
+        (StatusCode.OK, "InProgress")]
+    check = _one_account(series_keep=30)
+    moved, _ = _executions_read(check, FOUR_FINISHED,
+                                [*held, ("e-4", "InProgress")])
+    assert [one.identity for one in _kind(moved, "pipeline")] == ["e-4", "e-3"]
+    node = _deploy(check, moved)
+    assert [line.data["execution"] for line in node.reason_entries] == ["e-4"]
+    assert [(line.code, line.text) for line in node.for_record] == [
         (StatusCode.ERROR, "Failed")]
-    after, _ = _executions_read(_one_account(series_keep=30), FOUR_EXECUTIONS, [
-        ("e-1", "Succeeded"), ("e-2", "Superseded"), ("e-3", "Failed"),
-        ("e-4", "InProgress")])
+    after, _ = _executions_read(_one_account(series_keep=30), FOUR_FINISHED,
+                                [*held, ("e-4", "Succeeded")])
     assert [one.identity for one in _kind(after, "pipeline")] == ["e-4"]
 
 
 def test_two_kept_executions_of_one_instant_were_both_the_newest() -> None:
-    """§5: which of two that started at one instant carried the line, when they
-    started does not say. While one of them is the page's newest, neither is read
-    behind it; once a newer execution has started, both are read once more, and the
-    poll after that leaves both alone. An older one the history holds finished is
-    left alone throughout."""
+    """§5, ADR-0014 §4: which of two that started at one instant the line was written
+    from, when they started does not say. While the line is written from one of them
+    — as it still is while a newer execution is in flight — neither is read for that;
+    once a newer one has finished, both are read once more, and the poll after that
+    leaves both alone. An older one the history holds finished is left alone
+    throughout."""
     hour = timedelta(hours=1)
     first = _execution("Failed", started=hour, eid="e-a")
     second = _execution(started=hour, eid="e-b")
@@ -6745,11 +7163,16 @@ def test_two_kept_executions_of_one_instant_were_both_the_newest() -> None:
     newer = _execution("InProgress", started=timedelta(minutes=5), eid="e-c")
     taken, _ = _executions_read(_one_account(series_keep=30),
                                 [newer, first, second, before], held)
-    assert [one.identity for one in _kind(taken, "pipeline")] == [
+    assert [one.identity for one in _kind(taken, "pipeline")] == ["e-c", "e-a"]
+    done = _execution(started=timedelta(minutes=5), eid="e-c")
+    moved, _ = _executions_read(
+        _one_account(series_keep=30), [done, first, second, before],
+        [*held, ("e-c", "InProgress", timedelta(minutes=5))])
+    assert [one.identity for one in _kind(moved, "pipeline")] == [
         "e-c", "e-a", "e-b"]
     after, _ = _executions_read(
-        _one_account(series_keep=30), [newer, first, second, before],
-        [*held, ("e-c", "InProgress", timedelta(minutes=5))])
+        _one_account(series_keep=30), [done, first, second, before],
+        [*held, ("e-c", "Succeeded", timedelta(minutes=5))])
     assert [one.identity for one in _kind(after, "pipeline")] == ["e-c"]
 
 
@@ -6771,12 +7194,12 @@ def test_a_new_execution_of_the_kept_newest_s_own_instant_overtakes_it() -> None
 
 def test_the_history_s_newest_is_the_one_that_started_last_wherever_it_stands(
         ) -> None:
-    """§5: found by when each kept execution started and not by its place — and a
-    record of the pipeline from before it ever ran, which names no execution and no
-    start, is none of them."""
+    """§5, ADR-0014 §4: found by when each kept execution started and not by its
+    place — and a record of the pipeline from before it ever ran, which names no
+    execution and no start, is none of them."""
     never = SeriesRecord({"name": "running-deploy", "status": None, "at": None},
                          NOW, state=NEVER_RUN)
-    taken, _ = _executions_read(_one_account(series_keep=30), FOUR_EXECUTIONS, [
+    taken, _ = _executions_read(_one_account(series_keep=30), FOUR_FINISHED, [
         ("e-3", "Failed", timedelta(hours=1)), never,
         ("e-1", "Succeeded", timedelta(days=1)),
         ("e-2", "Superseded", timedelta(hours=2))])
@@ -6787,7 +7210,7 @@ def test_a_newest_execution_without_an_id_is_the_history_s_newest_all_the_same(
         ) -> None:
     """§5: kept, it is a record that names no execution, and the one before it is
     read once more and then left alone — not on every poll."""
-    nameless = _execution("InProgress", started=timedelta(minutes=5))
+    nameless = _execution(started=timedelta(minutes=5))
     known = _execution(started=timedelta(hours=1), eid="e-1")
     held = [("e-1", "Succeeded", timedelta(hours=1))]
     taken, _ = _executions_read(_one_account(series_keep=30), [nameless, known],
@@ -6795,15 +7218,17 @@ def test_a_newest_execution_without_an_id_is_the_history_s_newest_all_the_same(
     assert [one.identity for one in _kind(taken, "pipeline")] == ["", "e-1"]
     after, _ = _executions_read(
         _one_account(series_keep=30), [nameless, known],
-        [*held, ("", "InProgress", timedelta(minutes=5))])
+        [*held, ("", "Succeeded", timedelta(minutes=5))])
     assert [one.identity for one in _kind(after, "pipeline")] == [""]
 
 
-def test_a_success_grown_stale_is_no_warning_once_a_newer_execution_started(
+def test_a_success_grown_stale_warns_until_a_newer_execution_has_finished(
         ) -> None:
-    """§6: how old a success may get is asked of the newest execution alone. While
-    it is the newest, a success past `max_age` warns on its pipeline's line; read
-    behind a newer one, it passed."""
+    """§6, ADR-0014 §2: how old a success may get is asked of the execution the line
+    is written from alone. A success past `max_age` warns on its pipeline's line,
+    and goes on warning while a newer execution is in flight; once that one has
+    finished, the success is read behind it and said for the record as what it
+    was."""
     block = {"max_age_warn": "31d", "max_age_reason": "Nobody released in months."}
     stale = _execution(started=timedelta(days=40), updated=timedelta(days=40),
                        eid="e-1")
@@ -6814,6 +7239,17 @@ def test_a_success_grown_stale_is_no_warning_once_a_newer_execution_started(
     taken, _ = _executions_read(
         check, [_execution("InProgress", started=timedelta(minutes=5), eid="e-2"),
                 stale], [("e-1", "Succeeded")])
+    (line,) = _deploy(check, taken).reason_entries
+    assert (line.code, line.running, line.data["execution"]) == (
+        StatusCode.WARN, True, "e-1")
+    assert line.text.endswith(
+        ": Succeeded, but that run started 40d ago — Nobody released in months. · "
+        "InProgress, started 5m ago")
+    check = _one_account(series_keep=30, codepipeline=block)
+    taken, _ = _executions_read(
+        check, [_execution(started=timedelta(minutes=5),
+                           updated=timedelta(minutes=1), eid="e-2"), stale],
+        [("e-1", "Succeeded"), ("e-2", "InProgress")])
     assert [(line.data["execution"], line.code, line.text)
             for line in _deploy(check, taken).for_record] == [
         ("e-1", StatusCode.OK, "Succeeded")]
@@ -6870,19 +7306,29 @@ def test_a_poll_reads_no_more_executions_than_the_series_keeps(
         keep: int, read: list[str]) -> None:
     """§5: the newest of the page, as many as the series keeps — an older one would
     leave the series the moment it was kept."""
-    taken, _ = _executions_read(_one_account(series_keep=keep), FOUR_EXECUTIONS)
+    taken, _ = _executions_read(_one_account(series_keep=keep), FOUR_FINISHED)
     assert [one.identity for one in _kind(taken, "pipeline")] == read
 
 
-def test_a_check_that_keeps_no_series_reads_the_newest_execution_alone() -> None:
-    """§5: nothing would keep the rest, so no history is asked for — and the newest
-    is found wherever in the page it stands."""
-    taken, asked = _executions_read(_one_account(),
-                                    list(reversed(FOUR_EXECUTIONS)))
+def test_a_check_that_keeps_no_series_reads_what_its_line_is_written_from_alone(
+        ) -> None:
+    """§5, ADR-0014 §2: nothing would keep the rest, so no history is asked for. The
+    newest is read, found wherever in the page it stands — and while it is in
+    flight, the newest that is not, which the line is written from. A check that
+    keeps one record asks its history only where an execution is in flight, which
+    may be on a retry (ADR-0014 §5)."""
+    taken, asked = _executions_read(_one_account(), list(reversed(FOUR_FINISHED)))
     assert ([one.identity for one in _kind(taken, "pipeline")], asked) == (
         ["e-4"], [])
+    running, asked = _executions_read(_one_account(),
+                                      list(reversed(FOUR_EXECUTIONS)))
+    assert ([one.identity for one in _kind(running, "pipeline")], asked) == (
+        ["e-4", "e-3"], [])
     single, asked = _executions_read(_one_account(series_keep=1), FOUR_EXECUTIONS)
     assert ([one.identity for one in _kind(single, "pipeline")], asked) == (
+        ["e-4", "e-3"], [DEPLOY])
+    still, asked = _executions_read(_one_account(series_keep=1), FOUR_FINISHED)
+    assert ([one.identity for one in _kind(still, "pipeline")], asked) == (
         ["e-4"], [])
 
 
@@ -6890,7 +7336,7 @@ def test_an_older_execution_without_an_id_or_a_status_is_not_read() -> None:
     """§5: without an id it would be a new record at every poll, without a status
     it says nothing, and without a start it has no place — and none of them takes
     the place of one the series would keep."""
-    page = [_execution("InProgress", started=timedelta(minutes=5), eid="e-4"),
+    page = [_execution(started=timedelta(minutes=5), eid="e-4"),
             _execution("Failed", started=timedelta(hours=1)),
             _execution("", started=timedelta(hours=2), eid="e-2"),
             _execution("Failed", started=None, eid="e-0"),
@@ -6898,6 +7344,17 @@ def test_an_older_execution_without_an_id_or_a_status_is_not_read() -> None:
     for keep in (30, 2):
         taken, _ = _executions_read(_one_account(series_keep=keep), page)
         assert [one.identity for one in _kind(taken, "pipeline")] == ["e-4", "e-1"]
+
+
+def test_the_execution_the_line_is_written_from_is_read_without_an_id_too(
+        ) -> None:
+    """ADR-0014 §2: the line cannot be written without it, so it is read as the
+    newest is, an id or none."""
+    taken, _ = _executions_read(_one_account(), [
+        _execution("InProgress", started=timedelta(minutes=5), eid="e-2"),
+        _execution("Failed", started=timedelta(hours=1)),
+        _execution(started=timedelta(days=1), eid="e-1")])
+    assert [one.identity for one in _kind(taken, "pipeline")] == ["e-2", ""]
 
 
 def test_reading_more_executions_asks_codepipeline_for_no_more() -> None:
@@ -6916,8 +7373,10 @@ def test_every_execution_read_beside_the_newest_is_said_for_the_record_by_its_st
         ) -> None:
     """§6: the verdict its status has in `state_map`, as the line's has, in a
     sentence that is the status — on a line no node shows, which carries the
-    execution's record and names its pipeline."""
-    check = _one_account(series_keep=30)
+    execution's record and names its pipeline. One in flight within `max_run_time`
+    passes (ADR-0014 §1)."""
+    check = _one_account(series_keep=30,
+                         codepipeline={"max_run_time_warn": "3h"})
     taken, _ = _executions_read(check, [
         _execution(started=timedelta(minutes=5), eid="e-5"),
         _execution("Failed", started=timedelta(hours=1), eid="e-4"),
@@ -6931,7 +7390,7 @@ def test_every_execution_read_beside_the_newest_is_said_for_the_record_by_its_st
     assert [(line.code, line.text, line.subject, line.data)
             for line in node.for_record] == [
         (StatusCode.ERROR, "Failed", DEPLOY, dict(older[0].record)),
-        (StatusCode.WARN, "InProgress", DEPLOY, dict(older[1].record)),
+        (StatusCode.OK, "InProgress", DEPLOY, dict(older[1].record)),
         (StatusCode.WARN, "Reticulating", DEPLOY, dict(older[2].record)),
         (StatusCode.OK, "Succeeded", DEPLOY, dict(older[3].record))]
 
@@ -6940,7 +7399,7 @@ def test_a_state_map_grades_an_older_execution_as_it_grades_the_newest() -> None
     """§6: a deployment that says a failure is fine says it of every execution."""
     check = _one_account(series_keep=30,
                          codepipeline={"state_map": {"Failed": "OK"}})
-    taken, _ = _executions_read(check, FOUR_EXECUTIONS)
+    taken, _ = _executions_read(check, FOUR_FINISHED)
     assert [(line.text, line.code) for line in _deploy(check, taken).for_record] == [
         ("Failed", StatusCode.OK), ("Succeeded", StatusCode.OK)]
 
@@ -6952,7 +7411,7 @@ def test_nothing_is_said_for_the_record_of_an_execution_that_was_superseded(
     """§6: it neither failed nor deployed, so it gets no line, whatever the map
     says of its status — and its reading is read and kept all the same."""
     check = _one_account(series_keep=30, codepipeline={"state_map": state_map})
-    taken, _ = _executions_read(check, FOUR_EXECUTIONS)
+    taken, _ = _executions_read(check, FOUR_FINISHED)
     assert "e-2" in [one.identity for one in _kind(taken, "pipeline")]
     assert [line.data["execution"] for line in _deploy(check, taken).for_record] == [
         "e-3", "e-1"]
@@ -6970,19 +7429,24 @@ def test_a_superseded_execution_is_the_word_whatever_its_case_and_its_padding(
     assert _deploy(check, taken).for_record == ()
 
 
-def test_the_newest_execution_stands_on_the_line_whatever_order_its_readings_come_in(
+def test_the_line_s_execution_stands_on_it_whatever_order_its_readings_come_in(
         ) -> None:
-    """§5: the grading finds it by when it started, so readings handed over in
-    another order grade to the same line and the same lines for the record."""
-    check = _one_account(series_keep=30)
-    taken, _ = _executions_read(check, FOUR_EXECUTIONS)
+    """§5, ADR-0014 §2: the grading finds it by when each started and what each is
+    in, so readings handed over in another order grade to the same line and the same
+    lines for the record — the newest's, and while the newest is in flight, the
+    newest finished one's."""
+    for page, line_from, beside in ((FOUR_FINISHED, "e-4", ["e-1", "e-3"]),
+                                    (FOUR_EXECUTIONS, "e-3", ["e-1", "e-4"])):
+        check = _one_account(series_keep=30)
+        taken, _ = _executions_read(check, page)
 
-    def said(readings: Sequence[Measurement]) -> tuple[list[str], list[str]]:
-        node = _deploy(check, readings)
-        return ([line.data["execution"] for line in node.reason_entries],
-                sorted(line.data["execution"] for line in node.for_record))
+        def said(readings: Sequence[Measurement],
+                 check: AwsCheck = check) -> tuple[list[str], list[str]]:
+            node = _deploy(check, readings)
+            return ([line.data["execution"] for line in node.reason_entries],
+                    sorted(line.data["execution"] for line in node.for_record))
 
-    assert said(taken) == said(tuple(reversed(taken))) == (["e-4"], ["e-1", "e-3"])
+        assert said(taken) == said(tuple(reversed(taken))) == ([line_from], beside)
 
 
 def test_a_reading_that_names_no_execution_stands_behind_one_that_does() -> None:
@@ -7024,3 +7488,998 @@ def test_a_pipeline_is_counted_once_however_many_of_its_executions_a_poll_read(
     assert leaf.report.splitlines() == [
         "- [running-deploy](https://eu-central-1.console.aws.amazon.com/codesuite"
         "/codepipeline/pipelines/running-deploy/executions?region=eu-central-1)"]
+
+
+# --- CodePipeline's InProgress is OK, and work in flight is marked (ADR-0014) -------
+#
+# `InProgress` warned from an execution's first second, so every deployment was a
+# warning. It passes now; a pipeline's line keeps what the newest finished execution
+# did while a newer one is in flight, says what is in flight and is marked running;
+# and an execution in flight for longer than `max_run_time` warns.
+
+
+def test_a_failed_pipeline_stays_red_while_a_new_execution_runs() -> None:
+    """§2: the line keeps the verdict of the newest finished execution, carries it,
+    and says the one in flight beside it, marked running — red, visibly rebuilding,
+    where the newest execution's own verdict would have turned it green."""
+    check = _one_account()
+    taken = _readings(check, pipelines=ONE_PIPELINE, executions={"running-deploy": [
+        _execution("InProgress", started=timedelta(minutes=2), eid="e-2"),
+        _execution("Failed", started=timedelta(hours=3), eid="e-1")]})
+    node = _deploy(check, taken)
+    (line,) = node.reason_entries
+    (failed,) = [one for one in _kind(taken, "pipeline") if one.identity == "e-1"]
+    assert (line.code, line.running, line.data) == (
+        StatusCode.ERROR, True, dict(failed.record))
+    assert line.text.endswith(
+        ": Failed, started 3h ago · InProgress, started 2m ago")
+    assert node.stored_code is StatusCode.ERROR
+
+
+def test_a_healthy_pipeline_stays_green_while_it_deploys() -> None:
+    """§1, §2: an execution in flight is a deployment under way, so a pipeline whose
+    last execution succeeded stays as green as it was, in italics — and one with
+    nothing in flight is not marked."""
+    deploying = _pipelines(_one_account(), pipelines=ONE_PIPELINE,
+                           executions={"running-deploy": [
+                               _execution("InProgress",
+                                          started=timedelta(minutes=10)),
+                               _execution(started=timedelta(days=1))]})
+    entry = _entry(deploying, "running-deploy")
+    assert (entry.code, entry.running) == (StatusCode.OK, True)
+    assert entry.text.endswith(
+        ": Succeeded, started 1d ago · InProgress, started 10m ago")
+    idle = _pipelines(_one_account(), pipelines=ONE_PIPELINE,
+                      executions={"running-deploy": [_execution()]})
+    assert _entry(idle, "running-deploy").running is False
+
+
+def test_the_line_looks_past_a_superseded_execution_to_the_newest_that_finished(
+        ) -> None:
+    """§2: an execution a newer one overtook is no verdict (ADR-0009 §6). The one the
+    line is written from comes out of the page the aspect already asks for — and the
+    superseded one is not read where no series would keep it."""
+    check = _one_account()
+    taken = _readings(check, pipelines=ONE_PIPELINE, executions={"running-deploy": [
+        _execution("InProgress", started=timedelta(minutes=2), eid="e-3"),
+        _execution("Superseded", started=timedelta(hours=1), eid="e-2"),
+        _execution(started=timedelta(days=1), eid="e-1")]})
+    assert [one.identity for one in _kind(taken, "pipeline")] == ["e-3", "e-1"]
+    (line,) = _deploy(check, taken).reason_entries
+    assert (line.code, line.data["execution"]) == (StatusCode.OK, "e-1")
+    assert line.text.endswith(
+        ": Succeeded, started 1d ago · InProgress, started 2m ago")
+
+
+def test_what_is_in_flight_makes_the_line_worse_and_never_better() -> None:
+    """§2: its status counts as `state_map` says — `Stopping` is an error, and a
+    deployment that maps `InProgress` to `WARN` has its yellow back — and a failure
+    stays a failure whatever runs."""
+    def line(statuses: tuple[str, str], **block: Any) -> Any:
+        newest, before = statuses
+        leaf = _pipelines(_one_account(codepipeline=block), pipelines=ONE_PIPELINE,
+                          executions={"running-deploy": [
+                              _execution(newest, started=timedelta(minutes=3)),
+                              _execution(before, started=timedelta(days=1))]})
+        return _entry(leaf, "running-deploy")
+
+    stopping = line(("Stopping", "Succeeded"))
+    assert (stopping.code, stopping.running) == (StatusCode.ERROR, True)
+    assert stopping.text.endswith(
+        ": Succeeded, started 1d ago · Stopping, started 3m ago")
+    warned = {"state_map": {"InProgress": "WARN"}}
+    assert line(("InProgress", "Succeeded"), **warned).code is StatusCode.WARN
+    assert line(("InProgress", "Failed"), **warned).code is StatusCode.ERROR
+
+
+@pytest.mark.parametrize(("minutes", "code"), [
+    (29, StatusCode.OK), (30, StatusCode.OK), (31, StatusCode.WARN)])
+def test_an_execution_in_flight_warns_once_it_has_run_longer_than_max_run_time(
+        minutes: int, code: StatusCode) -> None:
+    """§3: thirty minutes by default and strictly longer, as every level of this type
+    is compared (ADR-0003 §1) — on the line, which says so, and for the record of the
+    execution in flight."""
+    check = _one_account(series_keep=30)
+    taken, _ = _executions_read(check, [
+        _execution("InProgress", started=timedelta(minutes=minutes), eid="e-2"),
+        _execution(started=timedelta(days=1), updated=timedelta(days=1),
+                   eid="e-1")])
+    node = _deploy(check, taken)
+    (line,) = node.reason_entries
+    past = ", past max_run_time" if code is StatusCode.WARN else ""
+    assert (line.code, line.running) == (code, True)
+    assert line.text.endswith(
+        f": Succeeded, started 1d ago · InProgress, started {minutes}m ago{past}")
+    assert [(entry.code, entry.text) for entry in node.for_record] == [
+        (code, f"InProgress, started {minutes}m ago{past}" if past
+         else "InProgress")]
+
+
+def test_max_run_time_is_a_pair_with_a_sentence_and_a_rule_may_carry_its_own(
+        ) -> None:
+    """§3: written as `max_age` is — both levels, the sentence the line carries once
+    it fires or else the rule's name, a rule's own levels, and `null` for a pipeline
+    that waits at an approval for as long as it takes."""
+    block = {"max_run_time_warn": "1h", "max_run_time_error": "4h",
+             "max_run_time_reason": "A deployment takes ten minutes.",
+             "rules": [{"name": "approved releases", "prefixes": ["release-"],
+                        "max_run_time": None},
+                       {"name": "slow builds", "prefixes": ["build-"],
+                        "max_run_time_warn": "2h"}]}
+    leaf = _pipelines(
+        _one_account(codepipeline=block),
+        pipelines={"eu-central-1": [["deploy", "release-app", "build-app"]]},
+        executions={name: [_execution("InProgress", started=started)]
+                    for name, started in (("deploy", timedelta(hours=5)),
+                                          ("release-app", timedelta(days=3)),
+                                          ("build-app", timedelta(hours=3)))})
+    deploy = _entry(leaf, "deploy")
+    assert deploy.code is StatusCode.ERROR
+    assert deploy.text.endswith(
+        ": InProgress, started 5h ago, past max_run_time — "
+        "A deployment takes ten minutes.")
+    assert _entry(leaf, "release-app").code is StatusCode.OK
+    build = _entry(leaf, "build-app")
+    assert build.code is StatusCode.WARN
+    assert build.text.endswith(
+        ": InProgress, started 3h ago, past max_run_time — slow builds")
+    # For the record as well: an execution in flight behind the line's is held to
+    # its pipeline's rule, and not to the block's level.
+    check = _one_account(series_keep=30, codepipeline=block)
+    taken = _readings(
+        check, pipelines={"eu-central-1": [["build-app"]]},
+        executions={"build-app": [
+            _execution("InProgress", started=timedelta(minutes=90), eid="e-2"),
+            _execution(started=timedelta(days=1), eid="e-1")]})
+    node = _node(_aspect(check, run_check(check, measurements=taken),
+                         CODEPIPELINE), "build-app")
+    assert [(entry.code, entry.text) for entry in node.for_record] == [
+        (StatusCode.OK, "InProgress")]
+
+
+def test_a_block_that_writes_one_level_of_max_run_time_keeps_none_of_the_default(
+        ) -> None:
+    """§3: the pair as it is written, whole, as a rule's is over its block's
+    (ADR-0003 §4) — an error level alone warns at nothing — and `null` grades
+    nothing."""
+    settings = _build(codepipeline={"max_run_time_error": "2h"}).codepipeline
+    assert (settings.run_time.warn, settings.run_time.error) == (None, 7200)
+    assert _build(codepipeline={"max_run_time": None}
+                  ).codepipeline.run_time.grades is False
+
+
+def test_several_executions_in_flight_are_counted_and_the_oldest_is_held_to_the_bound(
+        ) -> None:
+    """§2, §3: how many are in flight in one status, and when the oldest of them
+    started — the one `max_run_time` reaches first."""
+    leaf = _pipelines(_one_account(), pipelines=ONE_PIPELINE,
+                      executions={"running-deploy": [
+                          _execution("InProgress", started=timedelta(minutes=2)),
+                          _execution("InProgress", started=timedelta(minutes=40)),
+                          _execution(started=timedelta(days=1))]})
+    entry = _entry(leaf, "running-deploy")
+    assert entry.code is StatusCode.WARN
+    assert entry.text.endswith(
+        ": Succeeded, started 1d ago · 2 InProgress, the oldest started 40m ago, "
+        "past max_run_time")
+
+
+def test_an_execution_in_flight_behind_a_finished_one_is_said_on_the_line(
+        ) -> None:
+    """§2: a newer execution that failed fast leaves an older one still deploying,
+    and the line says both — the newest's verdict, and what is in flight — out of
+    the page the aspect already asks for."""
+    check = _one_account()
+    taken = _readings(check, pipelines=ONE_PIPELINE, executions={"running-deploy": [
+        _execution("Failed", started=timedelta(minutes=5), eid="e-2"),
+        _execution("InProgress", started=timedelta(minutes=20), eid="e-1")]})
+    assert [one.identity for one in _kind(taken, "pipeline")] == ["e-2", "e-1"]
+    (line,) = _deploy(check, taken).reason_entries
+    assert (line.code, line.running, line.data["execution"]) == (
+        StatusCode.ERROR, True, "e-2")
+    assert line.text.endswith(
+        ": Failed, started 5m ago · InProgress, started 20m ago")
+
+
+def test_the_card_says_when_an_execution_overruns_and_a_rule_s_own() -> None:
+    """§3, ADR-0003: the card is where a reader sees what an installation grades
+    on, the default included, and each rule as it will act."""
+    summary = _build(codepipeline={"rules": [
+        {"name": "approved releases", "prefixes": ["release-"],
+         "max_run_time": None, "max_age_warn": "90d"},
+        {"name": "builds", "prefixes": ["build-"]}]}).config_summary()
+    assert "- **pipeline execution overruns after:** warn above 30m" in summary
+    assert ("  - **approved releases** — success stales after warn above 90d\n"
+            in summary + "\n")
+    assert ("  - **builds** — an execution overruns after warn above 30m"
+            in summary)
+    assert "pipeline execution overruns after" not in _build(
+        codepipeline={"max_run_time": None}).config_summary()
+
+
+def test_executions_in_flight_in_two_statuses_are_said_each_and_the_worse_counts(
+        ) -> None:
+    """§2: a phrase for each status, in the order each first appears, newest first —
+    and the code of each counts, so one being stopped beside one deploying is an
+    error."""
+    leaf = _pipelines(_one_account(), pipelines=ONE_PIPELINE,
+                      executions={"running-deploy": [
+                          _execution("Stopping", started=timedelta(minutes=3)),
+                          _execution("InProgress", started=timedelta(minutes=10)),
+                          _execution(started=timedelta(days=1))]})
+    entry = _entry(leaf, "running-deploy")
+    assert (entry.code, entry.running) == (StatusCode.ERROR, True)
+    assert entry.text.endswith(
+        ": Succeeded, started 1d ago · Stopping, started 3m ago · "
+        "InProgress, started 10m ago")
+
+
+def test_with_every_execution_in_flight_the_line_is_written_from_the_newest(
+        ) -> None:
+    """§2: nothing has finished, so there is no verdict to keep; the line is the
+    newest's, carrying it, and says what is in flight — and an execution with no
+    status to say is no verdict either."""
+    check = _one_account()
+    taken = _readings(check, pipelines=ONE_PIPELINE, executions={"running-deploy": [
+        _execution("InProgress", started=timedelta(minutes=2), eid="e-3"),
+        _execution("", started=timedelta(minutes=20), eid="e-2"),
+        _execution("InProgress", started=timedelta(minutes=25), eid="e-1")]})
+    (line,) = _deploy(check, taken).reason_entries
+    assert (line.code, line.running, line.data["execution"]) == (
+        StatusCode.OK, True, "e-3")
+    assert line.text.endswith(
+        ": 2 InProgress, the oldest started 25m ago")
+
+
+def test_the_history_s_line_is_found_past_a_superseded_execution(
+        ) -> None:
+    """ADR-0014 §4: while e-2 ran and was superseded by e-3, which ran on, the line
+    was written from e-1. Once e-3 has finished, e-1 is read once more and said for
+    the record by its own status, whatever an overrun beside it made of its mark —
+    the superseded e-2 never was the line's."""
+    taken, _ = _executions_read(_one_account(series_keep=30), [
+        _execution(started=timedelta(minutes=5), updated=timedelta(minutes=1),
+                   eid="e-3"),
+        _execution("Superseded", started=timedelta(minutes=50),
+                   updated=timedelta(minutes=20), eid="e-2"),
+        _execution(started=timedelta(days=1), updated=timedelta(days=1),
+                   eid="e-1")],
+        [("e-1", "Succeeded"), ("e-2", "Superseded"), ("e-3", "InProgress")])
+    assert [one.identity for one in _kind(taken, "pipeline")] == ["e-3", "e-1"]
+
+
+# --- a retried stage keeps its failure (ADR-0014 §5) ---------------------------------
+#
+# A retry of a failed or stopped stage runs the execution it stopped in again, under its
+# own id and from the start it had. Where the history holds that execution ended failed
+# or stopped and the page has it in flight, its action executions are asked for, and the
+# line keeps the failure while the retry runs.
+
+
+def _action(status: str, *, started: timedelta,
+            updated: timedelta | None = None,
+            stage: str = "Deploy") -> dict[str, Any]:
+    """One action execution as `list_action_executions` answers it."""
+    row: dict[str, Any] = {"status": status, "stageName": stage,
+                           "actionName": stage, "startTime": NOW - started}
+    if updated is not None:
+        row["lastUpdateTime"] = NOW - updated
+    return row
+
+
+#: A deploy that failed for a permission somebody has since granted, and is retried.
+RETRIED = {"e-1": [
+    _action("Failed", started=timedelta(hours=2), updated=timedelta(minutes=110)),
+    _action("InProgress", started=timedelta(minutes=3))]}
+#: The page while the retry runs: the failed execution in flight again, from its start.
+RETRY_PAGE = [_execution("InProgress", started=timedelta(hours=2), eid="e-1"),
+              _execution(started=timedelta(days=1), updated=timedelta(days=1),
+                         eid="e-0")]
+
+
+def _retried(check: AwsCheck, page: Sequence[dict[str, Any]],
+             held: Sequence[Any], **stub: Any
+             ) -> tuple[tuple[Measurement, ...], list[tuple[str, str, int]]]:
+    """One poll of the one pipeline whose executions are *page*, by a check that holds
+    *held* of it: what it read, and the action executions it asked for."""
+    _holding(check, {DEPLOY: held})
+    built = _stub(check, pipelines=ONE_PIPELINE,
+                  executions={"running-deploy": list(page)}, **stub)
+    taken = measured(check)
+    return taken, [call for session in built for call in session.action_calls]
+
+
+def test_a_retried_failure_stays_red_while_the_retry_runs() -> None:
+    """§5: the history holds e-1 failed and the page has it in flight, so its action
+    executions are asked for — one call, one page — and they show the failed attempt:
+    the line is written from e-1, keeps the failure and says the retry, in italics."""
+    check = _one_account(series_keep=30)
+    taken, calls = _retried(check, RETRY_PAGE,
+                            [("e-0", "Succeeded"), ("e-1", "Failed")],
+                            actions=RETRIED)
+    assert calls == [("running-deploy", "e-1", 100)]
+    # The line is e-1's, so the success before it is not read: the history holds it.
+    (retry,) = _kind(taken, "pipeline")
+    assert retry.record["retry"] == {
+        "failed": 1, "abandoned": 0,
+        "started": _stamp(timedelta(minutes=3)), "error": None}
+    (line,) = _deploy(check, taken).reason_entries
+    assert (line.code, line.running, line.data["execution"]) == (
+        StatusCode.ERROR, True, "e-1")
+    assert line.text.endswith(
+        ": Failed, started 2h ago · InProgress, retried 3m ago")
+
+
+def test_a_retry_is_asked_for_at_every_poll_while_it_runs_and_no_longer(
+        ) -> None:
+    """§5: once the history holds it on a retry, the next poll asks again; once it has
+    finished, nothing is asked, and the line is what the retry made it."""
+    held = [("e-0", "Succeeded"),
+            SeriesRecord({"at": _stamp(timedelta(hours=2)), "status": "InProgress",
+                          "retry": {"failed": 1, "abandoned": 0,
+                                    "started": _stamp(timedelta(minutes=3)),
+                                    "error": None}}, NOW, "e-1")]
+    check = _one_account(series_keep=30)
+    taken, calls = _retried(check, RETRY_PAGE, held, actions=RETRIED)
+    assert calls == [("running-deploy", "e-1", 100)]
+    assert _deploy(check, taken).reason_entries[0].code is StatusCode.ERROR
+    check = _one_account(series_keep=30)
+    done = [_execution(started=timedelta(hours=2), updated=timedelta(minutes=1),
+                       eid="e-1"), RETRY_PAGE[1]]
+    taken, calls = _retried(check, done, held, actions=RETRIED)
+    assert calls == []
+    (line,) = _deploy(check, taken).reason_entries
+    assert (line.code, line.running) == (StatusCode.OK, False)
+    assert "retry" not in _kind(taken, "pipeline")[0].record
+
+
+@pytest.mark.parametrize(("check", "held"), [
+    (_one_account(), [("e-0", "Succeeded"), ("e-1", "Failed")]),
+    (_one_account(series_keep=30), [("e-0", "Succeeded"), ("e-1", "InProgress")]),
+    (_one_account(series_keep=30), [("e-0", "Succeeded"), ("e-1", "Superseded")]),
+    (_one_account(series_keep=30), [("e-0", "Succeeded")])])
+def test_a_retry_is_asked_for_only_where_the_history_holds_the_execution_ended(
+        check: AwsCheck, held: Sequence[Any]) -> None:
+    """§5: without a series nothing is held; one held in flight, or superseded — which
+    is not retried — or not at all, is a first run as far as anything here knows. The
+    line is then written from the execution before it, as §2 has it."""
+    taken, calls = _retried(check, RETRY_PAGE, held, actions=RETRIED)
+    assert calls == []
+    (line,) = _deploy(check, taken).reason_entries
+    assert (line.code, line.data["execution"]) == (StatusCode.WARN, "e-0")
+    assert line.text.endswith(": Succeeded, started 1d ago · "
+                              "InProgress, started 2h ago, past max_run_time")
+
+
+@pytest.mark.parametrize(("minutes", "code", "said"), [
+    (10, StatusCode.ERROR, "retried 10m ago"),
+    (45, StatusCode.ERROR, "retried 45m ago, past max_run_time")])
+def test_the_bound_counts_from_the_retry_s_own_start(
+        minutes: int, code: StatusCode, said: str) -> None:
+    """§5: the execution started two hours ago and its retry ten minutes ago, which is
+    what `max_run_time` holds — and past it the line says so, red as it is."""
+    check = _one_account(series_keep=30)
+    actions = {"e-1": [
+        _action("Failed", started=timedelta(hours=2), updated=timedelta(minutes=110)),
+        _action("InProgress", started=timedelta(minutes=minutes))]}
+    taken, _ = _retried(check, RETRY_PAGE, [("e-1", "Failed")], actions=actions)
+    (line,) = _deploy(check, taken).reason_entries
+    assert line.code is code
+    assert line.text.endswith(f": Failed, started 2h ago · InProgress, {said}")
+
+
+def test_a_retry_no_action_of_which_has_started_yet_is_said_without_when(
+        ) -> None:
+    """§5: retried a moment ago, before CodePipeline started any action again — the
+    failure is kept, and there is no start yet to hold the bound against."""
+    check = _one_account(series_keep=30)
+    actions = {"e-1": RETRIED["e-1"][:1]}
+    taken, _ = _retried(check, RETRY_PAGE, [("e-1", "Failed")], actions=actions)
+    (line,) = _deploy(check, taken).reason_entries
+    assert (line.code, line.running) == (StatusCode.ERROR, True)
+    assert line.text.endswith(": Failed, started 2h ago · InProgress, retried")
+
+
+def test_a_retry_beside_a_first_run_of_one_status_is_said_apart(
+        ) -> None:
+    """§2, §5: a newer execution deploying while an older one is retried — the line
+    keeps the retried one's failure and says each of the two in its own words."""
+    check = _one_account(series_keep=30)
+    page = [_execution("InProgress", started=timedelta(minutes=5), eid="e-2"),
+            *RETRY_PAGE]
+    taken, calls = _retried(check, page, [("e-0", "Succeeded"), ("e-1", "Failed")],
+                            actions=RETRIED)
+    assert calls == [("running-deploy", "e-1", 100)]
+    (line,) = _deploy(check, taken).reason_entries
+    assert (line.code, line.data["execution"]) == (StatusCode.ERROR, "e-1")
+    assert line.text.endswith(
+        ": Failed, started 2h ago · InProgress, started 5m ago · "
+        "InProgress, retried 3m ago")
+
+
+def test_a_stopped_execution_retried_keeps_its_stop() -> None:
+    """§5: stopped and abandoned, then retried — the line keeps what `state_map` says
+    of `Stopped`, an error by default."""
+    check = _one_account(series_keep=30)
+    actions = {"e-1": [
+        _action("Abandoned", started=timedelta(hours=2), updated=timedelta(hours=1)),
+        _action("InProgress", started=timedelta(minutes=2))]}
+    taken, _ = _retried(check, RETRY_PAGE, [("e-1", "Stopped")], actions=actions)
+    (line,) = _deploy(check, taken).reason_entries
+    assert line.code is StatusCode.ERROR
+    assert line.text.endswith(
+        ": Stopped, started 2h ago · InProgress, retried 2m ago")
+
+
+def test_a_retry_whose_actions_show_no_end_is_said_as_a_first_run() -> None:
+    """§5: an execution stopped and waited for left no failed or abandoned action, so
+    nothing CodePipeline answers says it had ended — and the record says what was
+    answered, and nothing it was not."""
+    check = _one_account(series_keep=30)
+    actions = {"e-1": [
+        _action("Succeeded", started=timedelta(hours=2), updated=timedelta(hours=1)),
+        _action("InProgress", started=timedelta(minutes=2))]}
+    taken, calls = _retried(check, RETRY_PAGE, [("e-1", "Stopped")],
+                            actions=actions)
+    assert len(calls) == 1
+    assert _kind(taken, "pipeline")[0].record["retry"] == {
+        "failed": 0, "abandoned": 0, "started": None, "error": None}
+    (line,) = _deploy(check, taken).reason_entries
+    assert line.data["execution"] == "e-0"
+    assert line.text.endswith(": Succeeded, started 1d ago · "
+                              "InProgress, started 2h ago, past max_run_time")
+
+
+def test_a_retry_that_could_not_be_read_says_so_at_a_warning() -> None:
+    """§5: a refusal is an answer, kept as one; the line is written as §2 has it and
+    says why the failure it may be running again is not on it."""
+    check = _one_account(series_keep=30,
+                         codepipeline={"max_run_time": None})
+    taken, calls = _retried(check, RETRY_PAGE, [("e-1", "Failed")],
+                            actions=RETRIED, actions_refused={"e-1"})
+    assert len(calls) == 1
+    assert "AccessDeniedException" in _kind(taken, "pipeline")[0].record["retry"][
+        "error"]
+    (line,) = _deploy(check, taken).reason_entries
+    assert (line.code, line.data["execution"]) == (StatusCode.WARN, "e-0")
+    assert ": Succeeded, started 1d ago · InProgress, started 2h ago · its retry " \
+        "could not be read: An error occurred (AccessDeniedException)" in line.text
+
+
+def test_the_history_holds_an_execution_on_a_retry_as_the_line_s() -> None:
+    """§4, §5: kept in flight on a retry, it was what the line was written from, so
+    the poll that finds it finished does not read the one before it once more."""
+    held = [("e-0", "Succeeded", timedelta(days=1)),
+            SeriesRecord({"at": _stamp(timedelta(hours=2)), "status": "InProgress",
+                          "retry": {"failed": 1, "abandoned": 0,
+                                    "started": _stamp(timedelta(minutes=3)),
+                                    "error": None}}, NOW, "e-1")]
+    done = [_execution(started=timedelta(hours=2), updated=timedelta(minutes=1),
+                       eid="e-1"), RETRY_PAGE[1]]
+    taken, _ = _executions_read(_one_account(series_keep=30), done, held)
+    assert [one.identity for one in _kind(taken, "pipeline")] == ["e-1"]
+
+
+# --- a console link opens the account it names (ADR-0013) ---------------------------
+#
+# A link names a region, a service's page and a name, and the console takes the account
+# from the browser's session. `console_link` is the template a deployment wraps a link
+# in, so that it opens the account its node stands for. Each test below is one sentence
+# of that record, with the addresses written out rather than computed.
+
+#: A template in the shape an access portal takes, under a host nobody has.
+PORTAL = ("https://portal.example/start/#/console"
+          "?account_id={account_id}&destination={url}")
+#: `PORTAL` as far as the account's id, and what stands between the id and the address.
+PORTAL_AS = "https://portal.example/start/#/console?account_id="
+PORTAL_TO = "&destination="
+#: A second wrapper, which names its tokens the other way round.
+OTHER_PORTAL = "https://other.example/go?to={url}&as={account_id}"
+
+LIVE_ID = "111111111111"
+NONLIVE_ID = "222222222222"
+#: Two accounts whose roles say which accounts they are, both read in one region.
+TWO_ROLES: list[dict[str, Any]] = [
+    {"name": "live", "role_arn": f"arn:aws:iam::{LIVE_ID}:role/monitoring"},
+    {"name": "nonlive", "role_arn": f"arn:aws:iam::{NONLIVE_ID}:role/monitoring"}]
+
+#: The console's host as a template's `{url}` carries it.
+CONSOLE_ENCODED = "https%3A%2F%2Feu-central-1.console.aws.amazon.com"
+
+#: The console's page of one thing of each kind `EVERY_ASPECT` holds, and the same
+#: page percent-encoded whole — written out here, not computed: every `/`, `?`, `=`,
+#: `#`, `&` and `:` of it.
+PAGES: dict[str, tuple[str, str]] = {
+    "alarm": (
+        "/cloudwatch/home?region=eu-central-1#s=Alarms&alarm=api-latency",
+        "%2Fcloudwatch%2Fhome%3Fregion%3Deu-central-1%23s%3DAlarms%26alarm"
+        "%3Dapi-latency"),
+    "instances": (
+        "/ec2/home?region=eu-central-1#Instances:search=web",
+        "%2Fec2%2Fhome%3Fregion%3Deu-central-1%23Instances%3Asearch%3Dweb"),
+    "function": (
+        "/lambda/home?region=eu-central-1#/functions/collector",
+        "%2Flambda%2Fhome%3Fregion%3Deu-central-1%23%2Ffunctions%2Fcollector"),
+    "pipeline": (
+        "/codesuite/codepipeline/pipelines/deploy/executions?region=eu-central-1",
+        "%2Fcodesuite%2Fcodepipeline%2Fpipelines%2Fdeploy%2Fexecutions"
+        "%3Fregion%3Deu-central-1"),
+    "job": (
+        "/batch/home?region=eu-central-1#jobs/detail/j-2",
+        "%2Fbatch%2Fhome%3Fregion%3Deu-central-1%23jobs%2Fdetail%2Fj-2"),
+    "queues": (
+        "/batch/home?region=eu-central-1#queues",
+        "%2Fbatch%2Fhome%3Fregion%3Deu-central-1%23queues"),
+}
+
+#: Every place a run writes a link: the aspect, a line or the roster, the name that is
+#: linked, and the page it links to. Six kinds of address, in ten places.
+PLACES = [
+    (CLOUDWATCH, "line", "api-latency", "alarm"),
+    (CLOUDWATCH, "roster", "api-latency", "alarm"),
+    (EC2, "line", "web", "instances"),
+    (LAMBDA, "line", "collector", "function"),
+    (LAMBDA, "roster", "collector", "function"),
+    (CODEPIPELINE, "line", "deploy", "pipeline"),
+    (CODEPIPELINE, "roster", "deploy", "pipeline"),
+    (BATCH, "line", "etl", "job"),
+    (BATCH, "line", "dormant", "queues"),
+    (BATCH, "roster", "nightly", "queues"),
+]
+
+_MARKDOWN_LINK = re.compile(r"\[([^\]]+)\]\(([^()\s]+)\)")
+
+
+def _links(text: str) -> dict[str, str]:
+    """The Markdown links *text* writes: each name, and the address it links to."""
+    return dict(_MARKDOWN_LINK.findall(text))
+
+
+def _one_role(**overrides: Any) -> AwsCheck:
+    """A check of the one account whose role says that it is `LIVE_ID`."""
+    return _build(accounts=TWO_ROLES[:1], **overrides)
+
+
+def _link_at(check: AwsCheck, aspect: str, where: str, name: str) -> str:
+    """The address *name* links to in one aspect of a run over `EVERY_ASPECT`: on a
+    line of the aspect's node or of a node beneath it, or in the aspect's roster."""
+    _stub(check, **EVERY_ASPECT)
+    leaf = _aspect(check, run_check(check), aspect)
+    text = leaf.report if where == "roster" else "\n".join(
+        entry.text for node in _nodes(leaf) for entry in node.reason_entries)
+    return _links(text)[name]
+
+
+def _deploy_links(check: AwsCheck) -> dict[str, str]:
+    """Where the pipeline `deploy` links to on each account's node, in a run in which
+    every account holds a pipeline of that name."""
+    _stub(check, pipelines={"eu-central-1": [["deploy"]]},
+          executions={"deploy": [_execution()]})
+    result = run_check(check)
+    return {account.name: _links(_line(
+        _aspect(check, result, CODEPIPELINE, account.name), "deploy"))["deploy"]
+        for account in check.accounts}
+
+
+def _through(portal_start: str, account_id: str, page: str) -> str:
+    """One page of `PAGES`, as `PORTAL` wraps it for one account."""
+    return f"{portal_start}{account_id}{PORTAL_TO}{CONSOLE_ENCODED}{PAGES[page][1]}"
+
+
+@pytest.mark.parametrize("page", sorted(PAGES))
+def test_the_pages_written_out_here_are_the_console_s_own_percent_encoded(
+        page: str) -> None:
+    """What these tests hold a link against: decoded once, as the far end of a
+    sign-in decodes it, an encoded page is the page — and none of the characters a
+    URL reserves is left in it as itself."""
+    own, encoded = PAGES[page]
+    assert urllib.parse.unquote(f"{CONSOLE_ENCODED}{encoded}") == f"{CONSOLE}{own}"
+    assert not set(f"{CONSOLE_ENCODED}{encoded}") & set("/?#&=:")
+
+
+@pytest.mark.parametrize("aspect,where,name,page", PLACES)
+def test_a_link_is_the_console_s_own_without_a_template_and_wrapped_with_one(
+        aspect: str, where: str, name: str, page: str) -> None:
+    """§1: the type fills the template for every link it writes for the account — a
+    line's and a roster's, of all six kinds — and where no template is set a link is
+    the console's own address, as it was."""
+    assert _link_at(_one_role(), aspect, where, name) == (
+        f"{CONSOLE}{PAGES[page][0]}")
+    assert _link_at(_one_role(console_link=PORTAL), aspect, where, name) == (
+        _through(PORTAL_AS, LIVE_ID, page))
+
+
+def test_one_pipeline_name_in_two_accounts_links_to_each_account_s_own() -> None:
+    """The record's context: a pipeline of one name in two accounts. With no template
+    the two nodes write one address, which opens in whichever account the browser is
+    signed in to. With one, each node's link names the account it stands for."""
+    alike = _deploy_links(_build(accounts=TWO_ROLES))
+    assert alike["live"] == alike["nonlive"] == f"{CONSOLE}{PAGES['pipeline'][0]}"
+
+    check = _build(accounts=TWO_ROLES, console_link=PORTAL)
+    assert _deploy_links(check) == {
+        "live": _through(PORTAL_AS, LIVE_ID, "pipeline"),
+        "nonlive": _through(PORTAL_AS, NONLIVE_ID, "pipeline")}
+    # The line around the link is the line it was.
+    _stub(check, pipelines={"eu-central-1": [["deploy"]]},
+          executions={"deploy": [_execution()]})
+    nonlive = _child(_child(run_check(check), "nonlive"), CODEPIPELINE)
+    assert _line(nonlive, "deploy") == (
+        f"[deploy]({_through(PORTAL_AS, NONLIVE_ID, 'pipeline')}): "
+        f"Succeeded, started 2h ago")
+
+
+def test_an_account_s_own_template_replaces_the_check_s() -> None:
+    """§1: as its `regions:` and its `profile:` replace the check's."""
+    check = _build(console_link=PORTAL, accounts=[
+        TWO_ROLES[0], {**TWO_ROLES[1], "console_link": OTHER_PORTAL}])
+    assert check.console_link_for(check.accounts[0]) == PORTAL
+    assert check.console_link_for(check.accounts[1]) == OTHER_PORTAL
+    assert _deploy_links(check) == {
+        "live": _through(PORTAL_AS, LIVE_ID, "pipeline"),
+        "nonlive": (f"https://other.example/go?to={CONSOLE_ENCODED}"
+                    f"{PAGES['pipeline'][1]}&as={NONLIVE_ID}")}
+
+
+def test_a_template_on_one_account_wraps_that_account_s_links_and_no_other_s() -> None:
+    """§1: where neither the check nor the account sets one, a link is the console's
+    own address."""
+    check = _build(accounts=[
+        TWO_ROLES[0], {**TWO_ROLES[1], "console_link": PORTAL}])
+    assert _deploy_links(check) == {
+        "live": f"{CONSOLE}{PAGES['pipeline'][0]}",
+        "nonlive": _through(PORTAL_AS, NONLIVE_ID, "pipeline")}
+
+
+def test_what_is_no_token_is_text_of_the_address() -> None:
+    """§2: `{account_id}` is optional — a template may carry an id its author wrote
+    into it — and a role is text of the template. A brace around anything but a
+    token's lower-case name is text as well."""
+    template = ("https://portal.example/{Stage}/#/console?account_id=333333333333"
+                "&role_name=ReadOnly&destination={url}")
+    check = _build(console_link=template,
+                   accounts=[{"name": "live"}, {"name": "sandbox"}])
+    page = f"{CONSOLE_ENCODED}{PAGES['pipeline'][1]}"
+    wrapped = ("https://portal.example/{Stage}/#/console?account_id=333333333333"
+               f"&role_name=ReadOnly&destination={page}")
+    assert _deploy_links(check) == {"live": wrapped, "sandbox": wrapped}
+
+
+def test_a_name_the_console_s_address_escapes_is_escaped_again_inside_a_template(
+        ) -> None:
+    """§2: every value is percent-encoded whole — the `%` of the address among the
+    rest, so that a name the console's address carries as `a%20b` arrives at the far
+    end of a sign-in as the console wrote it."""
+    check = _one_role(console_link=PORTAL)
+    leaf = _pipelines(check, pipelines={"eu-central-1": [["a b"]]},
+                      executions={"a b": [_execution()]})
+    link = _links(_line(leaf, "a b"))["a b"]
+    assert link == (
+        f"{PORTAL_AS}{LIVE_ID}{PORTAL_TO}{CONSOLE_ENCODED}%2Fcodesuite"
+        f"%2Fcodepipeline%2Fpipelines%2Fa%2520b%2Fexecutions%3Fregion%3Deu-central-1")
+    assert urllib.parse.unquote(link.split(PORTAL_TO)[1]) == (
+        f"{CONSOLE}/codesuite/codepipeline/pipelines/a%20b/executions"
+        f"?region=eu-central-1")
+
+
+def test_a_wrapped_address_holds_nothing_that_ends_a_markdown_link() -> None:
+    """§2: what a template produces is the destination of a Markdown link, whatever
+    the name is — an alarm's may hold a space, a parenthesis, an angle bracket, a
+    backtick and a backslash."""
+    check = _one_role(console_link=PORTAL)
+    leaf = _cloudwatch(check, alarms={"eu-central-1": [[
+        _alarm("a (b) <c> `d` \\e")]]})
+    text = leaf.reason[0].text
+    address = text.split("](", 1)[1].split("): in ALARM", 1)[0]
+    assert address.startswith(
+        f"{PORTAL_AS}{LIVE_ID}{PORTAL_TO}{CONSOLE_ENCODED}%2Fcloudwatch%2Fhome")
+    assert not set(address) & set(" \t\n()<>`\\")
+
+
+# --- the account's id ---------------------------------------------------------------
+
+@pytest.mark.parametrize("role_arn", [
+    "arn:aws:iam::333333333333:role/monitoring",
+    "arn:aws:iam::333333333333:role/application/monitoring-role",
+    "arn:aws-us-gov:iam::333333333333:role/monitoring",
+    "arn:aws-cn:iam::333333333333:role/monitoring",
+])
+def test_an_account_s_id_is_read_out_of_its_role_s_arn(role_arn: str) -> None:
+    """§3: it is written there already, `arn:<partition>:iam::<id>:role/…`, whatever
+    AWS calls the partition and whatever path the role has."""
+    check = _build(console_link=PORTAL,
+                   accounts=[{"name": "live", "role_arn": role_arn}])
+    assert check.accounts[0].account_id == "333333333333"
+    assert _deploy_links(check) == {
+        "live": _through(PORTAL_AS, "333333333333", "pipeline")}
+
+
+@pytest.mark.parametrize("role_arn", [
+    "arn:aws:iam::111:role/monitoring",
+    "arn:aws:iam::1111111111111:role/monitoring",
+    "arn:aws:iam::111111111111:user/somebody",
+    "arn:aws:sts::111111111111:assumed-role/monitoring/session",
+    "arn:aws:iam::111111111111:role/",
+    "monitoring",
+])
+def test_a_value_that_is_no_iam_role_s_arn_names_no_id(role_arn: str) -> None:
+    """§3: the id is read where it is written and never guessed. An account under
+    such a value says none, and a template that names the id is refused over it, in
+    words that say its `role_arn` is what names none."""
+    accounts = [{"name": "live", "role_arn": role_arn}]
+    assert _build(accounts=accounts).accounts[0].account_id == ""
+    with pytest.raises(CheckError) as refusal:
+        _build(accounts=accounts, console_link=PORTAL)
+    assert str(refusal.value) == (
+        "account 'live' has no account id, and the 'console_link' its links are "
+        "wrapped in names {account_id}: its 'role_arn' names none, so write "
+        "'account_id:' on the account")
+
+
+@pytest.mark.parametrize("written,taken", [
+    ("333333333333", "333333333333"),
+    (" 333333333333 ", "333333333333"),
+    ("012345670123", "012345670123"),
+    (333333333333, "333333333333"),
+])
+def test_an_account_that_names_no_role_says_its_id(written: object,
+                                                   taken: str) -> None:
+    """§3: `account_id`, the twelve digits of the id — and an unquoted number that
+    *is* twelve digits was written as one, and is taken."""
+    check = _build(console_link=PORTAL,
+                   accounts=[{"name": "live", "account_id": written}])
+    assert check.accounts[0].account_id == taken
+    assert _deploy_links(check) == {"live": _through(PORTAL_AS, taken, "pipeline")}
+
+
+#: What an `account_id` that is not twelve digits is told, whatever it is.
+NOT_TWELVE_DIGITS = (
+    "account 'live' 'account_id' must be the twelve digits of an AWS account id, in "
+    "quotes — YAML reads an unquoted number that starts with 0 as another number")
+
+
+@pytest.mark.parametrize("written", [
+    "33333333333", "3333333333333", "33333333333a", "3333-3333-3333", "",
+    "٣" * 12,          # twelve digits of another script: no id AWS gives
+    1402433619, 0, True, 3.3e11, None, ["333333333333"],
+])
+def test_an_account_id_that_is_not_twelve_digits_is_refused(written: object) -> None:
+    """§3: a value that is not twelve digits is refused — a key left empty and a
+    value that is no text or number among them."""
+    with pytest.raises(CheckError) as refusal:
+        _build(accounts=[{"name": "live", "account_id": written}])
+    assert str(refusal.value) == NOT_TWELVE_DIGITS
+
+
+def test_an_unquoted_id_that_starts_with_zero_is_another_number_to_yaml() -> None:
+    """§3: in quotes, because YAML reads an unquoted number that starts with `0` as
+    another number — an octal one, where every digit allows it — and what then
+    arrives is no twelve digits, and is refused."""
+    assert yaml.safe_load("account_id: 012345670123") == {"account_id": 1402433619}
+    assert yaml.safe_load("account_id: 000000000001") == {"account_id": 1}
+    for unquoted in ("012345670123", "000000000001"):
+        entry = {"name": "live", **yaml.safe_load(f"account_id: {unquoted}")}
+        with pytest.raises(CheckError) as refusal:
+            _build(accounts=[entry])
+        assert str(refusal.value) == NOT_TWELVE_DIGITS
+        quoted = {"name": "live", **yaml.safe_load(f'account_id: "{unquoted}"')}
+        assert _build(accounts=[quoted]).accounts[0].account_id == unquoted
+
+
+def test_an_account_id_beside_a_role_in_another_account_is_refused() -> None:
+    """§3: both written, and they differ. The refusal names the account and repeats
+    neither id."""
+    with pytest.raises(CheckError) as refusal:
+        _build(accounts=[{**TWO_ROLES[0], "account_id": NONLIVE_ID}])
+    assert str(refusal.value) == (
+        "account 'live' names two accounts: its 'account_id' is not the account its "
+        "'role_arn' is in. A role is in the account it reads, so one of the two is "
+        "wrong")
+
+
+def test_an_account_id_that_says_what_the_role_says_is_taken() -> None:
+    check = _build(accounts=[{**TWO_ROLES[0], "account_id": LIVE_ID}],
+                   console_link=PORTAL)
+    assert check.accounts[0].account_id == LIVE_ID
+
+
+def test_a_template_that_names_the_id_is_refused_over_an_account_that_says_none(
+        ) -> None:
+    """§3: when the check loads, naming the account and the key — never left as the
+    console's own address beside the wrapped links of the other accounts."""
+    with pytest.raises(CheckError) as refusal:
+        _build(accounts=[TWO_ROLES[0], {"name": "sandbox"}], console_link=PORTAL)
+    assert str(refusal.value) == (
+        "account 'sandbox' has no account id, and the 'console_link' its links are "
+        "wrapped in names {account_id}: it names no 'role_arn' to read one from, so "
+        "write 'account_id:' on the account")
+
+
+def test_the_template_an_account_is_held_to_is_the_one_its_links_are_wrapped_in(
+        ) -> None:
+    """§3: the account's own template, or the check's where it wrote none."""
+    # Its own names the id and it says none: refused, though the check sets no
+    # template at all.
+    with pytest.raises(CheckError) as refusal:
+        _build(accounts=[TWO_ROLES[0], {"name": "sandbox", "console_link": PORTAL}])
+    assert str(refusal.value) == (
+        "account 'sandbox' has no account id, and the 'console_link' its links are "
+        "wrapped in names {account_id}: it names no 'role_arn' to read one from, so "
+        "write 'account_id:' on the account")
+    # Its own names no id: taken, though the check's template names one.
+    check = _build(console_link=PORTAL, accounts=[
+        TWO_ROLES[0],
+        {"name": "sandbox", "console_link": "https://other.example/go?to={url}"}])
+    assert _deploy_links(check) == {
+        "live": _through(PORTAL_AS, LIVE_ID, "pipeline"),
+        "sandbox": (f"https://other.example/go?to={CONSOLE_ENCODED}"
+                    f"{PAGES['pipeline'][1]}")}
+
+
+# --- what a template is ---------------------------------------------------------------
+
+#: What a template is told that holds a character a URL carries percent-encoded.
+AS_THEY_ARE = (" — whitespace, a backtick, a backslash, a parenthesis and an angle "
+               "bracket are written percent-encoded in a URL, and as they are would "
+               "end the link a line writes")
+#: What a template is told that names no `{url}`.
+NO_URL = ("names no {url}, so every link would open one address — {url} is where "
+          "the console's address of what a line names goes")
+#: What follows the tokens of a template that names one it may not.
+MAY_NAME = " — a template may name {url} and {account_id}"
+
+
+def _refused_template(template: object) -> tuple[str, str]:
+    """What a `console_link` is told, as the check's own and as an account's."""
+    with pytest.raises(CheckError) as check_s:
+        _build(accounts=TWO_ROLES, console_link=template)
+    with pytest.raises(CheckError) as account_s:
+        _build(accounts=[{**TWO_ROLES[0], "console_link": template}])
+    return str(check_s.value), str(account_s.value)
+
+
+@pytest.mark.parametrize("template,said", [
+    ("https://portal.example/?to={url}&as={account}", "names {account}" + MAY_NAME),
+    ("https://portal.example/?to={url}&in={region}&as={account}",
+     "names {account}, {region}" + MAY_NAME),
+    ("https://portal.example/?to={url}&as={}", "names {}" + MAY_NAME),
+    ("https://portal.example/start", NO_URL),
+    ("https://portal.example/?as={account_id}", NO_URL),
+    ("https://portal.example/?to={URL}", NO_URL),
+])
+def test_a_template_names_the_address_and_no_token_but_the_two(template: str,
+                                                               said: str) -> None:
+    """§2: a template that names any other token is refused when the check loads,
+    with the two it may name; and a template names `{url}`, or it is refused."""
+    assert _refused_template(template) == (
+        f"aws 'console_link' {said}", f"account 'live' 'console_link' {said}")
+
+
+@pytest.mark.parametrize("char", [
+    " ", "\t", "\n", " ", "`", "\\", "(", ")", "<", ">", "\x01", "\x7f"])
+def test_a_template_is_written_as_a_url_is(char: str) -> None:
+    """§2: whitespace, a backtick, a backslash, a parenthesis or an angle bracket in
+    a template is refused when the check loads — and so is a control character."""
+    said = f"holds {char!r}{AS_THEY_ARE}"
+    assert _refused_template(f"https://portal.example/a{char}b?to={{url}}") == (
+        f"aws 'console_link' {said}", f"account 'live' 'console_link' {said}")
+
+
+@pytest.mark.parametrize("written,said", [
+    (None, "must not be empty"), ("", "must not be empty"), ("  ", "must not be empty"),
+    (17, "must be text, got int"), (["{url}"], "must be text, got list"),
+])
+def test_a_console_link_left_empty_is_refused_as_a_profile_is(written: object,
+                                                              said: str) -> None:
+    """§2: a key written and left empty, or a value that is not text."""
+    assert _refused_template(written) == (
+        f"aws 'console_link' {said}", f"account 'live' 'console_link' {said}")
+
+
+# --- the card, and where the id is not -----------------------------------------------
+
+#: The card's row where no template is set.
+OPEN_IN_THE_BROWSER_S = ("- **console links:** open in whichever account the browser "
+                         "is signed in to")
+
+
+def test_an_account_s_card_says_where_its_links_open() -> None:
+    """§5: one row of the configuration card, *console links*, on the account's card
+    where a check names several accounts: that a link opens in whichever account the
+    browser is signed in to, or the template — an account's own, where it has
+    replaced the check's. The check's own card says nothing of it there."""
+    bare = _build(accounts=TWO_ROLES)
+    _stub(bare)
+    assert OPEN_IN_THE_BROWSER_S in _child(run_check(bare), "live").config.splitlines()
+    assert "console links" not in bare.config_summary()
+
+    wrapped = _build(console_link=PORTAL, accounts=[
+        TWO_ROLES[0], {**TWO_ROLES[1], "console_link": OTHER_PORTAL}])
+    _stub(wrapped)
+    result = run_check(wrapped)
+    assert f"- **console links:** through `{PORTAL}`" in (
+        _child(result, "live").config.splitlines())
+    assert f"- **console links:** through `{OTHER_PORTAL}`" in (
+        _child(result, "nonlive").config.splitlines())
+    assert "console links" not in wrapped.config_summary()
+
+
+def test_the_check_s_own_card_says_it_where_the_check_names_one_account() -> None:
+    """§5: and on the check's own where it names one account and stands for it
+    (ADR-0007 §2)."""
+    assert OPEN_IN_THE_BROWSER_S in _one_role().config_summary().splitlines()
+    assert f"- **console links:** through `{PORTAL}`" in (
+        _one_role(console_link=PORTAL).config_summary().splitlines())
+
+
+def test_the_id_is_in_the_address_of_a_link_and_nowhere_else() -> None:
+    """§4: with a template, the id is in the address of every link of the account,
+    and it stays out of every path, slug, subject and record — and off the card,
+    which shows the template as it is written."""
+    check = _one_role(console_link=PORTAL, series_keep=30)
+    _stub(check, **EVERY_ASPECT)
+    taken = measured(check)
+    nodes = _nodes(run_check(check, measurements=taken))
+    lines = [entry for node in nodes
+             for entry in (*node.reason_entries, *node.for_record)]
+    kept = json.dumps(
+        [[reading.record, reading.subject, reading.identity, reading.state]
+         for reading in taken]
+        + [[entry.slug, entry.subject, entry.data] for entry in lines]
+        + [[node.name, node.title, node.description, node.config] for node in nodes]
+        + [check.config_summary(), check.subject])
+    assert LIVE_ID not in kept
+
+    said = "\n".join([*(entry.text for entry in lines),
+                      *(node.report or "" for node in nodes)])
+    assert said.count(f"{PORTAL_AS}{LIVE_ID}{PORTAL_TO}") == len(
+        _MARKDOWN_LINK.findall(said)) > 10
+    assert LIVE_ID not in _MARKDOWN_LINK.sub("", said)
+
+
+def test_an_account_id_reaches_nothing_where_no_template_names_it() -> None:
+    """§4: the type alone still writes the account id nowhere — not where an account
+    says one, and not where a template wraps its links and names none."""
+    for template in ({}, {"console_link": "https://other.example/go?to={url}"}):
+        check = _build(accounts=[{"name": "live", "account_id": LIVE_ID}], **template)
+        _stub(check, **EVERY_ASPECT)
+        nodes = _nodes(run_check(check))
+        assert LIVE_ID not in "\n".join([
+            *(entry.text for node in nodes for entry in node.reason_entries),
+            *(node.report or "" for node in nodes),
+            *(node.config or "" for node in nodes), check.config_summary()])
+
+
+def test_a_link_is_decided_by_the_configuration_and_no_reading_carries_it() -> None:
+    """§3: nothing is asked of AWS for a link, and a grading reads no session. What a
+    check with a template reads is what one without reads, to the record; and a
+    check that has one wraps the links of readings that a check without one took."""
+    without, wrapping = _one_role(), _one_role(console_link=PORTAL)
+    sessions = _stub(without, **EVERY_ASPECT)
+    taken = measured(without)
+    wrapped_sessions = _stub(wrapping, **EVERY_ASPECT)
+    assert measured(wrapping) == taken
+    assert ([session.clients for session in wrapped_sessions]
+            == [session.clients for session in sessions])
+    leaf = _aspect(wrapping, run_check(wrapping, measurements=taken), CODEPIPELINE)
+    assert _links(_line(leaf, "deploy")) == {
+        "deploy": _through(PORTAL_AS, LIVE_ID, "pipeline")}
+
+
+def test_a_configuration_that_says_nothing_of_links_has_no_template_and_no_id(
+        ) -> None:
+    """Every configuration written before the two keys existed."""
+    account = Account(name="here")
+    assert (account.account_id, account.console_link) == ("", "")
+    check = _build(accounts=[{"name": "live"}, {"name": "backup"}])
+    assert check.console_link == ""
+    assert [(check.console_link_for(account), account.account_id)
+            for account in check.accounts] == [("", ""), ("", "")]
+
+
+def test_a_misspelled_account_key_is_told_the_two_keys_among_those_it_takes() -> None:
+    with pytest.raises(CheckError) as refusal:
+        _build(accounts=[{"name": "live", "acount_id": LIVE_ID}])
+    assert str(refusal.value) == (
+        "unknown key(s) in account 'live': acount_id (an account takes: about, "
+        "account_id, console_link, name, profile, regions, role_arn, title)")

@@ -21,6 +21,7 @@ it carries rules, and that at least one of them ignores.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -130,3 +131,72 @@ def test_the_identities_example_parses() -> None:
         assert (declared.identity.profile or declared.identity.role_arn
                 or declared.region), (
             f"identity {name!r} names nothing — the loader refuses that")
+
+
+# `console_link` and `account_id` are shown commented, as `profile:` is: unset, nothing
+# moves. So no parser reads them where they stand, and a template that had stopped
+# loading would ship in the one file an operator copies it from. They are read here the
+# way an operator who takes the `#` away has them read.
+
+def _shown(key: str) -> list[Any]:
+    """Every value the check example shows for *key* on a commented line."""
+    text = (EXAMPLES / "checks" / "aws.yaml").read_text(encoding="utf-8")
+    return [yaml.safe_load(found) for found in re.findall(
+        rf'^ *# {key}: ("[^"]*")', text, re.MULTILINE)]
+
+
+def test_the_check_example_shows_a_console_link_on_the_check_and_on_an_account(
+        ) -> None:
+    """Both templates load, each names the two tokens, and the account's own is the
+    one its links are wrapped in."""
+    shown = _shown("console_link")
+    assert len(shown) == 2, (
+        "the example must show `console_link:` on the check and on an account")
+    on_the_check, on_the_account = shown
+    assert on_the_check != on_the_account, (
+        "an account's own template that is the check's demonstrates no replacing")
+    config = _check_config()
+    config["console_link"] = on_the_check
+    config["accounts"][1]["console_link"] = on_the_account
+    check = AwsCheck.from_config(config, EXAMPLES / "checks")
+    assert isinstance(check, AwsCheck)
+
+    live, backup = check.accounts
+    assert check.console_link_for(live) == on_the_check
+    assert check.console_link_for(backup) == on_the_account
+    for template in shown:
+        assert "{url}" in template and "{account_id}" in template
+    # Neither account says `account_id`: each id is read out of the role's ARN.
+    assert (live.account_id, backup.account_id) == ("000000000000", "000000000001")
+
+
+def test_the_check_example_shows_an_account_id_that_loads() -> None:
+    """In quotes, as the comment beside it asks — and on the account whose role says
+    the same, since one beside a role in another account is refused."""
+    (shown,) = _shown("account_id")
+    config = _check_config()
+    config["accounts"][1]["account_id"] = shown
+    check = AwsCheck.from_config(config, EXAMPLES / "checks")
+    assert isinstance(check, AwsCheck)
+    assert check.accounts[1].account_id == shown == "000000000001"
+
+
+def test_the_readme_s_console_link_example_loads_as_it_is_written() -> None:
+    """The README shows the template on a check and on an account that names no role.
+    That block is read here beside the two keys every check file has, and says what
+    the paragraph around it says: one id read out of a role, one said, and the
+    account's own template in place of the check's."""
+    readme = (EXAMPLES.parent / "README.md").read_text(encoding="utf-8")
+    blocks = [block for block in re.findall(r"```yaml\n(.*?)```", readme, re.DOTALL)
+              if "console_link:" in block]
+    assert len(blocks) == 1, "the README shows `console_link:` in one block"
+    config = {"type": "aws", "path": "/team/aws", **yaml.safe_load(blocks[0])}
+    check = AwsCheck.from_config(config, EXAMPLES)
+    assert isinstance(check, AwsCheck)
+
+    live, sandbox = check.accounts
+    assert (live.role_arn != "", sandbox.role_arn) == (True, "")
+    assert (live.account_id, sandbox.account_id) == ("000000000000", "000000000001")
+    assert check.console_link_for(live) == check.console_link != ""
+    assert check.console_link_for(sandbox) == sandbox.console_link
+    assert sandbox.console_link not in ("", check.console_link)

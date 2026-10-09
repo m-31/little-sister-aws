@@ -6,7 +6,10 @@ session whose credentials have been **proven**. Beside it lives everything that
 answers an *expired* login: :func:`login_capability` (whether ``aws sso login``
 could work on this machine at all), :func:`run_sso_login` (the one place a
 subprocess starts) and :data:`SSO_LOGINS` (one instance per process, so two
-callers behind one profile cannot both open a browser).
+callers behind one profile cannot both open a browser). :data:`SERVICE_MODELS` is
+the other thing here that belongs to the process: the one loader of service models
+every session :func:`new_session` builds is built on, so that a service's model is
+parsed once in a process and not once a session.
 
 This is the package's second public surface, and it exists because the ``aws``
 check is no longer the only thing in a process that has to open a session: a
@@ -46,6 +49,7 @@ import boto3
 import botocore.session
 from boto3.session import Session
 from botocore.exceptions import BotoCoreError, ClientError
+from botocore.loaders import Loader, create_loader
 from little_sister import process
 from little_sister.checks import CheckError, parse_duration, plain
 from little_sister.spans import format_span
@@ -398,15 +402,107 @@ class SessionFactory(Protocol):
                  profile_name: str = "") -> Session: ...
 
 
+# --- one loader of service models for every session --------------------------
+#
+# botocore gives every core session a loader of service models of its own, built
+# on first use, and boto3 builds every session on a core session of its own. A
+# loader parses a service's model — the JSON of its operations and shapes, and the
+# endpoint ruleset beside it — for the first client of that service and keeps what
+# it parsed in caches of its own. So a session that lives one run parses the
+# models of every service it opens on every run, three accounts parse them three
+# times, and all of it is garbage the cycle collector frees when it chooses: most
+# of what a process of the check weighs (ADR-0011). The seam botocore leaves is
+# the component: a core session reads its loader with `get_component('data_loader')`
+# whenever it builds a client, and `register_component` replaces the one it would
+# otherwise build on first use.
+
+
+class _SearchPaths(list[str]):
+    """A loader's search path, which takes a directory once.
+
+    boto3 appends its own ``data`` directory to the loader of every session it
+    builds — one line on a loader that was one session's, and one line more for
+    every session on a loader every session shares, for as long as the process
+    runs. The loader walks this list for every model it has not cached.
+    """
+
+    def append(self, path: str) -> None:
+        if path not in self:
+            super().append(path)
+
+
+def _loader(data_path: str | None) -> Loader:
+    """botocore's own loader for *data_path* — :func:`~botocore.loaders.create_loader`,
+    which is what gives ``AWS_DATA_PATH`` its meaning — on a search path that takes a
+    directory once. Built twice because the search path is set in the constructor and
+    read-only after it; neither construction reads a file."""
+    built = create_loader(data_path)
+    return Loader(extra_search_paths=_SearchPaths(built.search_paths),
+                  include_default_search_paths=False)
+
+
+class ServiceModels:
+    """The loaders of service models every session this package builds is built
+    on: one for each search path, built on first use and kept for the life of the
+    process.
+
+    Process-wide for the reason :class:`SsoLogins` is: the models are the
+    process's, not a caller's. A check, a second check and the secret provider in
+    one process each open sessions of their own, and a loader that lived with any
+    of them would parse the models once for each. Keyed by the search path a
+    session resolves — ``AWS_DATA_PATH``, or ``data_path`` in a profile's section
+    of the config file — because that path is botocore's rule for where a model is
+    found: a session that names another path is built on a loader of that path,
+    as botocore would have built it, and a process that names none has one loader.
+
+    A loader's caches are per instance and filled on first use, under no lock: two
+    threads that open the first client of one service at the same moment parse
+    its model twice, and the cache keeps the one stored last. Each thread holds a
+    whole model, and what botocore writes into loaded data after the load — the
+    extras merged into a model, the references resolved in the retry
+    configuration — a second writer sets to what the first set (ADR-0011).
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._loaders: dict[str | None, Loader] = {}
+
+    def loader(self, data_path: str | None) -> Loader:
+        """The loader for *data_path*, built on first use."""
+        with self._lock:
+            loader = self._loaders.get(data_path)
+            if loader is None:
+                loader = self._loaders[data_path] = _loader(data_path)
+            return loader
+
+
+#: The one instance. Module state, for the reason :class:`ServiceModels` gives.
+SERVICE_MODELS = ServiceModels()
+
+
 def new_session(*, aws_access_key_id: str = "", aws_secret_access_key: str = "",
                 aws_session_token: str = "", profile_name: str = "") -> Session:
-    """Build one boto3 session. Empty credentials mean the ambient chain; an
-    empty profile means whichever one that chain would pick for itself."""
+    """Build one boto3 session, on a core session that carries the process's
+    loader of service models (:data:`SERVICE_MODELS`). Empty credentials mean the
+    ambient chain; an empty profile means whichever one that chain would pick for
+    itself.
+
+    The core session is built as boto3 builds its own, with the profile set on it
+    first so that the search path it resolves is the profile's, and the loader is
+    registered before boto3 sees the session: boto3 reads the component as it
+    builds the session, and every client reads it after.
+    """
+    core = botocore.session.get_session()
+    if profile_name:
+        core.set_config_variable("profile", profile_name)
+    data_path: str | None = core.get_config_variable("data_path")
+    core.register_component("data_loader", SERVICE_MODELS.loader(data_path))
     return boto3.Session(
         aws_access_key_id=aws_access_key_id or None,
         aws_secret_access_key=aws_secret_access_key or None,
         aws_session_token=aws_session_token or None,
-        profile_name=profile_name or None)
+        profile_name=profile_name or None,
+        botocore_session=core)
 
 
 def base_session(identity: Identity, *,

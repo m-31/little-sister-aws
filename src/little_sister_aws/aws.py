@@ -128,6 +128,9 @@ from little_sister_aws.identity import (
 )
 
 if TYPE_CHECKING:
+    # The record a check's history holds, for its type only: what `kept()` answers.
+    from little_sister.series import SeriesRecord
+
     # The service clients, for their **types** only: `boto3-stubs`' per-service
     # extras are a dev dependency, so these names must not be imported at run
     # time. They are why ADR-0001 §3 bought the extras at all — without them every
@@ -328,15 +331,29 @@ _LOG_PAGES = 4
 #: have been seen while it was fresh.
 DEFAULT_ERROR_MAX_AGE_SECONDS = 14 * 86400
 
+#: How long an error the function saw is **held** on its line once clean runs have
+#: followed it (ADR-0012). An hour, because an hour is the smallest window any
+#: function is asked at one minute, so a hold inside it costs no request anywhere —
+#: and because the engine holds its own lines' worst for a window for the same
+#: reason: a verdict that stands one tick is two events and no information. A
+#: deployment says otherwise per block or per rule; ``0s`` is no hold.
+DEFAULT_ERROR_HOLD_SECONDS = 3600
+
+#: The longest hold the type can read: an error is held beside the clean runs that
+#: followed it only where both are one-minute points, and CloudWatch keeps those
+#: for fifteen days (:data:`_ERROR_PERIODS`). Past that a hold would end silently
+#: where the points end, so a longer one is refused where the check loads.
+MAX_ERROR_HOLD_SECONDS = 15 * 86400
+
 #: ``PipelineExecutionStatus`` → the code that line reports, keyed in lower case
 #: because CodePipeline spells its statuses in mixed case where CloudWatch shouts
-#: them. ``InProgress`` is a warning and
-#: *everything* that is not ``Succeeded`` is an error — a stopped, canceled or
-#: superseded run still means the newest thing this pipeline did was not a
-#: deployment.
+#: them. ``Succeeded`` passes and so does ``InProgress``: an execution in flight is a
+#: deployment under way, and how long one may take is ``max_run_time`` (ADR-0014
+#: §1). *Everything else* is an error — a stopped, canceled or superseded run still
+#: means the newest thing this pipeline did was not a deployment.
 DEFAULT_PIPELINE_STATE_MAP = {
     "succeeded": StatusCode.OK,
-    "inprogress": StatusCode.WARN,
+    "inprogress": StatusCode.OK,
     "failed": StatusCode.ERROR,
     "stopped": StatusCode.ERROR,
     "stopping": StatusCode.ERROR,
@@ -353,9 +370,10 @@ DEFAULT_PIPELINE_STATE_MAP = {
 #: How many executions of one pipeline one poll asks for: one page, the largest
 #: CodePipeline answers. ``list_pipeline_executions`` returns them newest first, and
 #: the newest is found by comparing every summary returned rather than by trusting
-#: that order. Where the check keeps a series, the executions a poll reads behind
-#: the newest come out of the same page (ADR-0009 §5), so reading them asks for
-#: nothing more.
+#: that order. The one a pipeline's line is written from while the newest is in
+#: flight, and every one in flight, come out of the same page (ADR-0014 §2), and so,
+#: where the check keeps a series, do the executions a poll reads behind the newest
+#: (ADR-0009 §5): reading them asks for nothing more.
 _EXECUTIONS_PAGE = 100
 
 #: The statuses in which CodePipeline says an execution is over, lowercased as a
@@ -365,32 +383,78 @@ _EXECUTIONS_PAGE = 100
 _EXECUTION_ENDED = frozenset(
     {"succeeded", "failed", "stopped", "superseded", "cancelled"})
 
+#: The statuses in which an execution is **in flight**, lowercased as a status word
+#: is compared: the two words of one on its way (ADR-0008 §3). While one is, its
+#: pipeline's line keeps what the newest finished execution did, says what is in
+#: flight beside it and is marked running (ADR-0014 §2). Listed rather than derived
+#: from :data:`_EXECUTION_ENDED`: a word CodePipeline adds ends nothing, and it is
+#: not taken for work in flight either until this type knows it (little-sister
+#: ADR-0032 rule 7).
+_EXECUTION_IN_FLIGHT = frozenset({"inprogress", "stopping"})
+
+#: The statuses an execution is retried from, lowercased: CodePipeline runs a failed
+#: or a stopped execution again, under its own id and from the start it had
+#: (ADR-0014 §5). Where the history holds an execution in one of them and the page
+#: has it in flight again, its action executions are asked for.
+_EXECUTION_RETRIED_FROM = frozenset({"failed", "stopped"})
+
+#: How many of one execution's action executions a poll asks for while the execution
+#: is retried: one page, the largest CodePipeline answers.
+_ACTIONS_PAGE = 100
+
+#: How long an execution may be in flight before its pipeline's line warns: the
+#: default of ``max_run_time``, and the one ``_warn`` / ``_error`` pair of this type
+#: that has a default (ADR-0014 §3). ``InProgress`` warned from an execution's first
+#: second until then, so thirty minutes takes no warning from an installation that
+#: had one and gives none it did not have. ``max_run_time: null`` switches it off.
+DEFAULT_PIPELINE_RUN_TIME = Threshold(warn=30 * 60)
+
 #: The status of an execution a newer one overtook, lowercased as a status word is
 #: compared. Read behind its pipeline's newest, such an execution is said nothing of
 #: for the record: it neither failed nor deployed (ADR-0009 §6).
 _SUPERSEDED = "superseded"
 
-#: The Batch job statuses this aspect reads. The first two are a *finished* run,
-#: the third is work in flight. ``RUNNABLE`` is the fourth and the one easiest to
-#: leave out: the queue accepted the job and no compute environment has capacity
-#: for it, so it waits, silently, and the queue looks idle while it does.
-#: Typed as Batch's own literal, so a fifth status invented here is a mypy error
-#: rather than an ``InvalidParameterValue`` at run time — which is exactly what
-#: the per-service stubs are for.
+#: The Batch job statuses this aspect reads: **every one Batch has**. A queue's node
+#: says that its job names are complete in every run that lists it (ADR-0009 §2), so
+#: a name whose only listed job is in a status nobody asked for would leave the tree
+#: for that poll and come back with the next. Each status is a ``ListJobs`` call of its
+#: own, as the call answers them: a filter answers every status at once, but newest
+#: first across all of them, and a job that has run or waited for long would fall
+#: behind newer ones that finished. Three words are written of the seven:
+#:
+#: * *finished* — ``SUCCEEDED`` and ``FAILED``;
+#: * *running* — ``RUNNING``, and ``STARTING``, which a job passes through on its way
+#:   there and which has no start yet to be counted from;
+#: * *waiting* — ``RUNNABLE``, the one easiest to leave out: the queue accepted the
+#:   job and no compute environment has capacity for it, so it waits, silently, and
+#:   the queue looks idle while it does; and ``SUBMITTED`` and ``PENDING``, a job not
+#:   yet placed, or held by a job it depends on. An array job's parent is ``PENDING``
+#:   while its children run.
+#:
+#: Typed as Batch's own literal, so a status invented here is a mypy error rather than
+#: an ``InvalidParameterValue`` at run time — which is exactly what the per-service
+#: stubs are for.
 BATCH_FINISHED_STATUSES: tuple[JobStatusType, ...] = ("SUCCEEDED", "FAILED")
-BATCH_RUNNING_STATUS: JobStatusType = "RUNNING"
-BATCH_WAITING_STATUS: JobStatusType = "RUNNABLE"
+BATCH_RUNNING_STATUSES: tuple[JobStatusType, ...] = ("RUNNING", "STARTING")
+BATCH_WAITING_STATUSES: tuple[JobStatusType, ...] = (
+    "RUNNABLE", "PENDING", "SUBMITTED")
+#: The waiting status that waits *for capacity*, which a job name's line names as such
+#: where every job it counts as waiting is in it.
+BATCH_CAPACITY_STATUS: JobStatusType = "RUNNABLE"
 BATCH_STATUSES: tuple[JobStatusType, ...] = (
-    *BATCH_FINISHED_STATUSES, BATCH_RUNNING_STATUS, BATCH_WAITING_STATUS)
+    *BATCH_FINISHED_STATUSES, *BATCH_RUNNING_STATUSES, *BATCH_WAITING_STATUSES)
 
 #: How long a Batch job may run before its line warns. Warning at the *existence*
 #: of a running job would be a permanent yellow on any queue that is doing its
 #: work, and a permanent yellow is a light people stop reading.
 DEFAULT_BATCH_MAX_RUN_SECONDS = 2 * 3600
 
-#: How long a job may sit in ``RUNNABLE`` before its line warns. This is the
-#: reading easiest to omit: a job that cannot be placed is not
-#: slow, it is stuck, and the queue looks idle while it happens.
+#: How long a job may wait — submitted, pending or runnable — before its line warns,
+#: counted from its submission. This is the reading easiest to omit: a job that
+#: cannot be placed is not slow, it is stuck, and the queue looks idle while it
+#: happens. A job held by one it depends on waits too, and so does an array job's
+#: parent while its children run: a deployment whose arrays run longer says so in
+#: ``max_wait_time``.
 DEFAULT_BATCH_MAX_WAIT_SECONDS = 30 * 60
 
 #: How many jobs are read per queue per status. ``list_jobs`` returns the newest
@@ -603,6 +667,15 @@ days, error at fourteen" is not a sentence about a gate. It keeps its default fo
 the same reason — where the clock ends is a fact about CloudWatch rather than
 about your estate.
 
+**An error the function saw is held on its line for `error_hold`** — an hour
+unless the block or a rule says otherwise, and never longer than `error_max_age`
+where nobody does — so that an error between two clean runs is not ERROR for one
+poll and OK the next: while the newest error is younger than the hold the line
+stays ERROR and says how many errors the hold holds, when the newest was and
+what ran clean since (*1 error in the last 1h, 23m ago · 4 clean runs since, the
+last 2m ago*). The newest run being the error reads as it always did.
+`error_hold: 0s` is no hold, and a hold written longer than the gate is refused.
+
 `error_reason` and `silent_reason` are the sentences those two judgments say
 when they fire, and **`rules:` gives a set of functions its own** — matched by
 exact `names:`, by `prefixes:` or by `regexes:`, first match winning, a key the
@@ -636,19 +709,35 @@ rules:
 Every CodePipeline pipeline in this account, a node each, whose line shows what
 the pipeline's **most recent execution** did and when that execution started.
 
-`Succeeded` passes, `InProgress` warns while it is in flight, and everything
-else — `Failed`, `Stopped`, `Stopping`, `Cancelled`, `Superseded` — is an error,
-because the newest thing the pipeline did was not a deployment. `state_map:` is
-how an installation disagrees with any of that.
+`Succeeded` passes, and everything else — `Failed`, `Stopped`, `Cancelled`,
+`Superseded` — is an error, because the newest thing the pipeline did was not a
+deployment. `state_map:` is how an installation disagrees with any of that.
+
+**While an execution is in flight** — `InProgress` or `Stopping` — the line keeps
+what the newest *finished* execution did and says what is in flight beside it, in
+italics: a pipeline whose last execution failed stays red while a new one runs,
+and turns green only once one succeeds. What is in flight can make the line worse
+and never better. Its status counts as `state_map` says — `InProgress` passes and
+`Stopping` is an error — and one in flight for longer than `max_run_time`, 30
+minutes unless the check says otherwise, warns.
 
 **Where the check keeps a series (`series_keep`), a pipeline's executions are
 kept.** A poll reads the newest, and behind it every execution the pipeline's
 history lacks or holds unfinished — as many as the series keeps, and no more than
 the hundred one page holds — each with `duration_s`, how long it took, once it is
-over. The pipeline's node draws them at the times they started. The newest is
-marked as the pipeline's line stands, and every one read behind it by what its
-status means in `state_map`. One that a newer execution overtook, `Superseded`, is
-marked as neither: it did not fail, and it did not deploy.
+over. The pipeline's node draws them at the times they started. The one the line
+is written from is marked as the line stands, and every other one by what its
+status means in `state_map`, raised past `max_run_time` while it is in flight. One
+that a newer execution overtook, `Superseded`, is marked as neither: it did not
+fail, and it did not deploy.
+
+**A retried stage keeps its pipeline red.** A retry of a failed stage runs the
+failed execution again, under its own id, so while it runs no page shows the
+failure. Where the check keeps a series, the history does: the execution is
+asked about — `ListActionExecutions`, which the role must allow — and the line
+keeps the status it had ended in, in italics, until it succeeds, `max_run_time`
+counted from the retry's own start. A refusal warns and says why. Without a
+series, a retry is read as a first run.
 
 **A success is also only good for so long.** Past `max_age_warn` the line warns
 and past `max_age_error` it burns, on the grounds that a pipeline nobody has run
@@ -670,6 +759,7 @@ rules:
   - name: release pipelines
     prefixes: [release-]
     max_age: null            # runs when we release; never stale
+    max_run_time: null       # waits at an approval for as long as it takes
 ```
 
 A pipeline that has **never been executed** warns rather than being left out.
@@ -692,10 +782,12 @@ node for every job *name* in it — jobs are submitted over and over under the s
 name, so the name is the thing worth watching and a single submission is not.
 
 A job name's line carries up to three readings at once: how the newest
-**finished** run ended and how long it took, how many are **running** and how
-long the oldest of those has been going, and how many are **runnable** — accepted
-by the queue and waiting for capacity that has not appeared. A failure is an
-error; a run past `max_run_time` or a wait past `max_wait_time` warns.
+**finished** run ended and how long it took, how many are **running** — or
+starting — and how long the oldest of those has been going, and how many are
+**waiting**, counted from when they were submitted: for capacity that has not
+appeared, for a job they depend on, or, an array job, for its children to finish.
+A failure is an error; a run past `max_run_time` or a wait past `max_wait_time`
+warns. While a job of the name runs or waits, its line is set in italics.
 
 **Where the check keeps a series (`series_keep`), a job name's runs are kept**,
 each with `wait_s` and `duration_s`, how long it waited and how long it ran. The
@@ -736,6 +828,14 @@ class Account:
     the check's own: it names the ``~/.aws/config`` profile the role is assumed
     **from**, and empty means the check's — which, empty in turn, means the
     ambient chain, ``AWS_PROFILE`` included.
+
+    ``account_id`` is AWS's own id of the account as far as the configuration says
+    it — the entry's ``account_id``, or the one its ``role_arn`` names — and empty
+    where it says neither (ADR-0013 §3). It goes into a link where a template names
+    it, and nowhere else: a path, a slug, a subject and a record name the account
+    by ``name``. ``console_link`` is the account's own template for its links and
+    replaces the check's, as ``regions`` and ``profile`` do; empty means the
+    check's (ADR-0013 §1).
     """
 
     name: str
@@ -744,6 +844,8 @@ class Account:
     profile: str = ""
     title: str = ""
     about: str = ""
+    account_id: str = ""
+    console_link: str = ""
 
 
 @dataclass(frozen=True)
@@ -836,6 +938,13 @@ class FunctionReading:
     ``log_error`` what AWS answered where the log could not be read at all: kept
     apart, because a reading keeps what AWS said and the sentence around it is the
     line's (:attr:`notes`).
+
+    ``error_at`` is the newest bucket with an error in the window the function was
+    asked at one minute — the newest run itself, where that run failed — and
+    ``clean_since`` the buckets after it, all clean by definition; ``held_errors``
+    is what the buckets inside this function's hold count together (ADR-0012). Facts
+    from the same answer as the newest run, read at no request more; whether the
+    error is still graded is the grading's, against the hold and the clock.
     """
 
     name: str
@@ -845,6 +954,9 @@ class FunctionReading:
     log_status: str = ""
     log_note: str = ""
     log_error: str = ""
+    error_at: datetime | None = None
+    held_errors: int = 0
+    clean_since: int = 0
 
     @property
     def notes(self) -> tuple[str, ...]:
@@ -924,6 +1036,12 @@ class LambdaConfig(_Shortened):
     #: longer means what it says. That is a fact about CloudWatch, not an opinion
     #: about somebody's estate.
     error_max_age_seconds: int = DEFAULT_ERROR_MAX_AGE_SECONDS
+    #: How long an error is held on the line once clean runs have followed it
+    #: (ADR-0012); zero is no hold, and ``None`` is a block that writes none, whose
+    #: functions take the default up to their gate (:meth:`hold_for`). A hold that
+    #: is written is never longer than the gate — the parser refuses that — since an
+    #: error older than the gate is not graded at all.
+    error_hold_seconds: int | None = None
     read_log_status: bool = True
     #: Whether a function nobody has invoked in the retention window is a
     #: finding. It is, for a scheduled job; it is not for a handler that runs
@@ -951,6 +1069,22 @@ class LambdaConfig(_Shortened):
         own = None if rule is None else rule.value("error_max_age")
         return own if isinstance(own, int) and not isinstance(own, bool) \
             else self.error_max_age_seconds
+
+    def hold_for(self, rule: Rule | None) -> int:
+        """How long an error the function saw is held on its line, for this
+        function (ADR-0012 §2): the rule's, or the block's — and where neither
+        writes one, an hour or the gate that applies, whichever is shorter, so a
+        default never refuses a gate that loaded before the hold existed."""
+        own = self.written_hold(rule)
+        return own if own is not None else min(DEFAULT_ERROR_HOLD_SECONDS,
+                                               self.gate_for(rule))
+
+    def written_hold(self, rule: Rule | None) -> int | None:
+        """The hold the configuration writes for this function — the rule's, or
+        the block's — and ``None`` where neither writes one."""
+        own = None if rule is None else rule.value("error_hold")
+        return own if isinstance(own, int) and not isinstance(own, bool) \
+            else self.error_hold_seconds
 
     def expects_invocations(self, rule: Rule | None) -> bool:
         own = None if rule is None else rule.value("expect_invocations")
@@ -1055,7 +1189,9 @@ class PipelineReading:
     is the id CodePipeline gives the execution: the event this reading is of
     (ADR-0005 §5). ``updated`` is the last change CodePipeline recorded of that
     execution, which is its end once the execution is over (ADR-0008 §2): no line
-    says it, and the record's ``duration_s`` is counted to it.
+    says it, and the record's ``duration_s`` is counted to it. ``retry`` is what
+    CodePipeline answered of the execution's action executions, asked while it runs
+    again after it had ended failed or stopped (ADR-0014 §5), and none otherwise.
     """
 
     name: str
@@ -1064,6 +1200,34 @@ class PipelineReading:
     started: datetime | None = None
     execution_id: str = ""
     updated: datetime | None = None
+    retry: Retry | None = None
+
+
+@dataclass(frozen=True)
+class Retry:
+    """What CodePipeline answered of one execution's action executions, asked while the
+    execution runs again after it had ended failed or stopped (ADR-0014 §5): how many
+    of them failed and how many were abandoned, and when the first of those that
+    started after the last failed or abandoned one had ended began — the retry's own
+    start, which ``max_run_time`` counts from. ``error`` is what the call was refused
+    with, where it was, and then nothing else is known."""
+
+    failed: int = 0
+    abandoned: int = 0
+    started: datetime | None = None
+    error: str = ""
+
+    @property
+    def ended(self) -> str:
+        """The status the execution had ended in, as its action executions show it:
+        ``Failed`` where one of them failed, ``Stopped`` where one was abandoned, and
+        nothing where neither did or nothing was answered — then nothing here says
+        that it had ended."""
+        if self.error:
+            return ""
+        if self.failed:
+            return "Failed"
+        return "Stopped" if self.abandoned else ""
 
 
 @dataclass(frozen=True)
@@ -1071,6 +1235,7 @@ class CodePipelineConfig(_Shortened):
     """The `codepipeline:` block."""
 
     age: Threshold = UNGRADED
+    run_time: Threshold = DEFAULT_PIPELINE_RUN_TIME
     rules: tuple[Rule, ...] = ()
     state_map: dict[str, StatusCode] = field(
         default_factory=lambda: dict(DEFAULT_PIPELINE_STATE_MAP))
@@ -1087,6 +1252,14 @@ class CodePipelineConfig(_Shortened):
         nightly and one that runs at a release are not stale at the same age,
         which is the whole reason a rule can carry its own."""
         return resolved(rule, "max_age", self.age)
+
+    def run_time_for(self, rule: Rule | None) -> Threshold:
+        """How long an execution of one pipeline may be in flight before its line
+        warns. A pipeline that waits at a manual approval and one that deploys in
+        five minutes do not overrun at the same age, which is why a rule can carry
+        its own — or ``max_run_time: null``, under which nothing overruns
+        (ADR-0014 §3)."""
+        return resolved(rule, "max_run_time", self.run_time)
 
     def code_for(self, status: str) -> StatusCode:
         # An unknown status is not a quiet OK, for the reason the alarm aspect
@@ -1199,6 +1372,20 @@ def _parse_regions(value: object, where: str) -> tuple[str, ...]:
     return regions
 
 
+def _optional_text(entry: Mapping[str, Any], key: str, where: str) -> str:
+    """One optional string of this check's configuration, or ``""`` where its key
+    is not written: read by the identity seam's reader
+    (`identity.parse_optional_text`), and refused in this check's words and as the
+    `CheckError` that pins this check and nothing else."""
+    try:
+        return parse_optional_text(entry, key, where=where)
+    except OptionalTextError as error:
+        if error.kind == "not-text":
+            raise CheckError(f"{where} must be text, got "
+                             f"{type(error.got).__name__}") from error
+        raise CheckError(f"{where} must not be empty") from error
+
+
 def _parse_profile(entry: Mapping[str, Any], where: str) -> str:
     """An ``~/.aws/config`` profile name, or ``""`` where none is written.
 
@@ -1215,16 +1402,146 @@ def _parse_profile(entry: Mapping[str, Any], where: str) -> str:
     different command from the one that runs. Neither is a legal profile name
     anyway.
     """
-    try:
-        profile = parse_optional_text(entry, "profile", where=where)
-    except OptionalTextError as error:
-        if error.kind == "not-text":
-            raise CheckError(f"{where} must be text, got "
-                             f"{type(error.got).__name__}") from error
-        raise CheckError(f"{where} must not be empty") from error
+    profile = _optional_text(entry, "profile", where)
     if any(ch in profile for ch in "`\n\r"):
         raise CheckError(f"{where} must not contain a backtick or a newline")
     return profile
+
+
+#: What a ``console_link`` template may name (ADR-0013 §2): the console's address
+#: of what a line names, as this type builds it, and the account's id. A token is
+#: a name in braces and every value is percent-encoded whole as it goes in, which
+#: is how little-sister fills the URL of a configured action (little-sister
+#: ADR-0038) — one way to fill a URL template in the family, not two.
+CONSOLE_LINK_TOKENS = ("url", "account_id")
+
+#: One token of a template. The library's own spelling of one, so a brace around
+#: anything but lower-case letters and underscores is text of the address.
+_TOKEN = re.compile(r"\{([a-z_]*)\}")
+
+#: What a template may not hold, beside whitespace and control characters
+#: (ADR-0013 §2). The address it produces is written as the destination of a
+#: Markdown link and, on the card, inside a code span: a parenthesis, an angle
+#: bracket or a backslash would end or bend the first, and a backtick the second.
+#: Each is a character a URL carries percent-encoded.
+_NOT_IN_A_LINK = "`\\()<>"
+
+#: An AWS account id: twelve digits, and nothing else.
+_ACCOUNT_ID = re.compile(r"[0-9]{12}")
+
+#: An IAM role's ARN, for the account it names:
+#: ``arn:<partition>:iam::<account id>:role/<path and name>``. The partition is
+#: whatever AWS calls it — ``aws``, ``aws-cn``, ``aws-us-gov`` — so none is listed.
+_ROLE_ARN = re.compile(r"arn:[^:]+:iam::([0-9]{12}):role/.+")
+
+
+def _tokens(template: str) -> set[str]:
+    """The tokens a template names."""
+    return set(_TOKEN.findall(template))
+
+
+def _parse_console_link(entry: Mapping[str, Any], where: str) -> str:
+    """One ``console_link``: the template an account's links are wrapped in, or
+    ``""`` where none is written (ADR-0013 §2).
+
+    Read as `profile:` is — a key written and left empty is a typo, and so is a
+    value that is not text — and then held to what a template is: written as a
+    URL is, naming no token but the two this type fills, and naming ``{url}``,
+    without which every link of an account would open one address under a name
+    that promises one thing's page. ``{account_id}`` is optional: a template may
+    carry an id its author wrote into it, or wrap a link in something that needs
+    none. Whether the account under a template **has** the id it names is decided
+    once the accounts are read (:func:`_hold_account_ids`).
+    """
+    template = _optional_text(entry, "console_link", where)
+    if not template:
+        return ""
+    unwritable = sorted({char for char in template
+                         if char in _NOT_IN_A_LINK or char.isspace()
+                         or ord(char) < 32 or ord(char) == 127})
+    if unwritable:
+        raise CheckError(
+            f"{where} holds {', '.join(repr(char) for char in unwritable)} — "
+            f"whitespace, a backtick, a backslash, a parenthesis and an angle "
+            f"bracket are written percent-encoded in a URL, and as they are would "
+            f"end the link a line writes")
+    named = _tokens(template)
+    unknown = sorted(named - set(CONSOLE_LINK_TOKENS))
+    if unknown:
+        raise CheckError(
+            f"{where} names {', '.join('{' + token + '}' for token in unknown)} — "
+            f"a template may name "
+            f"{' and '.join('{' + token + '}' for token in CONSOLE_LINK_TOKENS)}")
+    if "url" not in named:
+        raise CheckError(
+            f"{where} names no {{url}}, so every link would open one address — "
+            f"{{url}} is where the console's address of what a line names goes")
+    return template
+
+
+def _role_account(role_arn: str) -> str:
+    """The id of the account a role is in, out of the role's ARN, and ``""`` for a
+    value that is no IAM role's ARN and so names none (ADR-0013 §3). A role is in
+    the account it reads, which is why this id cannot be another account's."""
+    found = _ROLE_ARN.fullmatch(role_arn)
+    return found.group(1) if found else ""
+
+
+def _parse_account_id(entry: Mapping[str, Any], name: str, role_arn: str) -> str:
+    """AWS's id of one account, as its entry says it (ADR-0013 §3): the
+    ``account_id`` it writes, or the one its ``role_arn`` names, and ``""`` where
+    it says neither.
+
+    ``account_id`` is the twelve digits of the id. It is written in quotes,
+    because YAML reads an unquoted number that starts with ``0`` as another
+    number — as an octal one where every digit allows it — and what then arrives
+    is no twelve digits, and is refused. An unquoted number that *is* twelve
+    digits was written as one, and is taken. Written beside a ``role_arn`` that
+    names another account it is refused: a role is in the account it reads, so
+    one of the two is wrong. Neither refusal repeats an id.
+    """
+    named = _role_account(role_arn)
+    if "account_id" not in entry:
+        return named
+    value = entry["account_id"]
+    if isinstance(value, int):
+        # A number YAML read: twelve digits where it was written as twelve, and
+        # anything else — a `true` among them — no id, which the next line says.
+        value = str(value)
+    if not isinstance(value, str) or not _ACCOUNT_ID.fullmatch(value.strip()):
+        raise CheckError(
+            f"account {name!r} 'account_id' must be the twelve digits of an AWS "
+            f"account id, in quotes — YAML reads an unquoted number that starts "
+            f"with 0 as another number")
+    written = value.strip()
+    if named and written != named:
+        raise CheckError(
+            f"account {name!r} names two accounts: its 'account_id' is not the "
+            f"account its 'role_arn' is in. A role is in the account it reads, so "
+            f"one of the two is wrong")
+    return written
+
+
+def _hold_account_ids(accounts: Sequence[Account], console_link: str) -> None:
+    """Refuse a template that names ``{account_id}`` over an account whose
+    configuration says no id (ADR-0013 §3) — the account's own template, or the
+    check's where it wrote none.
+
+    Refused rather than left unwrapped: that account's links would be the
+    console's own, which open in whichever account the browser is signed in to,
+    beside the wrapped links of every other account — the failure a template is
+    set against, kept for one account and said nowhere a reader of the node
+    would see it."""
+    for account in accounts:
+        template = account.console_link or console_link
+        if "account_id" not in _tokens(template) or account.account_id:
+            continue
+        lacking = ("its 'role_arn' names none" if account.role_arn
+                   else "it names no 'role_arn' to read one from")
+        raise CheckError(
+            f"account {account.name!r} has no account id, and the 'console_link' "
+            f"its links are wrapped in names {{account_id}}: {lacking}, so write "
+            f"'account_id:' on the account")
 
 
 #: The subject of every ``sso:`` sentence below, and the ``where`` the shared
@@ -1282,7 +1599,8 @@ def _parse_accounts(value: object) -> tuple[Account, ...]:
         raise CheckError(
             "aws check requires a non-empty 'accounts:' list, each entry a "
             "mapping with a 'name' and an optional 'role_arn'")
-    known = {"name", "role_arn", "regions", "profile", "title", "about"}
+    known = {"name", "role_arn", "regions", "profile", "title", "about",
+             "account_id", "console_link"}
     accounts: list[Account] = []
     seen: set[str] = set()
     for entry in value:
@@ -1302,14 +1620,18 @@ def _parse_accounts(value: object) -> tuple[Account, ...]:
                 f"(an account takes: {', '.join(sorted(known))})")
         seen.add(name)
         regions = entry.get("regions")
+        role_arn = str(entry.get("role_arn", "")).strip()
         accounts.append(Account(
             name=name,
-            role_arn=str(entry.get("role_arn", "")).strip(),
+            role_arn=role_arn,
             regions=(() if regions is None
                      else _parse_regions(regions, f"account {name!r} 'regions'")),
             profile=_parse_profile(entry, f"account {name!r} 'profile'"),
             title=str(entry.get("title", "")),
             about=str(entry.get("about", "")),
+            account_id=_parse_account_id(entry, name, role_arn),
+            console_link=_parse_console_link(
+                entry, f"account {name!r} 'console_link'"),
         ))
     return tuple(accounts)
 
@@ -1450,8 +1772,8 @@ def _inherited_shorten(value: dict[str, Any], where: str,
 #: the newest error is graded at all, not a threshold to split into levels, and
 #: "warn at seven days, error at fourteen" is not a sentence about a gate. What it
 #: takes from the vocabulary is the rules and the sentences (ADR-0003).
-LAMBDA_RULE_KEYS = ("error_max_age", "read_log_status", "expect_invocations",
-                    "error_reason", "silent_reason")
+LAMBDA_RULE_KEYS = ("error_max_age", "error_hold", "read_log_status",
+                    "expect_invocations", "error_reason", "silent_reason")
 
 
 def _sentence(block: dict[str, Any], key: str, where: str) -> str:
@@ -1475,6 +1797,8 @@ def _lambda_rule_extra(item: Mapping[str, Any],
             raise CheckError(
                 f"{rule_at}: 'error_max_age' must be a duration of at least 1s")
         values.append(("error_max_age", seconds))
+    if "error_hold" in item and item["error_hold"] is not None:
+        values.append(("error_hold", _error_hold(item["error_hold"], rule_at)))
     for key in ("read_log_status", "expect_invocations"):
         if key in item and item[key] is not None:
             values.append((key, _flag(item[key], f"{rule_at}: '{key}'")))
@@ -1488,6 +1812,35 @@ def _lambda_rule_extra(item: Mapping[str, Any],
             f"{rule_at}: 'silent_reason' is set but 'expect_invocations' is "
             f"false, so the sentence could never be shown")
     return tuple(values)
+
+
+def _error_hold(value: object, where: str) -> int | None:
+    """One `error_hold`: a duration, zero for none, and never past what CloudWatch
+    keeps at one minute (:data:`MAX_ERROR_HOLD_SECONDS`) — ``None`` where it is not
+    written, which leaves the default to :meth:`LambdaConfig.hold_for`."""
+    if value is None:
+        return None
+    seconds = parse_duration(value, DEFAULT_ERROR_HOLD_SECONDS)
+    if seconds < 0:
+        raise CheckError(f"{where}: 'error_hold' must be a duration, or 0s for none")
+    if seconds > MAX_ERROR_HOLD_SECONDS:
+        raise CheckError(
+            f"{where}: 'error_hold' {format_span(seconds)} is longer than the "
+            f"{format_span(MAX_ERROR_HOLD_SECONDS)} CloudWatch keeps a one-minute "
+            f"point for, so the hold could not be read to its end")
+    return seconds
+
+
+def _hold_within_gate(hold: int, gate: int, where: str) -> None:
+    """A written hold longer than the gate is refused rather than capped: an error
+    older than the gate is not graded at all, so the hold's tail would never stand,
+    and a knob capped silently stops meaning what it says. The default is no knob
+    anybody wrote, and is capped (:meth:`LambdaConfig.hold_for`)."""
+    if hold > gate:
+        raise CheckError(
+            f"{where}: 'error_hold' {format_span(hold)} is longer than "
+            f"'error_max_age' {format_span(gate)}, and an error older than the gate "
+            f"is not graded — shorten the hold or raise the gate")
 
 
 def _parse_lambda(value: object, shorten: tuple[tuple[str, str], ...] = ()
@@ -1509,6 +1862,9 @@ def _parse_lambda(value: object, shorten: tuple[tuple[str, str], ...] = ()
                              DEFAULT_ERROR_MAX_AGE_SECONDS)
     if max_age < 1:
         raise CheckError("lambda 'error_max_age' must be a duration of at least 1s")
+    hold = _error_hold(value.get("error_hold"), "lambda")
+    if hold is not None:
+        _hold_within_gate(hold, max_age, "lambda")
     expects = _flag(value.get("expect_invocations", True),
                     "lambda.expect_invocations")
     silent = _sentence(value, "silent_reason", "lambda")
@@ -1516,8 +1872,9 @@ def _parse_lambda(value: object, shorten: tuple[tuple[str, str], ...] = ()
         raise CheckError(
             "lambda 'silent_reason' is set but 'expect_invocations' is false, "
             "so the sentence could never be shown")
-    return LambdaConfig(
+    settings = LambdaConfig(
         error_max_age_seconds=max_age,
+        error_hold_seconds=hold,
         enabled=_flag(value.get("enabled", True), "lambda.enabled"),
         read_log_status=_flag(value.get("read_log_status", True),
                               "lambda.read_log_status"),
@@ -1529,12 +1886,22 @@ def _parse_lambda(value: object, shorten: tuple[tuple[str, str], ...] = ()
                           parse_extra=_lambda_rule_extra),
         shorten=_inherited_shorten(value, "lambda 'shorten'", shorten),
     )
+    # A rule inherits what it does not name, so a written hold — its own or the
+    # block's — is held against the gate that applies to its functions once both
+    # are known. A hold nobody wrote is the gate's at most, and needs no holding.
+    for rule in settings.rules:
+        written = settings.written_hold(rule)
+        if written is not None:
+            _hold_within_gate(written, settings.gate_for(rule),
+                              f"lambda rule {rule.name!r}")
+    return settings
 
 
-#: What the `codepipeline` aspect grades with a threshold of its own. Its other
-#: judgment — what a status *means* — is `state_map`, which is a mapping rather
-#: than a level and stays as it is.
-PIPELINE_PAIRS = (("max_age", True),)
+#: What the `codepipeline` aspect grades with a threshold of its own: how old a
+#: success may grow, and how long an execution may be in flight (ADR-0014 §3). Its
+#: other judgment — what a status *means* — is `state_map`, which is a mapping
+#: rather than a level and stays as it is.
+PIPELINE_PAIRS = (("max_age", True), ("max_run_time", True))
 
 
 def _parse_codepipeline(value: object,
@@ -1544,8 +1911,9 @@ def _parse_codepipeline(value: object,
         return CodePipelineConfig(shorten=shorten)
     if not isinstance(value, dict):
         raise CheckError("aws 'codepipeline' must be a mapping")
-    known = ({"enabled", "state_map", "shorten", "rules", "max_age"}
-             | threshold_keys("max_age"))
+    known = ({"enabled", "state_map", "shorten", "rules", "max_age",
+              "max_run_time"}
+             | threshold_keys("max_age") | threshold_keys("max_run_time"))
     unknown = sorted(str(key) for key in value if str(key) not in known)
     if unknown:
         # `ignore_name_patterns` arrives here now: ignoring is a rule action, so
@@ -1563,10 +1931,15 @@ def _parse_codepipeline(value: object,
         # neither should turn into a silently ignored entry.
         state_map.update({str(status).strip().lower(): coerce_code(code)
                           for status, code in configured.items()})
+    # Absent, the default; written, the pair as it is written, whole — a block that
+    # sets one level of it keeps no level of the default's, as a rule that sets one
+    # keeps none of the block's (ADR-0003 §4); `null`, nothing (ADR-0014 §3).
+    run_time = parse_pair(value, "max_run_time", "codepipeline", duration=True)
     return CodePipelineConfig(
         enabled=_flag(value.get("enabled", True), "codepipeline.enabled"),
         age=parse_pair(value, "max_age", "codepipeline",
                        duration=True) or UNGRADED,
+        run_time=DEFAULT_PIPELINE_RUN_TIME if run_time is None else run_time,
         rules=parse_rules(value.get("rules"), "codepipeline", PIPELINE_PAIRS),
         state_map=state_map,
         shorten=_inherited_shorten(value, "codepipeline 'shorten'", shorten),
@@ -1630,9 +2003,29 @@ def _console_url(region: str, path: str, fragment: str = "") -> str:
     which part is a name: a fragment is assembled from literal syntax
     (``s=Alarms&alarm=``) and one untrusted value, and quoting the whole of it
     would escape the syntax as well.
+
+    **It names no account**, and no address built from it does: the console takes
+    the account from the browser's session. What opens one account's page in that
+    account is a sign-in, and what a link is wrapped in for it is the deployment's
+    to say (:func:`_wrapped`, ADR-0013).
     """
     address = f"https://{region}.console.aws.amazon.com/{path}?region={region}"
     return f"{address}#{fragment}" if fragment else address
+
+
+def _wrapped(template: str, address: str, account_id: str) -> str:
+    """*address*, the console's own, as a ``console_link`` template wraps it
+    (ADR-0013 §2): ``{url}`` filled with the address and ``{account_id}`` with the
+    account's id, each percent-encoded **whole** — a `/`, a `?`, a `#` and a `%`
+    of the address among them, so that what arrives at the far end of a sign-in
+    is the address this type built and no part of it is read as the wrapper's.
+
+    The template was held to its two tokens where the check loaded
+    (:func:`_parse_console_link`), and an account under a template that names
+    ``{account_id}`` to having one (:func:`_hold_account_ids`)."""
+    filled = {"url": address, "account_id": account_id}
+    return _TOKEN.sub(
+        lambda token: urllib.parse.quote(filled[token.group(1)], safe=""), template)
 
 
 def _quoted(value: str) -> str:
@@ -1958,13 +2351,40 @@ def _instance_of(record: Mapping[str, Any]) -> Instance:
 
 def _function_of(record: Mapping[str, Any]) -> FunctionReading:
     errors = record.get("errors")
+    error = record.get("error")
+    newest: Mapping[str, Any] = error if isinstance(error, Mapping) else {}
     return FunctionReading(
         name=str(record["name"]), region=str(record["region"]),
         errors=errors if isinstance(errors, int) else None,
         last_run=_time(record.get("at")),
         log_status=str(record.get("log_status") or ""),
         log_note=str(record.get("log_note") or ""),
-        log_error=str(record.get("log_error") or ""))
+        log_error=str(record.get("log_error") or ""),
+        error_at=_time(newest.get("at")),
+        held_errors=_count(newest.get("held")),
+        clean_since=_count(newest.get("clean_since")))
+
+
+def _count(value: object) -> int:
+    """A count a record kept, and zero where it kept none."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _errors_held(points: Sequence[tuple[datetime, int]], end: datetime,
+                 hold: int) -> tuple[datetime | None, int, int]:
+    """What one function's one-minute points, newest first, say of its errors
+    (ADR-0012): the newest bucket with an error and how many clean buckets follow
+    it, and what the buckets inside the hold — the last *hold* seconds before the
+    window's end — count together. Nothing where no bucket errored, and the hold's
+    count alone where the hold is nothing."""
+    error_at, clean_since = None, 0
+    for index, (stamp, count) in enumerate(points):
+        if count > 0:
+            error_at, clean_since = stamp, index
+            break
+    since = end - timedelta(seconds=hold)
+    held = sum(count for stamp, count in points if stamp >= since)
+    return error_at, held, clean_since
 
 
 def _run_entry(run: Measurement) -> Entry:
@@ -2004,7 +2424,108 @@ def _pipeline_of(record: Mapping[str, Any]) -> PipelineReading:
     return PipelineReading(name=str(record["name"]), region=str(record["region"]),
                            status=str(record.get("status") or ""),
                            started=_time(record.get("started")),
-                           execution_id=str(record.get("execution") or ""))
+                           execution_id=str(record.get("execution") or ""),
+                           retry=_retry_of(record.get("retry")))
+
+
+def _retry_of(value: object) -> Retry | None:
+    """The ``retry`` block of a pipeline's record, as the reading it was written from,
+    and none where the record keeps none."""
+    if not isinstance(value, Mapping):
+        return None
+    failed, abandoned = value.get("failed"), value.get("abandoned")
+    return Retry(failed=failed if isinstance(failed, int) else 0,
+                 abandoned=abandoned if isinstance(abandoned, int) else 0,
+                 started=_time(value.get("started")),
+                 error=str(value.get("error") or ""))
+
+
+def _ended_in(execution: PipelineReading) -> str:
+    """The status an execution in flight on a retry had ended in, as its action
+    executions show it (ADR-0014 §5), and nothing for any other."""
+    return "" if execution.retry is None else execution.retry.ended
+
+
+def _begun(execution: PipelineReading) -> datetime | None:
+    """When an execution in flight began running as it now runs: the retry's own
+    start, for one on a retry, and its start for any other (ADR-0014 §5)."""
+    retry = execution.retry
+    return (retry.started if retry is not None and retry.ended
+            else execution.started)
+
+
+def _in_flight(status: str) -> bool:
+    """Whether an execution in *status* is in flight (:data:`_EXECUTION_IN_FLIGHT`),
+    the word read as `state_map` reads one, whatever its case and its padding."""
+    return status.strip().lower() in _EXECUTION_IN_FLIGHT
+
+
+def _gives_verdict(status: str, ended: str) -> bool:
+    """Whether an execution in *status* — on a retry from a status *ended*, where it is
+    one — says a verdict the line can keep: one that is over, and neither superseded
+    nor without a status to say; or one in flight again on a retry, which says the
+    one it had ended in (ADR-0014 §2, §5)."""
+    word = status.strip().lower()
+    if word in _EXECUTION_IN_FLIGHT:
+        return bool(ended)
+    return bool(word) and word != _SUPERSEDED
+
+
+def _line_index(executions: Sequence[tuple[str, str]]) -> int:
+    """Of a pipeline's executions newest first, each given by the status it is in and
+    the one its retry shows it had ended in (nothing where it is on none), the place of
+    the one its line is written from (ADR-0014 §2, §5): the newest, unless it is in
+    flight — then the newest whose verdict the line can keep (:func:`_gives_verdict`),
+    which is the newest itself where it is on a retry. Where none can, the newest
+    after all: a pipeline whose first execution runs has nothing else to say."""
+    if not executions or not _in_flight(executions[0][0]):
+        return 0
+    for at, (status, ended) in enumerate(executions):
+        if _gives_verdict(status, ended):
+            return at
+    return 0
+
+
+def _carried(records: Sequence[SeriesRecord]) -> set[str]:
+    """The executions a pipeline's history holds as the one its line was last written
+    from, by the ids they name (ADR-0014 §4): the choice :func:`_line_index` makes,
+    made over the statuses the records keep and the retries they hold — the kept
+    execution that started last, unless it was in flight, and then the newest whose
+    verdict the line could keep, which is that one where it was on a retry. Where none
+    was, the line was written from the one in flight, which the history holds
+    unfinished and so reads again all the same: none is named.
+
+    Of several that started at one instant, when they started does not say which of
+    them the line was written from, so each is taken for it. A record that names no
+    start — the pipeline's from before it ever ran — is none of them."""
+    dated = [(record.at, record.identity, str(record.data.get("status") or ""),
+              _retry_of(record.data.get("retry")))
+             for record in records if record.at is not None]
+    latest = max((at for at, _, _, _ in dated), default=None)
+    newest = {identity for at, identity, status, _ in dated
+              if at == latest and not _in_flight(status)}
+    if newest:
+        return newest
+    behind = [(at, identity) for at, identity, status, retry in dated
+              if _gives_verdict(status, "" if retry is None else retry.ended)]
+    last = max((at for at, _ in behind), default=None)
+    return {identity for at, identity in behind if at == last}
+
+
+def _by_status(executions: Sequence[PipelineReading]
+               ) -> list[list[PipelineReading]]:
+    """*executions* in groups of one status each, in the order each status first
+    appears, the word compared as `state_map` compares one — and of one status, those
+    on a retry apart from those on a first run, and those whose retry could not be
+    read apart from both (ADR-0014 §5)."""
+    groups: dict[tuple[str, str], list[PipelineReading]] = {}
+    for execution in executions:
+        kind = ("retried" if _ended_in(execution)
+                else "unread" if execution.retry is not None and execution.retry.error
+                else "")
+        groups.setdefault((execution.status.strip().lower(), kind),
+                          []).append(execution)
+    return list(groups.values())
 
 
 def _queue_of(record: Mapping[str, Any]) -> QueueReading:
@@ -2078,6 +2599,7 @@ class AwsCheck(Check):
                  role_session_name: str = DEFAULT_ROLE_SESSION_NAME,
                  sts_region: str = DEFAULT_STS_REGION,
                  profile: str = "",
+                 console_link: str = "",
                  sso: SsoConfig | None = None,
                  cloudwatch: CloudwatchConfig | None = None,
                  ec2: Ec2Config | None = None,
@@ -2130,6 +2652,10 @@ class AwsCheck(Check):
         # it is the *absence* of one: boto3 then reads the ambient chain exactly
         # as it did before this key existed, `AWS_PROFILE` included.
         self.profile = profile
+        # The template every account's links are wrapped in unless the account
+        # wrote its own (ADR-0013 §1). Empty is the absence of one, and then a link
+        # is the console's own address, as it was before this key existed.
+        self.console_link = console_link
         self.sso = sso or SsoConfig()
         self.cloudwatch = cloudwatch or CloudwatchConfig()
         self.ec2 = ec2 or Ec2Config()
@@ -2180,6 +2706,10 @@ class AwsCheck(Check):
             raise CheckError("aws 'sts_region' must not be empty")
         regions = config.get("regions")
         accounts = _parse_accounts(config.get("accounts"))
+        # The check's own template, and then the one question that takes both: an
+        # account under a template that names its id has to have one.
+        console_link = _parse_console_link(config, "aws 'console_link'")
+        _hold_account_ids(accounts, console_link)
         # Parsed before the aspects, because each of them inherits it.
         shorten = _parse_shorten(config.get("shorten"))
         extra: dict[str, Any] = {
@@ -2189,6 +2719,7 @@ class AwsCheck(Check):
             "role_session_name": session_name,
             "sts_region": sts_region,
             "profile": _parse_profile(config, "aws 'profile'"),
+            "console_link": console_link,
             "sso": _parse_sso(config.get("sso")),
             "cloudwatch": _parse_cloudwatch(config.get("cloudwatch")),
             "ec2": _parse_ec2(config.get("ec2")),
@@ -2258,6 +2789,36 @@ class AwsCheck(Check):
         """
         return account.profile or self.profile
 
+    def console_link_for(self, account: Account) -> str:
+        """An account's link template: its own if it wrote one, the check's
+        otherwise (ADR-0013 §1) — and empty where neither did, which is every
+        config written before the key existed."""
+        return account.console_link or self.console_link
+
+    def _link(self, account: Account, address: str) -> str:
+        """What a line, or a roster, links a name to for *account*: the console's
+        own *address*, or that address wrapped in the account's template where the
+        configuration sets one (ADR-0013 §1).
+
+        The one place a link's address is decided, for all six kinds of it. The
+        console's address names no account and opens in whichever one the browser
+        is signed in to; a template is how a deployment says what signs its people
+        in to **this** one first."""
+        template = self.console_link_for(account)
+        if not template:
+            return address
+        return _wrapped(template, address, account.account_id)
+
+    def _links_summary(self, account: Account) -> str:
+        """Where *account*'s console links open, as its card says it (ADR-0013
+        §5): the template they are wrapped in, shown as it is written — in a code
+        span, which a template can hold no backtick to end — or, where none is
+        set, the one thing a reader of a link cannot see in it."""
+        template = self.console_link_for(account)
+        if not template:
+            return "open in whichever account the browser is signed in to"
+        return f"through `{template}`"
+
     def config_summary(self) -> str:
         # A check that names one account stands for it (ADR-0007 §2): the account
         # has no node, so what that node's page would have said — the regions the
@@ -2276,6 +2837,10 @@ class AwsCheck(Check):
             "credentials": (self._credentials_summary() if alone is None
                             else self._account_credentials(alone)),
             "sso login": self._sso_summary(),
+            # Where the one account's links open (ADR-0013 §5). Several accounts
+            # say it on their own cards, each of its own links.
+            "console links": (None if alone is None
+                              else self._links_summary(alone)),
             "ignored alarm names containing": ", ".join(
                 plain(pattern)
                 for pattern in self.cloudwatch.ignore_name_patterns) or None,
@@ -2290,6 +2855,7 @@ class AwsCheck(Check):
                                        else "no"),
             "lambda error graded within": format_span(
                 self.lambda_.error_max_age_seconds),
+            "lambda error held for": format_span(self.lambda_.hold_for(None)),
             "lambda silence is a finding": ("yes" if
                                             self.lambda_.expect_invocations
                                             else "no"),
@@ -2297,6 +2863,8 @@ class AwsCheck(Check):
                                                 self._lambda_rule_effect),
             "pipeline success stales after": self._pair_summary(
                 self.codepipeline.age, format_span),
+            "pipeline execution overruns after": self._pair_summary(
+                self.codepipeline.run_time, format_span),
             "pipeline rules": self._rules_summary(
                 self.codepipeline.rules, self._pipeline_rule_effect),
             "batch job running before red": format_span(
@@ -2511,7 +3079,7 @@ class AwsCheck(Check):
 
     # --- the cloudwatch aspect --------------------------------------------
 
-    def _alarm_entry(self, alarm: Alarm, code: StatusCode,
+    def _alarm_entry(self, account: Account, alarm: Alarm, code: StatusCode,
                      show_region: bool) -> Entry:
         settings = self.cloudwatch
         tags = [tag for tag, on in
@@ -2525,7 +3093,8 @@ class AwsCheck(Check):
             # The region is in the slug whether or not it is in the text: a pin
             # must not re-point the day a second region is configured.
             slug(alarm.region, alarm.name),
-            f"{where}[{plain(alarm.name)}]({_console_link(alarm)}): "
+            f"{where}[{plain(alarm.name)}]"
+            f"({self._link(account, _console_link(alarm))}): "
             f"{_state_phrase(alarm.state)}{suffix} — {plain(described)}",
             code)
 
@@ -2546,13 +3115,13 @@ class AwsCheck(Check):
                                tail=f", expected at least {minimum}")
         return _scope_line("alarm", counted, regions)
 
-    @staticmethod
-    def _roster(alarms: list[Alarm], show_region: bool) -> str:
+    def _roster(self, account: Account, alarms: list[Alarm],
+                show_region: bool) -> str:
         """What the run *found*: presence without a verdict (little-sister ADR-0044).
         The count can alarm and lives in a reason; these names cannot and live here."""
         return "\n".join(
             f"- {f'{plain(alarm.region)} / ' if show_region else ''}"
-            f"[{plain(alarm.name)}]({_console_link(alarm)})"
+            f"[{plain(alarm.name)}]({self._link(account, _console_link(alarm))})"
             for alarm in alarms)
 
     def _measure_cloudwatch(self, account: Account,
@@ -2601,8 +3170,8 @@ class AwsCheck(Check):
             code = settings.code_for(alarm.state)
             if code is StatusCode.OK and not settings.show_healthy:
                 continue
-            entries.append(_carrying(self._alarm_entry(alarm, code, show_region),
-                                     reading))
+            entries.append(_carrying(
+                self._alarm_entry(account, alarm, code, show_region), reading))
         # The scope line goes last so an OK one ends the list rather than
         # sitting between the findings and the healthy lines; a WARN one still
         # floats up with the sort.
@@ -2613,7 +3182,7 @@ class AwsCheck(Check):
         # refused at construction (little-sister ADR-0042).
         return CheckResult(reason=list(reason), name=CLOUDWATCH,
                            description=f"CloudWatch alarms in {account.name}",
-                           report=self._roster(found, show_region))
+                           report=self._roster(account, found, show_region))
 
     # --- the ec2 aspect ----------------------------------------------------
 
@@ -2685,8 +3254,8 @@ class AwsCheck(Check):
         entries: list[Entry] = []
         for key in sorted(kept, key=_instance_order):
             region, name = key
-            entry = self._instance_entry(region, name, counts[key], ages[key],
-                                         show_region)
+            entry = self._instance_entry(account, region, name, counts[key],
+                                         ages[key], show_region)
             members = kept[key]
             # A line one instance made carries that instance's reading; a line
             # about several carries none, since no one record is what it read
@@ -2718,12 +3287,14 @@ class AwsCheck(Check):
             age for age in (member.age_seconds(now) for member in members)
             if age is not None))
 
-    def _instance_entry(self, region: str, name: str | None, count: int,
-                        ages: tuple[int, ...], show_region: bool) -> Entry:
+    def _instance_entry(self, account: Account, region: str, name: str | None,
+                        count: int, ages: tuple[int, ...],
+                        show_region: bool) -> Entry:
         where = f"{plain(region)} / " if show_region else ""
         # The no-name group is not a name, so it is not a console search either.
-        label = (plain(NO_NAME_TAG) if name is None
-                 else f"[{plain(name)}]({_instance_link(region, name)})")
+        label = (plain(NO_NAME_TAG) if name is None else
+                 f"[{plain(name)}]"
+                 f"({self._link(account, _instance_link(region, name))})")
         # The age rides on **every** line, healthy ones included: it is the
         # reading, not the exception report, and a line that only shows it when
         # it is bad teaches nobody what normal looks like.
@@ -2871,16 +3442,19 @@ class AwsCheck(Check):
                     _subject(LAMBDA, account.name, region, _kept(name)))
                 if record.at is not None}
 
-    def _window(self, kept: Collection[datetime], end: datetime) -> timedelta:
+    def _window(self, kept: Collection[datetime], end: datetime,
+                hold: int) -> timedelta:
         """The window a function is asked in (ADR-0006 §3): the smallest of
         :data:`_RUN_WINDOWS` that reaches the oldest of its kept runs, where they
         fill the series, and the largest where they do not — which is every
         function of a check that keeps no series, asked the fifteen days as it
-        always was."""
+        always was. It reaches the function's error hold as well (ADR-0012): the
+        newest error has to be in the answer for the hold to stand on it, and the
+        hold is never longer than the largest window."""
         if not self.series_keep or len(kept) < self.series_keep:
             return _RUN_WINDOWS[-1]
-        oldest = min(kept)
-        return next((window for window in _RUN_WINDOWS if oldest >= end - window),
+        reach = max(end - min(kept), timedelta(seconds=hold))
+        return next((window for window in _RUN_WINDOWS if window >= reach),
                     _RUN_WINDOWS[-1])
 
     def _read_runs(self, client: CloudWatchClient, account: Account, region: str,
@@ -3017,7 +3591,9 @@ class AwsCheck(Check):
                 if self.series_keep else {})
         asked: dict[timedelta, list[str]] = {}
         for name in names:
-            asked.setdefault(self._window(kept.get(name, ()), end), []).append(name)
+            hold = settings.hold_for(settings.rule_for(name))
+            asked.setdefault(self._window(kept.get(name, ()), end, hold),
+                             []).append(name)
         points: dict[str, list[tuple[datetime, int]]] = {}
         for window in _RUN_WINDOWS:
             if window in asked:
@@ -3037,19 +3613,25 @@ class AwsCheck(Check):
                 if self.series_keep else {})
         readings: list[FunctionReading] = []
         for name in names:
+            rule = settings.rule_for(name)
             last_run, count = newest.get(name, (None, None))
+            error_at, held_errors, clean_since = _errors_held(
+                points.get(name, ()), end, settings.hold_for(rule))
             status, note, failure = ("", "", "")
             # Per function, because the log read is two API calls each — more where
             # a page comes back empty — and the functions worth paying for are not
             # always the whole account.
-            if settings.reads_log(settings.rule_for(name)):
+            if settings.reads_log(rule):
                 status, note, failure = self._log_reading(session, region, name)
             readings.append(FunctionReading(
                 name=_kept(name), region=region, errors=count, last_run=last_run,
-                log_status=status, log_note=note, log_error=failure))
+                log_status=status, log_note=note, log_error=failure,
+                error_at=error_at, held_errors=held_errors,
+                clean_since=clean_since))
         return readings, {_kept(name): found for name, found in runs.items()}
 
-    def _function_entry(self, reading: FunctionReading, now: datetime) -> Entry:
+    def _function_entry(self, account: Account, reading: FunctionReading,
+                        now: datetime) -> Entry:
         settings = self.lambda_
         rule = settings.rule_for(reading.name)
         age = (None if reading.last_run is None
@@ -3066,12 +3648,31 @@ class AwsCheck(Check):
             if settings.expects_invocations(rule):
                 code = StatusCode.WARN
                 said = settings.sentence("silent_reason", rule)
+        elif reading.errors == 0 and self._held(reading, now, rule):
+            # The newest run was clean, but an error inside the hold stands on the
+            # line (ADR-0012): how many the hold holds, when the newest was, and
+            # what ran clean since — so a reader of the node sees what a reader of
+            # the events would.
+            hold = format_span(settings.hold_for(rule))
+            held = reading.held_errors
+            when = coarse_span(int((now - reading.error_at).total_seconds())
+                               if reading.error_at is not None else 0)
+            newest = "" if held == 1 else "the newest "
+            parts.append(f"{held} error{'s' if held != 1 else ''} in the last "
+                         f"{hold}, {newest}{when} ago · {reading.clean_since} "
+                         f"clean run{'s' if reading.clean_since != 1 else ''} "
+                         f"since, the last {coarse_span(age or 0)} ago")
+            code = StatusCode.ERROR
+            said = settings.sentence("error_reason", rule)
         elif reading.errors == 0:
             parts.append(f"no errors, last run {coarse_span(age or 0)} ago")
         elif age is not None and age <= settings.gate_for(rule):
             parts.append(f"{reading.errors} error"
                          f"{'s' if reading.errors != 1 else ''}, "
                          f"last run {coarse_span(age)} ago")
+            if settings.hold_for(rule) and reading.held_errors > reading.errors:
+                parts.append(f"{reading.held_errors} in the last "
+                             f"{format_span(settings.hold_for(rule))}")
             code = StatusCode.ERROR
             said = settings.sentence("error_reason", rule)
         else:
@@ -3091,11 +3692,21 @@ class AwsCheck(Check):
         # node hangs beneath its region's (ADR-0007 §3). The slug keeps the region,
         # as every slug does.
         label = plain(settings.short_name(reading.name))
+        link = self._link(account, _function_link(reading.region, reading.name))
         return Entry(slug(reading.region, reading.name),
-                     f"[{label}]"
-                     f"({_function_link(reading.region, reading.name)}): "
-                     f"{' · '.join(parts)}",
+                     f"[{label}]({link}): {' · '.join(parts)}",
                      code)
+
+    def _held(self, reading: FunctionReading, now: datetime,
+              rule: Rule | None) -> bool:
+        """Whether an error this function saw still stands on its line (ADR-0012):
+        the newest error is younger than the hold that applies to the function. A
+        hold of nothing holds nothing, and the hold is never longer than the gate,
+        so a held error is always one the gate would grade."""
+        hold = self.lambda_.hold_for(rule)
+        if not hold or reading.error_at is None:
+            return False
+        return (now - reading.error_at).total_seconds() <= hold
 
     def _measure_lambda(self, account: Account,
                         session: Session) -> list[Measurement]:
@@ -3120,6 +3731,13 @@ class AwsCheck(Check):
                     LAMBDA, "function", account.name, region,
                     {"name": function.name, "errors": function.errors,
                      "at": _iso(function.last_run),
+                     # The newest error nests its instant under `at`, as a job's
+                     # creation does (ADR-0005 §1): a time under any other name
+                     # is only a string to the surfaces that show a record.
+                     "error": (None if function.error_at is None else
+                               {"at": _iso(function.error_at),
+                                "held": function.held_errors,
+                                "clean_since": function.clean_since}),
                      "log_status": function.log_status or None,
                      "log_note": function.log_note or None,
                      "log_error": function.log_error or None}))
@@ -3175,7 +3793,7 @@ class AwsCheck(Check):
         return self._subjects_node(
             account, LAMBDA, "functions", f"Lambda functions in {account.name}",
             _scope_line("function", len(found), regions),
-            self._function_roster(found, len(regions) > 1), unreadable,
+            self._function_roster(account, found, len(regions) > 1), unreadable,
             {region: self._function_nodes(account, members, runs, now)
              for region, members in functions.items()})
 
@@ -3275,8 +3893,8 @@ class AwsCheck(Check):
         alone (little-sister ADR-0111 decision 7).
         """
         subject = _subject(LAMBDA, account.name, function.region, function.name)
-        line = replace(self._function_entry(function, now), subject=subject,
-                       data=dict(reading.record))
+        line = replace(self._function_entry(account, function, now),
+                       subject=subject, data=dict(reading.record))
         short = self.lambda_.short_name(function.name)
         return CheckResult(
             reason=[line], name=function.name,
@@ -3284,12 +3902,13 @@ class AwsCheck(Check):
             description=f"Lambda function in {account.name}, {function.region}",
             for_record=[_run_entry(run) for run in runs], dynamic=True)
 
-    def _function_roster(self, readings: list[FunctionReading],
+    def _function_roster(self, account: Account,
+                         readings: list[FunctionReading],
                          show_region: bool) -> str:
         return "\n".join(
             f"- {f'{plain(reading.region)} / ' if show_region else ''}"
             f"[{plain(reading.name)}]"
-            f"({_function_link(reading.region, reading.name)})"
+            f"({self._link(account, _function_link(reading.region, reading.name))})"
             for reading in readings)
 
     # --- the codepipeline aspect -------------------------------------------
@@ -3340,64 +3959,113 @@ class AwsCheck(Check):
                 updated=updated if isinstance(updated, datetime) else None))
         return executions
 
-    def _lacking(self, account: Account, newest: PipelineReading,
-                 older: Sequence[PipelineReading]) -> list[PipelineReading]:
-        """The executions behind a pipeline's *newest* that this poll reads
-        (ADR-0009 §5): each one the pipeline's history lacks, or holds in a status
-        that ends nothing — out of the newest of the page, as many as the series
-        keeps beside the newest itself, since an older one would leave the series
-        the moment it was kept. So an execution a newer one overtook while it ran
-        is read to its end, and a pipeline's series is whole from its first poll,
-        as far as one page reaches.
+    def _behind(self, executions: Sequence[PipelineReading]
+                ) -> list[tuple[int, PipelineReading]]:
+        """The executions behind a pipeline's *newest* that its history may lack, by
+        their places in *executions*, which are newest first (ADR-0009 §5): out of the
+        newest of the page, as many as the series keeps beside the newest itself,
+        since an older one would leave the series the moment it was kept. None where
+        the check keeps no series, and none that came without an id or a status: the
+        first would be a new record at every poll, and the second says nothing."""
+        named = [(at, execution) for at, execution in enumerate(executions)
+                 if at and execution.execution_id and execution.status]
+        return named[:max(self.series_keep - 1, 0)]
 
-        And the one the history holds as its newest, where the page's newest is
-        another. It was last read as the newest, so what stood for it was the
-        pipeline's line, which says what no other execution is asked: how long ago
-        it started, and whether a success has grown stale. Read once behind the
-        newer one, it is said for the record by its own status (§6); the poll after
-        that finds the newer one in its place and leaves it alone.
+    @staticmethod
+    def _lacking(executions: Sequence[PipelineReading],
+                 behind: Sequence[tuple[int, PipelineReading]], line_at: int,
+                 records: Sequence[SeriesRecord]) -> list[int]:
+        """Of *behind*, the executions this poll reads for the pipeline's history
+        (ADR-0009 §5), by their places in *executions*: each one *records* lack, or
+        hold in a status that ends nothing. So an execution a newer one overtook while
+        it ran is read to its end, and a pipeline's series is whole from its first
+        poll, as far as one page reaches.
 
-        The history's newest is the kept execution that started last, wherever its
-        record stands. Of several that started at one instant, when they started
-        does not say which carried the line, so each is taken for it — and none of
-        them is read while the page's newest is one of them, which would be at
-        every poll.
-
-        None where the check keeps no series. And none that came without an id or a
-        status: the first would be a new record at every poll, and the second says
-        nothing. What the check kept decides what is read and nothing else
-        (little-sister ADR-0113): a record holds what CodePipeline answered."""
-        named = [execution for execution in older
-                 if execution.execution_id and execution.status]
-        named = named[:max(self.series_keep - 1, 0)]
-        if not named:
+        And the one the history holds as its line's, where the line is now written
+        from another — the one at *line_at* (ADR-0014 §4). What stood for it was the
+        pipeline's line, which says what no other execution is asked: how long ago it
+        started, whether a success has grown stale, and what was in flight beside it.
+        Read once more, it is said for the record by its own status (ADR-0009 §6);
+        the poll after that finds the line where it is, and leaves it alone. Which
+        execution the history holds as its line's, :func:`_carried` says — and of
+        several, none is read while the line is written from one of them, which
+        would be at every poll. What the check kept decides what is read and nothing
+        else (little-sister ADR-0113): a record holds what CodePipeline answered."""
+        if not behind:
             return []
-        held: dict[str, str] = {}
-        latest: datetime | None = None
-        were_newest: set[str] = set()
-        for record in self.kept(_subject(
-                CODEPIPELINE, account.name, named[0].region, named[0].name)):
-            held[record.identity] = str(record.data.get("status") or "")
-            at = record.at
-            if at is None or (latest is not None and at < latest):
-                continue
-            if latest is None or at > latest:
-                latest, were_newest = at, set()
-            were_newest.add(record.identity)
-        if newest.execution_id in were_newest:
-            were_newest = set()
-        return [execution for execution in named
-                if execution.execution_id in were_newest
+        held = {record.identity: str(record.data.get("status") or "")
+                for record in records}
+        carried = _carried(records)
+        if executions[line_at].execution_id in carried:
+            carried = set()
+        return [at for at, execution in behind
+                if execution.execution_id in carried
                 or held.get(execution.execution_id, "").strip().lower()
                 not in _EXECUTION_ENDED]
+
+    def _retried(self, client: CodePipelineClient, name: str,
+                 executions: Sequence[PipelineReading],
+                 records: Sequence[SeriesRecord]) -> list[PipelineReading]:
+        """*executions*, each one in flight that the history holds ended failed or
+        stopped — or holds on a retry already — with what CodePipeline answers of its
+        action executions: one call for each, at every poll while it runs again
+        (ADR-0014 §5). A retry of a stage runs the execution it failed in again, under
+        its own id and from the start it had, so the page alone cannot tell it from a
+        first run. The history can, and decides what is asked and nothing else
+        (little-sister ADR-0113 decision 3): the record holds what CodePipeline
+        answered. Nothing is asked where the check keeps no series."""
+        held = {record.identity: record.data for record in records
+                if record.identity}
+        retried: list[PipelineReading] = []
+        for execution in executions:
+            kept = (held.get(execution.execution_id) if execution.execution_id
+                    else None)
+            if (kept is not None and _in_flight(execution.status)
+                    and (str(kept.get("status") or "").strip().lower()
+                         in _EXECUTION_RETRIED_FROM
+                         or isinstance(kept.get("retry"), Mapping))):
+                execution = replace(execution, retry=self._actions(
+                    client, name, execution.execution_id))
+            retried.append(execution)
+        return retried
+
+    @staticmethod
+    def _actions(client: CodePipelineClient, name: str,
+                 execution_id: str) -> Retry:
+        """What one page of an execution's action executions says of its retry: how
+        many failed, how many were abandoned when it was stopped, and when the first
+        one that started after the last of those had ended began. A refusal is an
+        answer too, and is kept as one (little-sister ADR-0085 decision 3)."""
+        try:
+            details = client.list_action_executions(
+                pipelineName=name, filter={"pipelineExecutionId": execution_id},
+                maxResults=_ACTIONS_PAGE,
+            ).get("actionExecutionDetails", [])
+        except (BotoCoreError, ClientError) as error:
+            return Retry(error=_kept(str(error)))
+        ended = [detail.get("lastUpdateTime") for detail in details
+                 if detail.get("status") in ("Failed", "Abandoned")]
+        last = max((at for at in ended if isinstance(at, datetime)), default=None)
+        began = [detail.get("startTime") for detail in details]
+        return Retry(
+            failed=sum(1 for detail in details if detail.get("status") == "Failed"),
+            abandoned=sum(1 for detail in details
+                          if detail.get("status") == "Abandoned"),
+            started=min((at for at in began if isinstance(at, datetime)
+                         and last is not None and at > last), default=None))
 
     def _read_pipelines(self, session: Session, account: Account,
                         region: str) -> list[PipelineReading]:
         """One region's pipelines, narrowed at the seam: each pipeline's newest
         execution — or the pipeline alone, where it has never been executed — and
-        behind it the older executions this poll reads for the pipeline's history
-        (:meth:`_lacking`). One client for the region, not one per pipeline, and
-        one page of executions for a pipeline, whatever is read out of it."""
+        beside it what the pipeline's line is written from where that is another
+        (ADR-0014 §2): every execution in flight, each one the history shows on a
+        retry with what its action executions say (:meth:`_retried`), and while the
+        newest is in flight on no retry, the newest whose verdict the line can keep.
+        Behind them, the older executions this poll reads for the pipeline's history
+        (:meth:`_lacking`). Each once, newest first. One client for the region, not
+        one per pipeline, and one page of executions for a pipeline, whatever is
+        read out of it."""
         client = session.client("codepipeline", region_name=region)
         readings: list[PipelineReading] = []
         for name in self._list_pipeline_names(client):
@@ -3407,61 +4075,154 @@ class AwsCheck(Check):
             if not executions:
                 readings.append(PipelineReading(name=_kept(name), region=region))
                 continue
-            readings.append(executions[0])
-            readings.extend(
-                self._lacking(account, executions[0], executions[1:]))
+            behind = self._behind(executions)
+            # What the check kept is read where it decides something: an execution
+            # its history may lack, or one in flight that may be on a retry.
+            records = (self.kept(_subject(CODEPIPELINE, account.name, region,
+                                          executions[0].name))
+                       if self.series_keep > 0 and (behind or any(
+                           _in_flight(execution.status) and execution.execution_id
+                           for execution in executions))
+                       else ())
+            executions = self._retried(client, name, executions, records)
+            line_at = _line_index([(execution.status, _ended_in(execution))
+                                   for execution in executions])
+            read = {0, line_at, *(at for at, execution in enumerate(executions)
+                                  if _in_flight(execution.status))}
+            read.update(self._lacking(executions, behind, line_at, records))
+            readings.extend(executions[at] for at in sorted(read))
         return readings
 
-    def _pipeline_entry(self, reading: PipelineReading, now: datetime) -> Entry:
-        """A pipeline's line: what its newest execution did and when that execution
-        started, graded by `state_map` — and, where it succeeded, by how long ago
-        that was."""
+    def _pipeline_entry(self, account: Account, pipeline: PipelineReading,
+                        verdict: PipelineReading | None,
+                        in_flight: Sequence[PipelineReading],
+                        now: datetime) -> Entry:
+        """A pipeline's line: what the execution whose verdict it keeps did and when
+        that execution started, graded by `state_map` — and, where it succeeded, by
+        how long ago that was — and beside it what is in flight (ADR-0014 §2).
+
+        *verdict* is the newest execution whose verdict the line can keep — one that is
+        not in flight, or one in flight again on a retry, which says the status it had
+        ended in (ADR-0014 §5) — and none where no execution read is either: the line
+        then says what is in flight alone. What is in flight
+        leaves the line's verdict where that execution put it and can only make it
+        worse — its status counts as `state_map` says, and so does an execution in
+        flight for longer than `max_run_time` — and while there is any, the line is
+        marked running: an italic, display only (little-sister ADR-0042 decision 6),
+        so the words say it as well."""
         settings = self.codepipeline
-        rule = settings.rule_for(reading.name)
-        age = (None if reading.started is None
-               else max(0, int((now - reading.started).total_seconds())))
-        said = ""
-        if not reading.status:
+        rule = settings.rule_for(pipeline.name)
+        code = StatusCode.OK
+        parts: list[str] = []
+        if verdict is not None and not verdict.status:
             # A pipeline that has never been executed. Reporting nothing for it
             # would make a pipeline created and never triggered indistinguishable
             # from one that does not exist.
-            code, phrase = StatusCode.WARN, "never run"
-        else:
-            code = settings.code_for(reading.status)
-            # "started N ago" rather than "N ago": `startTime` is what was read,
-            # and for an `InProgress` run it is the only honest thing to say.
-            when = f", started {coarse_span(age)} ago" if age is not None else ""
-            phrase = f"{plain(reading.status)}{when}"
-            if code is StatusCode.OK and age is not None:
-                # A success this old is not evidence the pipeline still works.
-                # Only a success: a failure is already the finding, and telling
-                # somebody it is also stale is noise on the line they act on.
-                stale = settings.age_for(rule)
-                aged = stale.code_for(age)
-                if aged is not StatusCode.OK:
-                    code = aged
-                    phrase = (f"{plain(reading.status)}, but that run started "
-                              f"{coarse_span(age)} ago")
-                    sentence = sentence_for(stale, rule)
-                    said = f" — {plain(sentence)}" if sentence else ""
-        label = plain(settings.short_name(reading.name))
+            code = StatusCode.WARN
+            parts.append("never run")
+        elif verdict is not None:
+            # An execution on a retry is in flight, and what the line keeps of it is
+            # the status it had ended in, as its action executions say.
+            ended = _ended_in(verdict)
+            code, phrase = self._verdict_of(
+                replace(verdict, status=ended) if ended else verdict, rule, now)
+            parts.append(phrase)
+        for group in _by_status(in_flight):
+            graded, phrase = self._in_flight_phrase(group, rule, now)
+            code = _worst(code, graded)
+            parts.append(phrase)
+        label = plain(settings.short_name(pipeline.name))
+        link = self._link(account, _pipeline_link(pipeline.region, pipeline.name))
         return Entry(
             # The region and the full name, as everywhere else: the slug is a
             # stored key, and neither a region's level coming or going nor a
             # cosmetic `shorten` rule may re-point a pin (ADR-0007 §5). The line
             # prints no region: it stands on the pipeline's own node, and the
             # level above says it where an account reads several (ADR-0007 §3).
-            slug(reading.region, reading.name),
-            f"[{label}]({_pipeline_link(reading.region, reading.name)}): "
-            f"{phrase}{said}",
-            code)
+            slug(pipeline.region, pipeline.name),
+            f"[{label}]({link}): {' · '.join(parts)}",
+            code, running=bool(in_flight))
+
+    def _verdict_of(self, execution: PipelineReading, rule: Rule | None,
+                    now: datetime) -> tuple[StatusCode, str]:
+        """What a pipeline's line says of the execution whose verdict it keeps: its
+        status and when it started, graded by `state_map` — and, where it
+        succeeded, by how long ago that was."""
+        settings = self.codepipeline
+        age = self._elapsed(execution.started, now)
+        code = settings.code_for(execution.status)
+        # "started N ago" rather than "N ago": `startTime` is what was read, and of an
+        # execution in flight it is the only honest thing to say.
+        when = f", started {coarse_span(age)} ago" if age is not None else ""
+        phrase = f"{plain(execution.status)}{when}"
+        if code is StatusCode.OK and age is not None:
+            # A success this old is not evidence the pipeline still works. Only a
+            # success: a failure is already the finding, and telling somebody it is
+            # also stale is noise on the line they act on.
+            stale = settings.age_for(rule)
+            aged = stale.code_for(age)
+            if aged is not StatusCode.OK:
+                code = aged
+                phrase = (f"{plain(execution.status)}, but that run started "
+                          f"{coarse_span(age)} ago")
+                sentence = sentence_for(stale, rule)
+                if sentence:
+                    phrase += f" — {plain(sentence)}"
+        return code, phrase
+
+    def _in_flight_phrase(self, group: Sequence[PipelineReading],
+                          rule: Rule | None,
+                          now: datetime) -> tuple[StatusCode, str]:
+        """What a pipeline's line says of its executions in flight in one status:
+        the status and when the one started, or how many and when the oldest of them
+        did — graded by what `state_map` says of the status, and once the oldest has
+        been in flight for longer than `max_run_time`, by that as well (ADR-0014
+        §3). Of executions on a retry it says when the retry began, which the bound
+        counts from; of one whose retry could not be read, that, as a warning
+        (ADR-0014 §5)."""
+        settings = self.codepipeline
+        first = group[0]
+        status, retried = first.status, bool(_ended_in(first))
+        code = settings.code_for(status)
+        phrase = (plain(status) if len(group) == 1
+                  else f"{len(group)} {plain(status)}")
+        # Every execution the page holds has a start (`_executions`), so the oldest
+        # has one; a retry has one once an action has started again, and an
+        # execution said without one is said without when.
+        age = self._elapsed(min((begun for begun in map(_begun, group)
+                                 if begun is not None), default=None), now)
+        limit = settings.run_time_for(rule)
+        overrun = StatusCode.OK if age is None else limit.code_for(age)
+        if age is not None and retried:
+            phrase += (f", retried {coarse_span(age)} ago" if len(group) == 1
+                       else f", retried, the oldest {coarse_span(age)} ago")
+        elif age is not None:
+            phrase += (f", started {coarse_span(age)} ago" if len(group) == 1
+                       else f", the oldest started {coarse_span(age)} ago")
+        elif retried:
+            phrase += ", retried"
+        if overrun is not StatusCode.OK:
+            code = _worst(code, overrun)
+            phrase += ", past max_run_time"
+            sentence = sentence_for(limit, rule)
+            if sentence:
+                phrase += f" — {plain(sentence)}"
+        if first.retry is not None and first.retry.error:
+            # Asked because the history holds it ended failed or stopped, and not
+            # answered: the failure it may be running again is not on the line, and
+            # the line says why, at a warning, until the call is answered.
+            code = _worst(code, StatusCode.WARN)
+            phrase += f" · its retry could not be read: {plain(first.retry.error)}"
+        return code, phrase
 
     def _measure_codepipeline(self, account: Account,
                               session: Session) -> list[Measurement]:
         """Every pipeline in this account's regions that no rule ignores — a rule's
         ``ignore`` spares the pipeline's execution list, so it is decided here
-        (ADR-0005 §2) — a reading of its newest execution, and one of each older
-        execution the poll reads for its history (ADR-0009 §5)."""
+        (ADR-0005 §2) — a reading of its newest execution; of the one its line is
+        written from and of every one in flight, where those are others (ADR-0014
+        §2); and of each older execution the poll reads for its history (ADR-0009
+        §5)."""
         settings = self.codepipeline
         readings: list[Measurement] = []
         for region in self.regions_for(account):
@@ -3502,7 +4263,14 @@ class AwsCheck(Check):
              "status": pipeline.status or None, "started": started,
              "duration_s": (_seconds(pipeline.started, pipeline.updated)
                             if over else None),
-             "at": started},
+             "at": started,
+             # Only where its action executions were asked for: a record holds
+             # what CodePipeline answered, and nothing it was not asked.
+             **({} if pipeline.retry is None else {"retry": {
+                 "failed": pipeline.retry.failed,
+                 "abandoned": pipeline.retry.abandoned,
+                 "started": _iso(pipeline.retry.started),
+                 "error": pipeline.retry.error or None}})},
             subject=_subject(CODEPIPELINE, account.name, pipeline.region,
                              pipeline.name),
             identity=identity, state=state)
@@ -3511,9 +4279,10 @@ class AwsCheck(Check):
                             readings: Sequence[Measurement],
                             now: datetime) -> CheckResult:
         """The pipelines' node, from its readings: a node for every pipeline, which
-        carries the pipeline's line — written from its newest execution and
-        carrying it, its staleness measured to *now* — and says how each execution
-        the poll read behind that one stood, for the record (ADR-0009 §5, §6).
+        carries the pipeline's line — written from the execution whose verdict it
+        keeps and carrying it, its staleness and what is in flight measured to *now*
+        (ADR-0014 §2) — and says how every other execution the poll read stood, for
+        the record (ADR-0009 §6).
 
         The pipelines hang beneath their region's node where the account reads
         several regions, and beneath this one where it reads one (ADR-0007 §3).
@@ -3537,7 +4306,7 @@ class AwsCheck(Check):
             account, CODEPIPELINE, "pipelines",
             f"CodePipeline pipelines in {account.name}",
             _scope_line("pipeline", len(found), regions),
-            self._pipeline_roster(found, len(regions) > 1), unreadable,
+            self._pipeline_roster(account, found, len(regions) > 1), unreadable,
             {region: tuple(self._pipeline_node(account, members[name], now)
                            for name in sorted(members))
              for region, members in pipelines.items()})
@@ -3550,32 +4319,46 @@ class AwsCheck(Check):
         ADR-0118): a pipeline its account calls ``batch`` is not the ``batch``
         aspect.
 
-        Its one line is the pipeline's, written from the reading of its newest
-        execution and carrying it — the one that started last, whatever order the
-        readings came in, and of two that started at one instant the one that was
-        read first. That reading names the pipeline as its subject, so the
-        line does, which is what makes the node stand for the pipeline and its
-        pages draw the pipeline's executions (little-sister ADR-0106 decision 2).
-        No other execution has a line of its own: how each one this poll read
-        behind the newest stood is said for the record alone (§6)."""
-        newest = max(executions, key=_started)
-        pipeline = _pipeline_of(newest.record)
+        Its one line is the pipeline's, written from the execution whose verdict it
+        keeps and carrying it (ADR-0014 §2): the newest — the one that started last,
+        whatever order the readings came in, and of two that started at one instant
+        the one that was read first — unless it is in flight on no retry, and then
+        the newest behind it whose verdict the line can keep, with what is in flight
+        beside it. One in flight on a retry keeps the status it had ended in (§5).
+        That reading names the pipeline as its subject, so the line does, which is
+        what makes the node stand for the pipeline and its pages draw the pipeline's
+        executions (little-sister ADR-0106 decision 2). No other execution has a
+        line of its own: how each one this poll read stood is said for the record
+        alone (ADR-0009 §6)."""
+        # Stable, so of two that started at one instant the one read first leads.
+        ordered = sorted(executions, key=_started, reverse=True)
+        pipelines = [_pipeline_of(execution.record) for execution in ordered]
+        at = _line_index([(pipeline.status, _ended_in(pipeline))
+                          for pipeline in pipelines])
+        carried, pipeline = ordered[at], pipelines[at]
+        in_flight = [one for one in pipelines if _in_flight(one.status)]
+        verdict = (None if _in_flight(pipeline.status) and not _ended_in(pipeline)
+                   else pipeline)
         short = self.codepipeline.short_name(pipeline.name)
-        said = (self._execution_entry(execution) for execution in executions
-                if execution is not newest)
+        said = (self._execution_entry(execution, now) for execution in executions
+                if execution is not carried)
         return CheckResult(
-            reason=[_carrying(self._pipeline_entry(pipeline, now), newest)],
+            reason=[_carrying(self._pipeline_entry(account, pipeline, verdict,
+                                                   in_flight, now), carried)],
             name=pipeline.name, title="" if short == pipeline.name else short,
             description=(f"CodePipeline pipeline in {account.name}, "
                          f"{pipeline.region}"),
             for_record=[entry for entry in said if entry is not None],
             dynamic=True)
 
-    def _execution_entry(self, execution: Measurement) -> Entry | None:
-        """What the grading says of one execution a poll read behind its pipeline's
-        newest, for the record alone (ADR-0009 §6): the verdict its status has in
-        `state_map`, as the line's has, in a sentence that is the status. How old a
-        success may get is asked of the newest execution alone.
+    def _execution_entry(self, execution: Measurement,
+                         now: datetime) -> Entry | None:
+        """What the grading says of one execution its pipeline's line is not written
+        from, for the record alone (ADR-0009 §6): the verdict its status has in
+        `state_map`, as the line's has, in a sentence that is the status — and of one
+        in flight for longer than `max_run_time`, the worse of that verdict and the
+        overrun, in a sentence that says when it started (ADR-0014 §3). How old a
+        success may get is asked of the line's own execution alone.
 
         Nothing of one a newer execution overtook: it neither failed nor deployed,
         so it gets no line, whatever the map says of `Superseded`, and its mark is
@@ -3587,18 +4370,30 @@ class AwsCheck(Check):
         status = str(record.get("status") or "")
         if not status or status.strip().lower() == _SUPERSEDED:
             return None
+        settings = self.codepipeline
+        code, said = settings.code_for(status), plain(status)
+        reading = _pipeline_of(record)
+        retried = bool(_ended_in(reading))
+        # A retry is held to the bound from its own start (ADR-0014 §5).
+        age = self._elapsed(_begun(reading), now)
+        if _in_flight(status) and age is not None:
+            limit = settings.run_time_for(settings.rule_for(str(record["name"])))
+            overrun = limit.code_for(age)
+            if overrun is not StatusCode.OK:
+                code = _worst(code, overrun)
+                said = (f"{plain(status)}, {'retried' if retried else 'started'} "
+                        f"{coarse_span(age)} ago, past max_run_time")
         return Entry(slug(str(record["region"]), str(record["name"]),
                           str(record.get("execution") or "")),
-                     plain(status), self.codepipeline.code_for(status),
-                     subject=execution.subject, data=dict(record))
+                     said, code, subject=execution.subject, data=dict(record))
 
-    @staticmethod
-    def _pipeline_roster(found: Sequence[tuple[str, str]],
+    def _pipeline_roster(self, account: Account,
+                         found: Sequence[tuple[str, str]],
                          show_region: bool) -> str:
         """The pipelines in scope, each by its region and its name, as a list."""
         return "\n".join(
             f"- {f'{plain(region)} / ' if show_region else ''}"
-            f"[{plain(name)}]({_pipeline_link(region, name)})"
+            f"[{plain(name)}]({self._link(account, _pipeline_link(region, name))})"
             for region, name in sorted(found))
 
     # --- the batch aspect --------------------------------------------------
@@ -3672,7 +4467,8 @@ class AwsCheck(Check):
                                          capped=capped))
         return readings
 
-    def _queue_entry(self, reading: QueueReading, job_names: int) -> Entry | None:
+    def _queue_entry(self, account: Account, reading: QueueReading,
+                     job_names: int) -> Entry | None:
         """A line about the *queue*, and only when the queue has something to
         say for itself.
 
@@ -3705,9 +4501,9 @@ class AwsCheck(Check):
                          f"were read")
         if not notes:
             return None
+        link = self._link(account, _queue_link(queue.region))
         return Entry(slug(queue.region, queue.name),
-                     f"[{plain(queue.name)}]({_queue_link(queue.region)}): "
-                     f"{' · '.join(notes)}",
+                     f"[{plain(queue.name)}]({link}): {' · '.join(notes)}",
                      code)
 
     @staticmethod
@@ -3732,20 +4528,23 @@ class AwsCheck(Check):
         took = f", ran {coarse_span(ran)}" if ran is not None else ""
         return f"{plain(job.status)} {coarse_span(ended)} ago{took}"
 
-    def _job_entry(self, queue: JobQueue, name: str, jobs: list[Job],
-                   now: datetime) -> Entry:
+    def _job_entry(self, account: Account, queue: JobQueue, name: str,
+                   jobs: list[Job], now: datetime) -> Entry:
         """A job name's line, carrying every reading of the name at once.
 
         Splitting the finished and the running reading into two lines would make
         two pins for one thing an operator thinks of as one thing. They meet on
         one line, the way the lambda aspect's metric and log readings do — on the
         job name's own node, beneath its queue's, so the line prints neither the
-        queue nor the region (ADR-0009 §3).
+        queue nor the region (ADR-0009 §3). Batch's seven statuses are three words
+        here: finished, running — starting among it — and waiting, which is for
+        capacity where every waiting job is ``RUNNABLE`` (``BATCH_STATUSES``). While
+        a job of the name runs or waits, the line is marked ``running``.
         """
         settings = self.batch
         finished = [job for job in jobs if job.status in BATCH_FINISHED_STATUSES]
-        running = [job for job in jobs if job.status == BATCH_RUNNING_STATUS]
-        waiting = [job for job in jobs if job.status == BATCH_WAITING_STATUS]
+        running = [job for job in jobs if job.status in BATCH_RUNNING_STATUSES]
+        waiting = [job for job in jobs if job.status in BATCH_WAITING_STATUSES]
         code = StatusCode.OK
         parts: list[str] = []
 
@@ -3761,22 +4560,29 @@ class AwsCheck(Check):
             if longest is not None and longest > settings.max_run_seconds:
                 code = _worst(code, StatusCode.WARN)
         if waiting:
-            # Waiting is measured from submission, because a RUNNABLE job has
-            # never started — that is the whole complaint.
+            # Waiting is measured from submission, because a waiting job has never
+            # started — that is the whole complaint. *For capacity* is said where it
+            # is true of every job counted, and not of one held by another job.
             longest = self._longest(waiting, lambda job: job.created, now)
             for_how_long = f" ({coarse_span(longest)})" if longest is not None else ""
-            parts.append(f"{len(waiting)} waiting for capacity{for_how_long}")
+            why = (" for capacity"
+                   if all(job.status == BATCH_CAPACITY_STATUS for job in waiting)
+                   else "")
+            parts.append(f"{len(waiting)} waiting{why}{for_how_long}")
             if longest is not None and longest > settings.max_wait_seconds:
                 code = _worst(code, StatusCode.WARN)
         if not parts:
-            # No run handed over is in a status this aspect asks Batch for, so the
-            # line has nothing to count and says so.
+            # No run handed over is in a status this aspect knows — one Batch would
+            # have to add, or a reading this check did not take — so the line has
+            # nothing to count and says so.
             parts.append("no run finished, running or waiting")
 
         link_to = newest or self._newest_job(jobs)
         label = plain(settings.short_name(name))
-        linked = (f"[{label}]({_job_link(queue.region, link_to.job_id)})"
-                  if link_to is not None and link_to.job_id else label)
+        linked = (
+            f"[{label}]"
+            f"({self._link(account, _job_link(queue.region, link_to.job_id))})"
+            if link_to is not None and link_to.job_id else label)
         return Entry(
             # Region, queue *and* name: the same job name may be submitted to two
             # queues, and those are two different things to put into maintenance —
@@ -3784,7 +4590,12 @@ class AwsCheck(Check):
             # (ADR-0007 §5).
             slug(queue.region, queue.name, name),
             f"{linked}: {' · '.join(parts)}",
-            code)
+            code,
+            # Work in flight — a job submitted, waiting, starting or running — is
+            # marked as such: an italic, display only, which leaves the code what
+            # the newest finished run made it (little-sister ADR-0042 decision 6).
+            # The words say it as well, which is the rule the italic rides on.
+            running=bool(running or waiting))
 
     @staticmethod
     def _newest_job(jobs: list[Job]) -> Job | None:
@@ -3906,9 +4717,9 @@ class AwsCheck(Check):
                 names = len(runs.get((region, read.queue.name), {}))
                 said = "no job names" if not names else (
                     f"{names} job name{'' if names == 1 else 's'}")
+                link = self._link(account, _queue_link(region))
                 roster.append(f"- {f'{plain(region)} / ' if several else ''}"
-                              f"[{plain(read.queue.name)}]({_queue_link(region)})"
-                              f" — {said}")
+                              f"[{plain(read.queue.name)}]({link}) — {said}")
         found = sum(len(members) for members in queues.values())
         return self._subjects_node(
             account, BATCH, "job queues", f"Batch job queues in {account.name}",
@@ -3934,7 +4745,7 @@ class AwsCheck(Check):
         trade as a region's node does: it is the box its job names stand in
         (little-sister ADR-0063)."""
         queue = read.queue
-        line = self._queue_entry(read, len(names))
+        line = self._queue_entry(account, read, len(names))
         return CheckResult(
             StatusCode.OK if line is None else None,
             [] if line is None else [_carrying(line, reading)],
@@ -3958,8 +4769,9 @@ class AwsCheck(Check):
         its pages draw the name's runs (little-sister ADR-0106 decision 2). No run
         has a line of its own: how each run this poll read stood is said for the
         record alone (§4)."""
-        line = replace(self._job_entry(queue, name, [job for job, _ in runs], now),
-                       subject=runs[0][1].subject)
+        line = replace(
+            self._job_entry(account, queue, name, [job for job, _ in runs], now),
+            subject=runs[0][1].subject)
         short = self.batch.short_name(name)
         said = (self._job_run_entry(run, now) for _, run in runs)
         return CheckResult(
@@ -3975,8 +4787,9 @@ class AwsCheck(Check):
         and for one that still runs or waits, ``OK`` until it is past
         ``max_run_time`` or ``max_wait_time`` and ``WARN`` from then on, in a
         sentence that says for how long — the bounds its job name's line is graded
-        by, held against this run alone. A run in a status this aspect does not
-        read is said nothing of.
+        by, held against this run alone. One that is starting has no start to count
+        from, and is said as it is. A run in a status this aspect does not know is
+        said nothing of.
 
         A span is counted from the record's instants and an age to *now*, as the
         line counts them; the record's own two numbers are not read (ADR-0008). A
@@ -3998,10 +4811,12 @@ class AwsCheck(Check):
             ran = _seconds(job.started, job.stopped)
             if ran is not None:
                 said += f", ran {coarse_span(ran)}"
-        elif job.status == BATCH_RUNNING_STATUS:
+        elif job.status in BATCH_RUNNING_STATUSES:
+            # A job that is starting has no start yet, so nothing to hold against
+            # the bound: it is said as it is, OK, as the line counts it.
             code, said = self._in_flight(job.status, job.started, now,
                                          settings.max_run_seconds, "max_run_time")
-        elif job.status == BATCH_WAITING_STATUS:
+        elif job.status in BATCH_WAITING_STATUSES:
             # Waiting is measured from submission, as the line measures it.
             code, said = self._in_flight(job.status, job.created, now,
                                          settings.max_wait_seconds,
@@ -4238,7 +5053,8 @@ class AwsCheck(Check):
             return "neither listed nor counted"
         settings = self.lambda_
         parts = [f"errors graded within "
-                 f"{format_span(settings.gate_for(rule))}"]
+                 f"{format_span(settings.gate_for(rule))}, held for "
+                 f"{format_span(settings.hold_for(rule))}"]
         if not settings.expects_invocations(rule):
             parts.append("silence is fine")
         if not settings.reads_log(rule):
@@ -4248,9 +5064,17 @@ class AwsCheck(Check):
     def _pipeline_rule_effect(self, rule: Rule) -> str:
         if rule.ignore:
             return "neither listed nor counted"
-        stale = self.codepipeline.age_for(rule)
-        summary = stale.summary(format_span)
-        return f"success stales after {summary}" if summary else "not graded"
+        settings = self.codepipeline
+        # Each judgment is labeled, as an EC2 rule's two are: two warning levels on
+        # one line would read as one judgment with two of them.
+        parts = [f"{label} {summary}"
+                 for label, summary in (
+                     ("success stales after",
+                      settings.age_for(rule).summary(format_span)),
+                     ("an execution overruns after",
+                      settings.run_time_for(rule).summary(format_span)))
+                 if summary]
+        return "; ".join(parts) or "not graded"
 
     def _ec2_rule_effect(self, rule: Rule) -> str:
         if rule.ignore:
@@ -4308,6 +5132,7 @@ class AwsCheck(Check):
             "regions": ", ".join(plain(region)
                                  for region in self.regions_for(account)),
             "credentials": self._account_credentials(account),
+            "console links": self._links_summary(account),
         })
 
     def _account_credentials(self, account: Account) -> str:

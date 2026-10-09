@@ -20,7 +20,10 @@ detail:
   aspect — a terminated instance lingers in `describe_instances` for about an hour,
   so it is not counted — but a threshold is a judgment about somebody's estate, and
   this package has never seen it. An installation that grades nothing gets an
-  inventory and one log line, not an opinion.
+  inventory and one log line, not an opinion. One pair has a default all the same,
+  set where its aspect reads it and saying why there: `codepipeline`'s
+  `max_run_time`, which took over a warning the type had always given (ADR-0014
+  §3).
 - **The comparison is strictly above.** `max_per_name_warn: 1` warns at *two*,
   because the key is named for the largest value that is still fine. It follows that
   `0` is the useful spelling of "tell me about any of these at all", and that the

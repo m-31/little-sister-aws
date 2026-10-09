@@ -1,11 +1,12 @@
 # little-sister-aws — what is built
 
 What this package **is**, in enough detail to work in it without opening a decision
-record. The records say *why* each shape was chosen and what was rejected; this file
-says what is true now and what follows from it, and names the record beside each rule
-so you can go and argue with it. The division is deliberate: you should not have to
-read the records to write correct code here, and you should always read the governing
-one before **changing** a shape rather than building within it.
+record. The records say *why* each shape was chosen and what was rejected, and
+[`decisions.md`](decisions.md) digests every one in [`adr/`](adr/); this file says what
+is true now and what follows from it, and names the record beside each rule so you can
+go and argue with it. The division is deliberate: you should not have to read the
+records to write correct code here, and you should always read the governing one before
+**changing** a shape rather than building within it.
 
 Settings and their defaults are the [`README.md`](../README.md) — it ships, and it is
 written for whoever installs this package. Nothing here repeats it.
@@ -36,6 +37,11 @@ the same shape.)
    ([ADR-0002](adr/0002-aws-secret-references.md),
    [ADR-0004](adr/0004-the-s3-keeper.md)).
 
+**The import that registers the type also declares what the SDK writes into a log** —
+four noise caps on boto3's loggers (§6) — and that is all an import of this package
+does: every surface passes `__init__`, and every one of them opens its sessions through
+boto3 ([ADR-0010](adr/0010-the-package-declares-what-its-sdk-writes.md)).
+
 The line that decides what may live here at all: **what is true of the extension
 travels with the package; what names somebody's org, tenant, account, region or
 threshold belongs in a deployment's YAML.** It is the test to apply to any new knob
@@ -45,7 +51,7 @@ threshold belongs in a deployment's YAML.** It is the test to apply to any new k
 
 | | |
 |---|---|
-| `__init__.py` | the API epoch (`require_api(3)`) and the import whose side effect registers the type |
+| `__init__.py` | the API epoch (`require_api(3)`), the noise caps declared for what boto3 writes (§6), and the import whose side effect registers the type |
 | `aws.py` | the `aws` check type: configuration, the five aspects — each measured and then graded — and the tree it writes |
 | `_rules.py` | the configuration vocabulary the aspects share — a graded threshold is a pair, a rule owns names ([ADR-0003](adr/0003-a-graded-threshold-is-a-pair-and-a-rule-owns-names.md)). Private on purpose: it is shared *between the aspects*, not with anybody outside |
 | `identity.py` | the identity seam (§4) |
@@ -133,6 +139,22 @@ line where the account reads several; a line on a subject's own node prints none
   an account may legitimately run no EC2, and it passes that verdict in rather than
   spelling the sentence again ([ADR-0003](adr/0003-a-graded-threshold-is-a-pair-and-a-rule-owns-names.md)
   is the same instinct applied to thresholds).
+- **A link is the console's own address, or that address in what the deployment wraps
+  it in** ([ADR-0013](adr/0013-a-console-link-opens-the-account-it-names.md)). The
+  console's address names no account and opens in whichever one the browser is signed
+  in to, so every link a line or a roster writes goes through
+  `_link(account, address)`: the address as it is where neither the check nor the
+  account sets `console_link`, and otherwise the account's template — its own, or the
+  check's (`console_link_for`) — filled by `_wrapped`, `{url}` with the address and
+  `{account_id}` with the account's id, each percent-encoded whole. **The id is the
+  configuration's, and no call asks for it**: `Account.account_id` is the entry's
+  `account_id` or the one its `role_arn` names, read where the accounts are parsed
+  (`_parse_account_id`). What cannot be a link is refused when the check loads — a
+  template that is not written as a URL is, or names a token but the two
+  (`_parse_console_link`), and a template that names the id over an account that says
+  none (`_hold_account_ids`). The id reaches the address of a link and nothing else: no
+  path, slug, subject or record. Where an account's links open is a row of its card
+  (`_links_summary`) — the account's, and the check's own where it names one account.
 - **A rule that matches nothing goes to the log and never to a node.** It is a fact
   about the *configuration*, not about the estate, and coloring a card over a typo in
   a file sends somebody hunting through an account where nothing is wrong.
@@ -147,7 +169,9 @@ line where the account reads several; a line on a subject's own node prints none
   that the configuration now ignores, leaves with that run — and never where it could
   not be read, so the nodes stay. A queue's node says it of its job names in every run
   that lists it, read at its cap too: a name that fell behind `max_jobs` would otherwise
-  stand stale beneath it (ADR-0009 §2). A node whose children are configuration — the
+  stand stale beneath it (ADR-0009 §2). That is why `BATCH_STATUSES` is every status
+  Batch has, each a `ListJobs` call: a name whose one job was in a status not asked for
+  left the tree for that poll. A node whose children are configuration — the
   root's accounts or aspects, an aspect's regions — never says it: a run cannot find one
   of those gone.
 - **A node this type does not name says so** (`dynamic=True`, little-sister ADR-0118): a
@@ -205,21 +229,65 @@ little-sister ADR-0086); each aspect is a `_measure_<aspect>` beside a
   node stand for it (little-sister ADR-0106 decision 2); every run the poll read is said
   for the record alone, in `for_record` (`_run_entry`), `ERROR` where it counted an
   error.
+- **A function's line holds an error it saw**
+  ([ADR-0012](adr/0012-a-functions-line-holds-an-error-it-saw.md)). Beside the newest
+  bucket, the `function` reading carries the newest **error** in the window the function
+  was asked — `error.at`, the clean buckets since, and what the buckets inside the
+  function's hold count together (`_errors_held`), from the same answer and at no
+  request more — and the grading keeps the line at ERROR while that error is younger
+  than `error_hold` (`_held`):
+  *3 errors in the last 1h, the newest 23m ago · 2 clean runs since, the last 2m ago*.
+  The hold is a duration, a key of the `lambda:` block and of its rules, an hour by
+  default or the gate where that is shorter (`LambdaConfig.hold_for`); `0s` is no hold;
+  written longer than the gate, or than the fifteen days of one-minute points, it is
+  refused when the check loads (`_hold_within_gate`). The window a function is asked in
+  reaches the hold as well as its series (`_window`). A run's own record and verdict are
+  untouched.
 - **A job name and a pipeline stand on nodes as a function does, and each run and each
   execution is said for the record**
   ([ADR-0009](adr/0009-a-job-name-and-a-pipeline-have-nodes.md)). A job name's line is
-  written from every run of the name, carries none and names the job name as its subject
-  (`_job_node`); each run the poll read is said in `for_record` with a verdict of its
-  own (`_job_run_entry`) — `OK` or `ERROR` once it has finished, and while it runs or
-  waits `OK` until it is past `max_run_time` or `max_wait_time`, counted to the `now`
-  the grading is handed. A pipeline's line carries the reading of its newest execution,
-  the one that started last (`_pipeline_node`). Where `series_keep` is set, the
-  measuring half reads behind it, out of the one page it asks for, every execution
-  `self.kept(subject)` lacks or holds in a status outside `_EXECUTION_ENDED`, as many as
-  the series keeps (`_lacking`) — and, once, the kept execution that started last, or
-  each of several that started at one instant, where the page's newest is none of them:
-  what stood for it was the pipeline's line. The grading says of each what its status
-  means in `state_map` (`_execution_entry`), and of one that was `Superseded`, nothing.
+  written from every run of the name, carries none, names the job name as its subject
+  and is marked `running` while a job of the name waits or runs,
+  little-sister ADR-0042 decision 6 (`_job_node`); each run the poll read is said in
+  `for_record` with a verdict of its own (`_job_run_entry`) — `OK` or `ERROR` once it
+  has finished, and while it runs or waits `OK` until it is past `max_run_time` or
+  `max_wait_time`, counted to the `now` the grading is handed. A pipeline's line carries
+  the reading of the execution it is written from (`_pipeline_node`, `_line_index`): its
+  newest, the one that started last, unless that one is in flight on a first run, and
+  then the newest behind it with a verdict to keep — one neither in flight nor
+  superseded, or one on a retry
+  ([ADR-0014](adr/0014-a-pipelines-line-keeps-its-verdict-while-an-execution-is-in-flight.md)).
+  Where `series_keep` is set, the measuring half reads behind the newest, out of the one
+  page it asks for, every execution `self.kept(subject)` lacks or holds in a status
+  outside `_EXECUTION_ENDED`, as many as the series keeps (`_lacking`) — and, once, the
+  execution the history holds as the line's, or each of several that started at one
+  instant (`_carried`), where the line is now written from another: what stood for it
+  was the pipeline's line. The grading says of each what its status means in
+  `state_map`, raised past `max_run_time` while it is in flight (`_execution_entry`),
+  and of one that was `Superseded`, nothing.
+- **A pipeline's line keeps its verdict while an execution is in flight**
+  ([ADR-0014](adr/0014-a-pipelines-line-keeps-its-verdict-while-an-execution-is-in-flight.md)).
+  `InProgress` passes (`DEFAULT_PIPELINE_STATE_MAP`), and an execution is in flight
+  while its status is in `_EXECUTION_IN_FLIGHT`, `InProgress` or `Stopping`. Beside the
+  newest, the measuring half hands the grading the execution the line is written from
+  and every one in flight, out of the page it already reads (`_read_pipelines`). The
+  line says that execution's verdict (`_verdict_of`) and what is in flight, a phrase for
+  each status (`_in_flight_phrase`, `_by_status`), is the worse of them, and is marked
+  `running` while anything is in flight (`_pipeline_entry`). `max_run_time` is a pair on
+  `codepipeline` whose default, `DEFAULT_PIPELINE_RUN_TIME`, warns above thirty minutes
+  — the one pair of the type with a default — held on the line against the oldest
+  execution in flight in each status, and for the record against each. A retry is an
+  execution in flight that the history holds `Failed` or `Stopped`
+  (`_EXECUTION_RETRIED_FROM`) or holds on a retry already: where `series_keep` is set,
+  the measuring half asks for one page of its action executions at every poll while it
+  runs (`_retried`, `_actions`, `_ACTIONS_PAGE`), what the check kept deciding what it
+  asks (little-sister ADR-0113 decision 3). The answer rides on the reading as a `Retry`
+  — how many action executions failed and how many were abandoned, when the retry began,
+  a refusal's words — and is kept in the record's `retry` block (`_pipeline_reading`,
+  `_retry_of`). What it says the execution had ended in (`_ended_in`) is the verdict the
+  line keeps (`_gives_verdict`, `_line_index`), the bound counts from the retry's start
+  (`_begun`), and a refusal leaves the line as for a first run, warning with its words
+  (`_in_flight_phrase`).
 - **What a poll asks of CloudWatch is decided by what the check kept**
   (`_read_functions`, little-sister ADR-0113). `self.kept(subject)` is read before
   anything is asked, and only where `series_keep` is set: each function is asked
@@ -283,6 +351,23 @@ it); `open_session()` turns one into a boto3 session whose credentials have been
 lock and a cooldown, and it is exported rather than reimplemented: two instances would
 each hold half of the machine's history and open two browsers for one expiry.
 
+**Every session is built on the process's one loader of service models**
+([ADR-0011](adr/0011-one-loader-of-service-models-for-every-session.md)).
+`new_session()` builds the botocore core session itself, registers `SERVICE_MODELS`'s
+loader as its `data_loader` component and hands it to boto3, so a service's model —
+its JSON and the endpoint ruleset beside it — is parsed for the first client of that
+service in the process and never again, where a session of boto3's own parses it for
+itself: three accounts, thirty runs, 424 MiB at the highest against 95. Every surface
+reaches that builder: the check through its `_new_session` seam, the keeper and the
+secret provider through `open_session`'s default factory, and a deployment's own
+code through either. `SERVICE_MODELS` is process-wide for the reason `SSO_LOGINS` is —
+two checks in one process must not parse twice — and holds one loader for each search
+path a session resolves, built by botocore's own `create_loader`, so `AWS_DATA_PATH`
+and a profile's `data_path` keep their meaning. Its search path takes a directory
+once, because boto3 appends its own to the loader of every session it builds. **A
+session is still a run's**: nothing of a run's sessions outlives it, the credentials
+are proven at the top of each run, and the record says what would change that.
+
 `is_credential_error()` is the reading every caller shares — *stale credentials* as
 against *AWS said no* — and its docstring carries what it answers in each of the four
 SSO states, measured. The three callers act on it differently on purpose: the check
@@ -292,7 +377,8 @@ the keeper does not renew at all.
 **The surface is released and frozen**: `Identity`, `base_session`, `assumed_session`,
 `open_session`, `login_capability`, `login_problem`, `run_sso_login`, `SsoLogins`,
 `SSO_LOGINS`, `parse_sso_block`, `parse_optional_text` and their error parts went out
-with 0.1.1. A change to any of them is a version, not an edit.
+with 0.1.1, `new_session` unlisted among them; `ServiceModels` and `SERVICE_MODELS`
+with 0.1.6. A change to any of them is a version, not an edit.
 
 Three changes to it have been asked for and answered, all by the S3 keeper having
 been written against the released shape — a `region` on the identity, a refreshing
@@ -387,60 +473,28 @@ role ([ADR-0002](adr/0002-aws-secret-references.md)).
 - **boto3 is the one dependency beyond the library**, argued in
   [ADR-0001](adr/0001-the-aws-check-type.md) §3: signing SigV4 by hand would be a
   signing implementation and its test suite, bought for one dependency saved.
-
-## 7. The records that bind this package
-
-Each is digested in one or two lines here; the record carries the argument and what
-was rejected. Read one before changing what it decided.
-
-- **[ADR-0001](adr/0001-the-aws-check-type.md) — the `aws` check type.** One type with
-  aspects rather than one type per service; account first, where a check names several,
-  and aspect second, three of the aspects handing back nodes for what they read; boto3
-  over stdlib; a package rather than a deployment's private code; **§5** the identity
-  seam and its two rules; **§6** the readers the seam carries for its callers; **§7**
-  the secret provider living here too.
-- **[ADR-0002](adr/0002-aws-secret-references.md) — AWS secret references.** What
-  `aws-sm://` and `aws-ssm://` address, why a named identity is a **scheme** rather
-  than part of the address, and why registration is the deployment's call.
-- **[ADR-0003](adr/0003-a-graded-threshold-is-a-pair-and-a-rule-owns-names.md) — a
-  graded threshold is a pair, and a rule owns names.** The configuration vocabulary
-  `_rules.py` implements, and why one number that produced one severity had to go.
-- **[ADR-0004](adr/0004-the-s3-keeper.md) — the S3 keeper.** Its own aspect; one
-  lease per prefix, held by a heartbeat every interval and taken by a conditional
-  write, with the state files written unconditionally behind it; standby instead of a
-  latch; the bounded client, and the session re-opened once at call time. **§8**
-  liveness measured inside one S3 answer and release as a heartbeat of zero; **§9**
-  reporting by the library's loss principle, WARN for a standby, and the two actions
-  the web app owes; **§10** versioning off and checked once; **§12** the bucket as a
-  mirror of bounded memory, never a history.
-- **[ADR-0005](adr/0005-a-run-is-its-readings-and-the-runs-keep-a-history.md) — a
-  run is its readings, and only the runs and the estate keep a history.** The
-  conversion to little-sister's measure/grade split: one reading per thing a run read,
-  the configuration split by what it spares, a history only for a Batch job's runs, a
-  pipeline's executions, a function's runs and the estate, a subject that names an
-  account by its configured name, and a root that grades nothing above its accounts.
-- **[ADR-0006](adr/0006-a-functions-runs-are-kept-and-a-function-has-a-node.md) — a
-  function's runs are kept, and a function has a node.** A run is a one-minute bucket of
-  CloudWatch's metric, kept under its function; the function's reading and its line stay
-  what they are, and a run is read in full, by a second call, only once it exists; a
-  function asked in the smallest of three windows — an hour, a day, fifteen days — that
-  reaches its kept runs; a bucket read again until a poll has read it an hour old;
-  `duration_ms`, the slowest invocation, declared as a measure; and a node for every
-  function, whose line names it.
-- **[ADR-0007](adr/0007-a-level-stands-only-where-the-configuration-names-several.md) —
-  a level stands in the tree only where the configuration names several.** No account
-  level where a check names one account and no region level where an account reads one
-  region, the aspect always; a subject and a slug keep every part, so a history survives
-  a change of shape and a path does not.
-- **[ADR-0008](adr/0008-a-run-and-an-execution-say-how-long-they-took.md) — a run and an
-  execution say how long they took.** A Batch run's record carries `wait_s` and
-  `duration_s`, a pipeline's `duration_s`, from its execution's start to its last
-  change: whole seconds, each once both its instants are known and an execution's once
-  it is over, none counted to a poll's clock; both declared as measures in `s`.
-- **[ADR-0009](adr/0009-a-job-name-and-a-pipeline-have-nodes.md) — a job name and a
-  pipeline have nodes.** A pipeline's node beneath `codepipeline` and a job name's
-  beneath a node for its queue, which is a level in every Batch path; a job name's line
-  that carries no run, and each run said for the record with a verdict of its own; a
-  poll that reads, out of the page it asks for, the executions a pipeline's history
-  lacks or holds unfinished, each said for the record by its status and a superseded one
-  not at all; and a job name the list hides, which is not kept.
+- **What boto3 writes into a deployment's log is declared, and no level is set**
+  ([ADR-0010](adr/0010-the-package-declares-what-its-sdk-writes.md)). `__init__.py`
+  declares four rows through `little_sister.noise.cap` (little-sister `architecture.md`
+  §11): `botocore` and `urllib3` at `INFO`, which takes the SDK's `DEBUG` lines — a
+  session's token and what a call answered among them — and `botocore.credentials` and
+  `botocore.tokens` at `WARNING`, which takes the sentence a new session says of
+  itself. little-sister sets the rows where the application is imported; a level the
+  deployment's startup file set stands against them, `LOG_LEVEL` has a logger back by
+  name, and nothing the SDK says as a warning is taken out. No row reaches what a
+  startup file reads from AWS before that import. A row names a logger that is
+  botocore's to rename, so `tests/test_noise.py` has the SDK itself write each kind of
+  line — in an interpreter of its own, which sends nothing to AWS — and holds the rows
+  and the two tables that print them against it. A new use of the SDK that writes under
+  another logger, a resource or a managed transfer, is measured and declared with it.
+- **Every session stands on botocore's component seam**
+  ([ADR-0011](adr/0011-one-loader-of-service-models-for-every-session.md)):
+  `register_component('data_loader', …)` on the core session, which every client
+  creation reads back with `get_component`. Public by name and held apart from
+  botocore's internal components, and the seam boto3 itself stands on through its
+  `botocore_session` argument — but not a page of botocore's published reference,
+  which documents the loader and not the session. So `tests/test_service_models.py`
+  holds it, with the SDK itself in the process: two sessions the check builds share
+  one loader object, and a client from each is built on the one model that loader's
+  cache holds. The day a botocore release stops reading the component, the second is
+  the test that goes red, where the weight would otherwise come back without a word.

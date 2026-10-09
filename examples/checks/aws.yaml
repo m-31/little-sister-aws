@@ -102,14 +102,44 @@ regions: [eu-central-1]
 # role_session_name: little-sister   # the default; it is what CloudTrail shows
 # sts_region: eu-central-1           # where the AssumeRole call itself is made
 
+# --- Console links -------------------------------------------------------------
+# A name on a line links to its page in the AWS console, and that address names no
+# account: the console opens it in whichever account your browser is signed in to —
+# the other account's resource of that name, where two accounts carry one. A
+# `console_link` template wraps every link of an account in an address that signs in
+# to that account first. IAM Identity Center's access portal takes one in the shape
+# below; `role_name=<a permission set>` is one more parameter where you want the role
+# named, and the portal asks which where it is not.
+#
+#   {url}         the console's address of what the line names
+#   {account_id}  the account's id: read out of its `role_arn`, or its `account_id:`
+#
+# Each goes in percent-encoded. A template has to name {url}; one that names any
+# other token is refused when the check loads, and so is one that holds whitespace,
+# a backtick, a backslash, a parenthesis or an angle bracket — write those
+# percent-encoded. Unset, a link is the console's own address, and the account's
+# card says under *console links* that it opens in whichever account the browser is
+# signed in to. Set, the card shows the template — and where the template names
+# {account_id}, the account's id is in every link of that account, wherever its line
+# goes: an event, History, what a client polls, a line somebody pastes into a ticket.
+#
+# console_link: "https://example.awsapps.com/start/#/console?account_id={account_id}&destination={url}"
+
 # --- The accounts ------------------------------------------------------------
 # `name` is the node's path segment: keep it stable, because every maintenance pin
 # under this check hangs off it. `role_arn` may be omitted for an account reachable
-# with the ambient credentials directly. `regions` and `profile` each **replace**
-# the default rather than adding to it. `title` / `about` are this installation's
-# own words for the account, and label its node — so a check that names ONE account,
-# which has no such node, says them in its own `title:` / `about:` above. Written on
-# that one account they are read and not shown, and the log says so once at load.
+# with the ambient credentials directly. `regions`, `profile` and `console_link` each
+# **replace** the default rather than adding to it. `title` / `about` are this
+# installation's own words for the account, and label its node — so a check that
+# names ONE account, which has no such node, says them in its own `title:` / `about:`
+# above. Written on that one account they are read and not shown, and the log says so
+# once at load.
+#
+# `account_id` is for an account that names no `role_arn`: a template that names
+# {account_id} needs the id, and there is no role to read it from. Twelve digits, in
+# quotes — YAML reads an unquoted number that starts with 0 as another number.
+# Beside a `role_arn` in another account it is refused, and a template that names
+# {account_id} over an account that says neither is refused too.
 accounts:
   - name: live
     role_arn: arn:aws:iam::000000000000:role/application/monitoring-role
@@ -120,6 +150,10 @@ accounts:
     role_arn: arn:aws:iam::000000000001:role/application/monitoring-role
     regions: [eu-west-1]           # replaces the default, does not add to it
     title: Backup (Ireland)
+    # This account's own template replaces the check's — another portal, or the same
+    # one with the role its people take here:
+    # console_link: "https://example.awsapps.com/start/#/console?account_id={account_id}&role_name=ReadOnlyAccess&destination={url}"
+    # account_id: "000000000001"   # only where there is no `role_arn` to read it from
 
 # --- The aspects -------------------------------------------------------------
 # Each block opens with `enabled:`. Off, the aspect emits no node **and makes no
@@ -270,6 +304,17 @@ lambda:
   # fact about CloudWatch rather than about your estate.
   error_max_age: 14d
 
+  # How long an error the function saw stays on its line once clean runs have
+  # followed it: while the newest error is younger than this, the line is ERROR
+  # and says how many errors the hold holds, when the newest was and what ran
+  # clean since — so an error between two clean runs is not ERROR for one poll
+  # and OK the next. An hour by default — `error_max_age` where that is shorter —
+  # which costs no request: the hour is the smallest window a function is asked
+  # anyway. `0s` is no hold (the newest run alone decides); a hold written longer
+  # than `error_max_age`, or than the 15 days CloudWatch keeps a one-minute point
+  # for, is refused.
+  error_hold: 1h
+
   # Read the newest log event per function and take its status word (REPORT, END,
   # ERROR, …). Two API calls per function per run — the expensive half of this
   # aspect. Set false to grade on the metric alone.
@@ -301,16 +346,19 @@ lambda:
     - name: the nightly batch
       prefixes: [batch-]
       error_max_age: 30d           # it runs rarely; grade an error for longer
+      error_hold: 1d               # and hold one for a day, not an hour
       read_log_status: false       # and do not pay two API calls for it
 
 codepipeline:
   enabled: true
 
   # Every pipeline has a node of its own beneath `codepipeline`, named by what AWS
-  # calls it; its line stands there and says what its newest execution did. With
-  # `series_keep` set above, a poll also reads, out of the one page of executions it
-  # asks for anyway, every execution the pipeline's history lacks or holds
-  # unfinished, and the pipeline's node draws them. Nothing here configures that.
+  # calls it; its line stands there and says what its newest execution did — or,
+  # while that one is in flight, what the newest finished one did, with what is in
+  # flight beside it, in italics. With `series_keep` set above, a poll also reads,
+  # out of the one page of executions it asks for anyway, every execution the
+  # pipeline's history lacks or holds unfinished, and the pipeline's node draws them.
+  # Nothing here configures that.
 
   # How long a *successful* run stays evidence that the pipeline still works, as a
   # pair of levels with no defaults — how long a success lasts depends on how often
@@ -319,6 +367,15 @@ codepipeline:
   max_age_warn: 31d
   max_age_error: 90d
   max_age_reason: "Nobody has released through this pipeline in months."
+
+  # How long an execution may be in flight — `InProgress` or `Stopping` — before the
+  # line warns, measured on the oldest in flight. The one pair this type gives a
+  # default: a warning above 30m, which is what applies where nothing is written.
+  # Written, the pair is taken as it is, so an error level alone warns at nothing;
+  # `max_run_time: null` switches it off.
+  max_run_time_warn: 30m
+  max_run_time_error: 4h
+  max_run_time_reason: "A deployment here takes ten minutes."
 
   # A set of pipelines with its own clock. Same shape as the `ec2` rules above:
   # checked in order, first match decides, a level not named here is inherited
@@ -336,15 +393,20 @@ codepipeline:
     - name: release pipelines
       prefixes: [release-]
       max_age: null                # runs when we release, so never stale
+      max_run_time: null           # waits at a manual approval for as long as it takes
 
   # PipelineExecutionStatus -> the code that line reports, matched case-insensitively.
-  # A pipeline that has never been executed warns rather than being left out. A kept
-  # execution that is no longer the newest is marked by this map too — except one a
-  # newer execution overtook: `Superseded` is an error on the line of a pipeline
-  # whose newest execution it is, and behind the newest it is marked as neither.
+  # `InProgress` passes: an execution in flight is a deployment under way, and the
+  # line keeps the verdict of the newest finished one while it runs. What is in
+  # flight can make the line worse and never better, so `InProgress: WARN` here makes
+  # every deployment yellow again. A pipeline that has never been executed warns
+  # rather than being left out. A kept execution that is not the line's is marked by
+  # this map too — except one a newer execution overtook: `Superseded` is an error on
+  # the line of a pipeline whose newest execution it is, and otherwise it is marked as
+  # neither.
   state_map:
     Succeeded: OK
-    InProgress: WARN
+    InProgress: OK
     Failed: ERROR
     Stopped: ERROR
     Stopping: ERROR
@@ -372,12 +434,15 @@ batch:
   # running job decides, so a queue that keeps starting fresh ones cannot reset it.
   max_run_time: 2h
 
-  # How long a job may sit RUNNABLE — accepted by the queue, waiting for capacity
-  # that has not appeared — before its line warns. Measured from submission,
-  # because such a job has never started.
+  # How long a job may wait before its line warns: RUNNABLE — accepted by the
+  # queue, waiting for capacity that has not appeared — or SUBMITTED or PENDING,
+  # not yet placed or held by a job it depends on. An array job is PENDING while its
+  # children run, so a deployment whose arrays run long sets this above their run.
+  # Measured from submission, because such a job has never started.
   max_wait_time: 30m
 
-  # How many jobs are read per queue per status, newest first. Reaching this bound
+  # How many jobs are read per queue per status, newest first — of each of the
+  # seven a job can be in, one ListJobs call apiece. Reaching this bound
   # is said out loud on the queue's node rather than silently truncating, and a job
   # name whose runs are no longer among those read has no node until it runs again.
   max_jobs: 100

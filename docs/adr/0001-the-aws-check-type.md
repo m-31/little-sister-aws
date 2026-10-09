@@ -1,17 +1,18 @@
 # ADR-0001 — The `aws` check type: account nodes, aspect leaves, and boto3
 
 - **Status:** Accepted
-- **Date:** 2026-10-04 (the type was accepted 2026-08-09)
+- **Date:** 2026-10-10 (the type was accepted 2026-08-09)
 - **Related:** [ADR-0002](0002-aws-secret-references.md) (the secret references the
   identities on this package's seam are read with),
-  [ADR-0007](0007-a-level-stands-only-where-the-configuration-names-several.md)
-  (where the account's level stands),
+  [ADR-0007](0007-a-level-stands-only-where-the-configuration-names-several.md) (where
+  the account's level stands),
   [ADR-0006](0006-a-functions-runs-are-kept-and-a-function-has-a-node.md) and
   [ADR-0009](0009-a-job-name-and-a-pipeline-have-nodes.md) (the aspects that hand back
-  nodes), little-sister **ADR-0042** (coded entries), little-sister **ADR-0043** /
-  little-sister **ADR-0044** (the coverage reading and the roster), little-sister
-  **ADR-0025** (subnode text); the lift-out this record promised has happened, and this
-  package is the result
+  nodes), [ADR-0013](0013-a-console-link-opens-the-account-it-names.md) (an account's
+  links, and the id they may carry), little-sister **ADR-0042** (coded entries),
+  little-sister **ADR-0043** / little-sister **ADR-0044** (the coverage reading and the
+  roster), little-sister **ADR-0025** (subnode text); the lift-out this record promised
+  has happened, and this package is the result
 
 > This record was written in the deployment whose AWS checks this type replaced and
 > traveled here with the code: *that codebase* in the Context below is that
@@ -80,6 +81,12 @@ what such a split is usually carrying, and the tree carries the account.
 each job name beneath it ([ADR-0009](0009-a-job-name-and-a-pipeline-have-nodes.md)). An
 alarm's line and an instance name's stay on their aspect's node, and the region stays in
 their slugs.
+
+**An account's entry takes two keys for its links**, beside those that say where it is
+read from ([ADR-0013](0013-a-console-link-opens-the-account-it-names.md)):
+`console_link`, a template the type fills for every link it writes for the account,
+readable at the check and on an account exactly like `regions:` and `profile:` below;
+and `account_id`, for an account that names no role to read its id from.
 
 **The credential half of the same decision: from where, into what.** An account has its
 own session, and its own node where a check names several; where the session the role is
@@ -269,7 +276,9 @@ which is exactly why it sits *beside* the seam and never in it.
   ([ADR-0007](0007-a-level-stands-only-where-the-configuration-names-several.md) §6).
   Neither the path nor the slug carries the alarm ARN, because that carries the account
   id and a private string in a `?reason=` value is a private string in somebody's
-  bookmark.
+  bookmark. Nor does a link the type builds by itself: the console address names no
+  account, and the id is in a link only where a deployment's `console_link` names it
+  (§2).
 - Two gradings are deliberate and worth knowing on the first run, because the
   cheaper reading of each is the one people expect: `INSUFFICIENT_DATA` is a
   **WARN**, not an OK, since an alarm with no data is usually an alarm whose metric

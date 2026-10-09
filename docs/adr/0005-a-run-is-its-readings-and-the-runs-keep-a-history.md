@@ -1,26 +1,29 @@
 # ADR-0005 — A run is its readings, and only the runs and the estate keep a history
 
 - **Status:** Accepted
-- **Date:** 2026-10-04 (accepted 2026-09-26)
+- **Date:** 2026-10-10 (accepted 2026-09-26)
 - **Related:** [ADR-0001](0001-the-aws-check-type.md) (account first, aspect second —
-  the tree this kept — and the account id kept off every slug and link),
+  the tree this kept — and the account id kept off every slug, and off every link the
+  type builds by itself),
   [ADR-0003](0003-a-graded-threshold-is-a-pair-and-a-rule-owns-names.md) (the
   configuration vocabulary this splits between the two halves),
   [ADR-0006](0006-a-functions-runs-are-kept-and-a-function-has-a-node.md) (a function's
   runs, the fourth history),
-  [ADR-0007](0007-a-level-stands-only-where-the-configuration-names-several.md)
-  (the root that stands for a check's one account),
+  [ADR-0007](0007-a-level-stands-only-where-the-configuration-names-several.md) (the
+  root that stands for a check's one account),
   [ADR-0008](0008-a-run-and-an-execution-say-how-long-they-took.md) (how long a run and
-  an execution took),
-  [ADR-0009](0009-a-job-name-and-a-pipeline-have-nodes.md) (a job name's and a
-  pipeline's nodes, what is said of a run for the record, and the executions a poll
-  reads), little-sister **ADR-0086** (a check measures and then grades what it measured
-  — the split this is the conversion to), little-sister **ADR-0087** (a subject's
-  readings kept as its series, the identity or the state that says whether a reading is
-  a new record, and what a kept reading keeps of where it stood), little-sister
-  **ADR-0085** (one shape for every reading), little-sister **ADR-0082** (a line's
-  `data` and `subject`, and the typed times), little-sister **ADR-0111** (a line written
-  for the record alone), `little-sister-github` ADR-0013 and ADR-0014 and
+  an execution took), [ADR-0009](0009-a-job-name-and-a-pipeline-have-nodes.md) (a job
+  name's and a pipeline's nodes, what is said of a run for the record, and the
+  executions a poll reads), [ADR-0012](0012-a-functions-line-holds-an-error-it-saw.md)
+  (the error a function's line holds),
+  [ADR-0013](0013-a-console-link-opens-the-account-it-names.md) (a link that may carry
+  the account id), little-sister **ADR-0086** (a check measures and then grades what it
+  measured — the split this is the conversion to), little-sister **ADR-0087** (a
+  subject's readings kept as its series, the identity or the state that says whether a
+  reading is a new record, and what a kept reading keeps of where it stood),
+  little-sister **ADR-0085** (one shape for every reading), little-sister **ADR-0082**
+  (a line's `data` and `subject`, and the typed times), little-sister **ADR-0111** (a
+  line written for the record alone), `little-sister-github` ADR-0013 and ADR-0014 and
   `little-sister-wiz` ADR-0003 (the packages through the split before this one — their
   readings, their configuration split and their line rule, taken here in this
   vocabulary)
@@ -75,7 +78,7 @@ nothing the line does not need but what a kept run should carry:
 | `unreadable` | each | `error` |
 | `alarm` | `cloudwatch` | `name`, `state`, `description`, `composite` |
 | `instance` | `ec2` | `id`, `name`, `state`, `started` |
-| `function` | `lambda` | `name`, `errors`, `at`, `log_status`, `log_note`, `log_error` |
+| `function` | `lambda` | `name`, `errors`, `at`, `error` — the newest error in the window the function was asked, its `at`, `held` and `clean_since`, `null` where the window holds none; `log_status`, `log_note`, `log_error` |
 | `run` | `lambda` | `name`, `at`, `invocations`, `errors`, `duration_ms` |
 | `pipeline` | `codepipeline` | `name`, `execution`, `status`, `started`, `duration_s`, `at` |
 | `queue` | `batch` | `name`, `state`, `status`, `reason`, `capped` |
@@ -87,9 +90,13 @@ the names little-sister reads as an instant — `at`, `started` or `ended`, at t
 the record or nested (little-sister ADR-0082) — since under any other name it is only a
 string to every surface that shows a record: an instance's launch is its `started`, a
 function's newest invocation its `at`, the instant its line reports, as a pipeline's is,
-and a job's creation, which has no such name of its own, `created.at`. A job's `reason`
-is Batch's `statusReason`: no line says it, and a kept run is poorer without it. A
-function's run is the minute it was invoked in, and its `at` that minute's start
+and a function's newest error and a job's creation, which have no such name of their
+own, `error.at` and `created.at`. A job's `reason` is Batch's `statusReason`: no line
+says it, and a kept run is poorer without it. A function's `error` is the error its line
+holds ([ADR-0012](0012-a-functions-line-holds-an-error-it-saw.md)): the newest in the
+window the function was asked, the clean buckets since it, `clean_since`, and what the
+buckets inside the function's hold count together, `held`. A function's run is the
+minute it was invoked in, and its `at` that minute's start
 ([ADR-0006](0006-a-functions-runs-are-kept-and-a-function-has-a-node.md) §1). How long a
 Batch run waited and ran and how long an execution took are whole seconds: a run's
 `null` until both of its instants are known, an execution's until it is over
@@ -104,7 +111,7 @@ grading makes, as it always was, and has no reading of its own.
 
 ### 2. The configuration is split by what it spares
 
-`little-sister-github` ADR-0014 §5's rule: a setting that **spares a request** stays in
+little-sister-github ADR-0014 §5's rule: a setting that **spares a request** stays in
 the measuring half, because the reading it saves is never taken; one that only
 **chooses what is said** moves to the grading, because a reading that left something
 out would be a reading of the configuration rather than of AWS.
@@ -184,11 +191,16 @@ character in an account name, a subject is its kind, `/`, and `sha256:` with 32 
 digits of the rest: still that kind's and still one object's, and never a refusal of a
 configuration that loaded before.
 
-**Not the account id.** It is AWS's identifier for the account, one a rename cannot
-move and two checks reading one account would share — and it is the private string
-[ADR-0001](0001-the-aws-check-type.md) keeps off every slug and every link, because
-those end up in bookmarks and tickets. A subject is exactly where it would spread: the
-envelope a client polls, the series file, and every line that names a subject.
+**Not the account id.** It is AWS's identifier for the account, one a rename cannot move
+and two checks reading one account would share — and it is the private string
+[ADR-0001](0001-the-aws-check-type.md) keeps off every slug, because slugs end up in
+bookmarks and tickets. A subject is exactly where it would spread: the envelope a client
+polls, the series file, and every line that names a subject. So no subject and no
+reading's record carries it. A link does only where a deployment asks: its
+`console_link`, a template that wraps an account's links, may name the account's id
+([ADR-0013](0013-a-console-link-opens-the-account-it-names.md)), which is then in the
+address of a line's link, and so in the text a kept reading keeps of a pipeline's line —
+the configuration's, out of the account's `role_arn` or its `account_id`.
 
 **Nor is the name the editorial label** little-sister ADR-0086 decision 4 keeps out of
 subjects, although it is a path segment where a check names several accounts. It comes
@@ -302,7 +314,7 @@ way.
 
 ### 7. A line made from one reading carries it
 
-`little-sister-github` ADR-0014 §7's rule: a line the grading writes out of **one**
+little-sister-github ADR-0014 §7's rule: a line the grading writes out of **one**
 reading carries that reading's record as its `data` and its subject as its own — an
 alarm's, a pipeline's, a queue's own line, a name's line where one instance carries the
 name, and a region that could not be read. A line written out of several carries none: a
@@ -396,7 +408,8 @@ will refuse that configuration at startup, by name, instead of at every run.
   a function was invoked in and not by its newest invocation (ADR-0006).
 - **Alarms alone as well.** Refused in §3 for the number, not the object.
 - **AWS's account id in a subject.** Refused in §4: the private string ADR-0001 keeps
-  off every slug and link, in exactly the places a subject goes.
+  off every slug, and off every link the type builds by itself, in exactly the places a
+  subject goes.
 - **`:` between a subject's parts**, as `little-sister-github`'s have it. An account
   name may hold one; nothing in a subject here may hold `/`.
 - **One reading per job name**, carrying its newest finished run and what is in flight,

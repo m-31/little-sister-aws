@@ -1,7 +1,7 @@
 # ADR-0006 — A function's runs are kept, and a function has a node
 
 - **Status:** Accepted
-- **Date:** 2026-10-03
+- **Date:** 2026-10-10 (accepted 2026-10-03)
 - **Related:** [ADR-0005](0005-a-run-is-its-readings-and-the-runs-keep-a-history.md)
   (one reading per thing a run read, which readings have a history, how a subject is
   spelled and what a line carries — its §1, §3, §4, §5 and §7 are amended here),
@@ -17,7 +17,9 @@
   line written for the record alone), little-sister **ADR-0092** (a check declares its
   measures), little-sister **ADR-0086** (a line's subject is its reading's — the rule
   little-sister ADR-0106 amends for the line of §9), little-sister **ADR-0118** (a node
-  a run names says so, and takes nothing declared for its name)
+  a run names says so, and takes nothing declared for its name),
+  [ADR-0012](0012-a-functions-line-holds-an-error-it-saw.md) (the error a function's
+  line holds)
 
 > Every reference to one of little-sister's records is written out as **little-sister
 > ADR-00NN**, because the two numbering spaces overlap.
@@ -93,21 +95,25 @@ function's runs are a fourth history, with a subject and an event of their own.
 Two things a bucket cannot do: tell two invocations within one minute apart, and stand
 for one run where a function is invoked all the time.
 
-### 2. The function's reading stays what it is, and a run is a record of its own
+### 2. The function's reading stays one reading, and a run is a record of its own
 
 **Every poll reads each function's newest bucket, as it does today, and a run is read in
 full once it exists.** So the aspect hands back two kinds of record for a function:
 
 | kind | fields | subject |
 |---|---|---|
-| `function` | `name`, `errors`, `at`, `log_status`, `log_note`, `log_error` — unchanged | none: read and graded, and kept no longer than its node |
+| `function` | `name`, `errors`, `at`, `error`, `log_status`, `log_note`, `log_error` | none: read and graded, and kept no longer than its node |
 | `run` | `name`, `at`, `invocations`, `errors`, `duration_ms` | the function, by §1: kept as its series |
 
-The function's reading is what it always was, and its line is written from it (§9). It
-is asked for on every poll because the line needs the function's newest run on every
-poll — *no errors, last run 3 d ago* — and nothing else can supply it. A poll that asked
-only for what is new would read nothing of a function that did not run, and a kept
-record is never handed back as a reading (little-sister ADR-0113 decision 3).
+The function's reading is what it was — the newest bucket's count and its time — and
+beside them the newest error in the window it was asked: its time, the clean buckets
+since, and what the buckets inside the function's `error_hold` count together, from the
+same answer ([ADR-0012](0012-a-functions-line-holds-an-error-it-saw.md)). Its line is
+written from it (§9). It is asked for on every poll because the line needs the
+function's newest run on every poll — *no errors, last run 3 d ago* — and nothing else
+can supply it. A poll that asked only for what is new would read nothing of a function
+that did not run, and a kept record is never handed back as a reading
+(little-sister ADR-0113 decision 3).
 
 A run's invocations and its duration are two more metrics, each billed for each function
 on each poll that asks it. So they are asked only of the functions that have a run to
@@ -134,23 +140,23 @@ the series the moment it was kept, so it is no reason to ask.
 
 **A function is asked in one of three windows: the last hour, the last day, or the
 fifteen days.** Where its kept runs fill the series it is the smallest of the three that
-reaches the oldest of those runs, and where they do not it is the fifteen days. One call
-has one window, so a region's functions are asked in at most three calls, five hundred
-queries to a call, and a metric is asked once, whichever call holds it. No call then
-asks a function further back than the window its series reaches into. With thirty runs
-kept, a function that fills every bucket answers its last hour and not the 21,600 points
-of fifteen days, one that runs every five minutes answers a day — 288 points, where
-thirty kept runs reach back two and a half hours — and one that runs once a day is asked
-as far back as it is today. **How far a series reaches is how many runs it keeps times
-how seldom its function runs**, so the hour is nothing a busy function is promised: one
-that fills every bucket answers its last day once the series keeps an hour of it, some
-sixty runs, and its fifteen days once the series keeps a day of it, 1,440. A series that
-is not full — at a deployment's first poll, or after `series_keep` was raised — is asked
-the fifteen days until it is. The window decides how much CloudWatch answers, and in
-how many pages — and, by the count this record takes of a metric, never what it bills.
-Either way a call asks the coarser periods where its window holds no point, as it does
-today, and follows CloudWatch's token from page to page. The windows are constants of
-this type, as the overlap is (§4).
+reaches back to the oldest of those runs and to the start of its hold (§9), and where
+they do not it is the fifteen days. One call has one window, so a region's functions are
+asked in at most three calls, five hundred queries to a call, and a metric is asked
+once, whichever call holds it. No call then asks a function further back than its series
+and its hold reach into. With thirty runs kept, a function that fills every bucket
+answers its last hour and not the 21,600 points of fifteen days, one that runs every
+five minutes answers a day — 288 points, where thirty kept runs reach back two and a
+half hours — and one that runs once a day is asked as far back as it is today. **How far
+a series reaches is how many runs it keeps times how seldom its function runs**, so the
+hour is nothing a busy function is promised: one that fills every bucket answers its
+last day once the series keeps an hour of it, some sixty runs, and its fifteen days once
+the series keeps a day of it, 1,440. A series that is not full — at a deployment's first
+poll, or after `series_keep` was raised — is asked the fifteen days until it is. The
+window decides how much CloudWatch answers, and in how many pages — and, by the count
+this record takes of a metric, never what it bills. Either way a call asks the coarser
+periods where its window holds no point, as it does today, and follows CloudWatch's
+token from page to page. The windows are constants of this type, as the overlap is (§4).
 
 **The second call starts at the oldest bucket it is to read.** It holds the functions of
 one window, as the first does, so that a function whose bucket is minutes old is not
@@ -158,6 +164,15 @@ asked with one whose bucket is days old. Asked in the window of the first call, 
 answer every point of that window again, for each of its two metrics, where the poll
 reads a few buckets of it: a function that fills every bucket under a series of 1,440
 runs would answer 43,200 points where it answers its last hour's, some 120.
+
+**A call follows CloudWatch's answer to its last page**, decided on what a deployment's
+regions list: two to five functions each, where an answer takes a second page at a
+region's first poll after a start alone. What a poll takes follows how many functions a
+region lists, and not how busy they are: a hundred functions asked their fifteen days
+are 22 requests and some seven seconds a poll, and five hundred are 108 requests and
+some five minutes, more than the minute a deployment may poll in. Two shapes that ask
+less were weighed for a region of hundreds and not built, and what a page is billed is
+still not measured.
 
 **The first poll after a start reads in full again the buckets its first call
 answered**, the newest and as many as the series keeps, and its second call reaches as
@@ -261,13 +276,16 @@ never reaches its path, as it never reaches a slug. The node says that a run nam
 name, and not under what this type declares for the `batch` aspect.
 
 **The function's line stands on that node and says what it says today** — the last run,
-its errors, the log's status word, the sentence of the rule that graded it — written
-from the function's reading, under the slug it has. **It names the function as its
-subject, though its reading names none.** That is what makes the node stand for the
-function (little-sister ADR-0106 decision 2), so that the node's page and its Series
-view draw the function's runs and its History page lists them; and it is what keeps the
-function's reading out of the series, which would otherwise gain a record at every poll.
-A line's subject is otherwise its reading's (little-sister ADR-0086 decision 2), and
+its errors, the log's status word, the sentence of the rule that graded it — and holds
+an error it saw at ERROR while that error is younger than `error_hold`, an hour by
+default, once clean runs have followed it
+([ADR-0012](0012-a-functions-line-holds-an-error-it-saw.md)); it is written from the
+function's reading, under the slug it has. **It names the function as its subject,
+though its reading names none.** That is what makes the node stand for the function
+(little-sister ADR-0106 decision 2), so that the node's page and its Series view draw
+the function's runs and its History page lists them; and it is what keeps the function's
+reading out of the series, which would otherwise gain a record at every poll. A line's
+subject is otherwise its reading's (little-sister ADR-0086 decision 2), and
 little-sister ADR-0106 decision 2 has this case: a line on a subject's own node names
 the subject where its reading names none. It amends ADR-0005 §7 for a function's line.
 
@@ -275,7 +293,8 @@ the subject where its reading names none. It amends ADR-0005 §7 for a function'
 says for the record alone (little-sister ADR-0111 decision 7): `ERROR` where its errors
 are above zero and `OK` where they are not, in a sentence that says its errors and its
 invocations. A run's verdict is its own at any age; the gate that keeps an old error
-from being graded (`error_max_age`) is the line's.
+from being graded (`error_max_age`) is the line's, and so is the hold, which a run's
+record knows nothing of.
 
 **The node the functions hang on says that its children are complete** where their
 listing was read whole (little-sister ADR-0109), so a function that was deleted, or that
@@ -302,18 +321,18 @@ then the overview: every function's runs, on one time axis.
 - **CloudWatch's bill for this aspect** is one metric a poll for a function that did not
   run, where it ran within the fifteen days, and up to three times that for a busy one
   (§2). Nothing is asked of a function a rule ignores, as before.
-- **The first call's answer is bounded by the window a function's series reaches into**
-  (§3) where it was bounded by fifteen days: with thirty runs kept, a function that
-  fills every bucket answers its last hour where it answered 21,600 points. A deeper
-  series reaches further, and from 1,440 kept runs on such a function answers its
-  fifteen days again. The second call's answer is bounded by the buckets it reads,
-  however deep the series: ordinarily such a function's last hour or so.
+- **The first call's answer is bounded by the window a function's series and its hold
+  reach into** (§3) where it was bounded by fifteen days: with thirty runs kept, a
+  function that fills every bucket answers its last hour where it answered 21,600
+  points. A deeper series reaches further, and from 1,440 kept runs on such a function
+  answers its fifteen days again. The second call's answer is bounded by the buckets it
+  reads, however deep the series: ordinarily such a function's last hour or so.
 - **How many requests an answer takes follows the window, and not what the functions
   hold**, by the count a page ends at (*Context*): one for the functions asked their
   hour, one for every seventy asked their day, and three for every fourteen asked their
-  fifteen days — which is every function whose kept runs do not fill its series or
-  reach back past a day, and every function of a check that keeps none, however seldom
-  it runs.
+  fifteen days — which is every function whose kept runs do not fill its series or reach
+  back past a day, or whose hold does, and every function of a check that keeps none,
+  however seldom it runs.
 - **ADR-0005 §1, §3, §4, §5 and §7 are amended**: a kind, a history, a subject, an
   event, and a line that names what its reading does not.
 - **The aspect is tested with its kept runs handed to it**, and no engine: a type's test
@@ -346,6 +365,14 @@ then the overview: every function's runs, on one time axis.
   seventy.
 - **The second call asked in the window of the first.** Refused in §3: it answers that
   whole window for both metrics, where the poll reads a few buckets of it.
+- **A first call at a period of a day**, fifteen points a function, with the one-minute
+  period asked of the days that hold something. Not built in §3: whether CloudWatch
+  answers a period of a day as that needs was not tried. It can follow for a region of
+  hundreds of functions.
+- **No function asked further back than its newest kept run**, one page for a region of
+  hundreds. Not built in §3: a reading would lean on what an instance holds, which two
+  of the alternatives above were refused for. It can follow for a region of hundreds of
+  functions.
 - **The one function's line saying that its metric was not answered**, and the rest of
   its region read. Refused in §3: a function's reading would need a field for it, which
   is a key once shipped, and its line a verdict for a read that did not happen. A region

@@ -8,8 +8,11 @@ provider** behind
 instance's `var/state/` into a bucket, and the **identity seam** all three open their
 sessions through, which a deployment may also use on its own.
 
-- **Needs little-sister ≥ 0.3.19** (a floor, never a pin), and **boto3**.
+- **Needs little-sister ≥ 0.3.20** (a floor, never a pin), and **boto3**.
 - **Registers one check type: `aws`.**
+- **Declares what boto3 may write into your log** — four noise caps on the SDK's
+  loggers, which little-sister sets and `LOG_LEVEL` lifts by name (see *What the SDK
+  writes into your log*).
 - **Ships the AWS secret provider** — `aws-sm://` and `aws-ssm://` secret
   references, with named reading identities — which a deployment installs by an
   explicit call, never by import (see *Resolving secrets from AWS*).
@@ -80,8 +83,8 @@ tree has
 dependencies = [
     # Pin them: an upgrade is then a deliberate edit rather than drift. The library
     # number is the floor this release was built against.
-    "little-sister==0.3.19",
-    "little-sister-aws==0.1.5",
+    "little-sister==0.3.20",
+    "little-sister-aws==0.1.6",
 ]
 ```
 
@@ -127,6 +130,47 @@ a task role, an SSO session, the `AWS_*` variables — and each account's `role_
 is assumed from it. `profile:` names an `~/.aws/config` profile to assume *from*
 and composes with `role_arn`; static keys are an optional `secrets:` block of
 little-sister secret references, and are mutually exclusive with `profile`.
+
+**Console links.** A name on a line links to its page in the AWS console, and that
+address names no account: the console opens it in whichever account your browser is
+signed in to. Where two of your accounts carry a resource of one name, the link on one
+account's node opens the other account's and looks right. `console_link:` is a template
+that wraps every link of an account in an address that signs in to that account first —
+IAM Identity Center's access portal takes one in this shape:
+
+```yaml
+console_link: "https://example.awsapps.com/start/#/console?account_id={account_id}&destination={url}"
+
+accounts:
+  - name: live
+    role_arn: arn:aws:iam::000000000000:role/application/monitoring-role
+  - name: sandbox                  # no role to read the id from, and its own template
+    account_id: "000000000001"
+    console_link: "https://example.awsapps.com/start/#/console?account_id={account_id}&role_name=Developer&destination={url}"
+```
+
+`{url}` is the console's address of what the line names and `{account_id}` the
+account's id. Each goes in percent-encoded, a template has to name `{url}`, and one that
+names any other token is refused when the check loads. Anything else is text of the
+address: the portal takes `role_name=` with a permission set, and asks which where none
+is named. An account's own `console_link` **replaces** the check's, as its `regions` and
+`profile` do. With no template anywhere, a link is the console's own address.
+
+The id is read out of an account's `role_arn`. An account that names no role says
+`account_id:` — the twelve digits, in quotes, since YAML reads an unquoted number that
+starts with `0` as another number. Refused when the check loads: an `account_id` that is
+not twelve digits, one beside a `role_arn` in another account, a template that names
+`{account_id}` over an account that says neither, and a template that holds whitespace,
+a backtick, a backslash, a parenthesis or an angle bracket — write those
+percent-encoded, as a URL carries them.
+
+**A template that names `{account_id}` puts the account's id into every link of that
+account**, and so wherever a line goes: an event, History, what a client polls, what
+the series keeps of a pipeline's line, a line pasted into a ticket. Without one this
+package writes the id nowhere. Either way an account's card says which holds, under
+*console links* — the check's own card, where it names one account: the template, or
+that a link opens in whichever account the browser is signed in to
+([ADR-0013](docs/adr/0013-a-console-link-opens-the-account-it-names.md)).
 
 **Switching an aspect off.** Each aspect block opens with `enabled:`. Off, the
 aspect emits no node and makes no API call, which is what a role whose policy does
@@ -184,14 +228,15 @@ place to say it.
 
 Each run records what it read, one reading per thing: whether the credentials opened and
 what became of each account, then every alarm, instance, function, job queue and Batch
-job run it read, each pipeline's newest execution, and every region an aspect could not
-read — and, where a series is kept, every run of a function that the poll read in full,
-and the executions it read behind a pipeline's newest, for their histories. Every line
-made from one reading carries that reading's record as its `data` — an alarm's, a
-function's, a pipeline's, a queue's, a name's where one instance carries it — so a line
-template or a client can read what the line read; a job name's line is made from all of
-its runs, and carries none of them. Free text is clipped once, at 300 characters, and
-the line says exactly what the record keeps.
+job run it read, each pipeline's newest execution, every one in flight and, while the
+newest is, the newest behind it that is neither in flight nor superseded, and every
+region an aspect could not read — and, where a series is kept, every run of a function
+that the poll read in full, and the executions it read behind a pipeline's newest, for
+their histories. Every line made from one reading carries that reading's record as its
+`data` — an alarm's, a function's, a pipeline's, a queue's, a name's where one instance
+carries it — so a line template or a client can read what the line read; a job name's
+line is made from all of its runs, and carries none of them. Free text is clipped once,
+at 300 characters, and the line says exactly what the record keeps.
 
 `series_keep:` — little-sister's setting, **0 by default** — keeps four histories on
 this check: each **Batch job**'s runs, one record per run however many polls saw it,
@@ -211,12 +256,16 @@ node is where little-sister shows the history: its page and its Series view draw
 runs at their own times, each marked by how it stood, and its History page lists them
 with a sentence each. A job name has its node for as long as Batch lists a run of it,
 which is about a week after its last one, and for as long as its runs are among the
-newest `max_jobs` its queue is read to. The runs that are read are those that finished,
-run or wait for capacity: a name whose only listed run is being started — past
-`RUNNABLE`, not yet `RUNNING` — is without its node for that poll. Without a node its
-history is not lost: until the name runs again, little-sister lists it on the check's
-History page and draws its plots on the check's own node, as it does for a pipeline that
-was deleted.
+newest `max_jobs` of a status its queue is read to. Batch is asked for every status a
+job can be in, so a name keeps its node while its one job is submitted, held, waiting,
+starting or running. A job that is starting is counted with those running; one that is
+submitted or held by a job it depends on — an array job is held while its children run —
+is counted with those waiting, from its submission, and warns past `max_wait_time` as a
+wait for capacity does. While a job of the name waits or runs, its line is set in
+italics, little-sister's mark for work in flight, and keeps the code its newest finished
+run gave it. Without a node its history is not lost: until the name runs again,
+little-sister lists it on the check's History page and draws its plots on the check's
+own node, as it does for a pipeline that was deleted.
 
 **A Batch run is marked by how it ended, or by how long it has been going.** One that
 succeeded passes and one that failed fails. One that still runs or waits passes until
@@ -225,20 +274,53 @@ mark from the poll that reads it finished. The job name's own line is not any on
 run's: it says how the newest finished run ended, how many run and how many wait, as it
 did, so a retry submitted after a failure does not turn the name green.
 
-**A pipeline's line is its newest execution's**, as it was. Where the check keeps a
-series, a poll reads more than that one: out of the one page of executions the aspect
-already asks for, every execution the pipeline's history lacks or holds unfinished, as
-many as `series_keep` and no more than the hundred a page holds. So a pipeline's
-history is whole from its first poll, and an execution that a newer one overtook while
-it ran is read to its end. The newest is marked as the pipeline's line stands, so a
-success past `max_age_warn` warns and one past `max_age_error` fails. Every execution
-read behind it is marked by what its status means in `state_map`, and the one that was
-the newest is read once more for that, by the poll that first finds a newer one: a
-success is then a success, however stale it had grown. One that a newer execution
-overtook — `Superseded` — is marked as neither failed nor passed: it did not fail, and
-it did not deploy. Nothing more is asked of AWS for any of this. Why it is shaped this
+**A pipeline's line is its newest execution's, unless that one is in flight.** While an
+execution is `InProgress` or `Stopping`, the line keeps what the newest finished
+execution did and says what is in flight beside it, set in italics, little-sister's mark
+for work in flight: `Failed, started 3h ago · InProgress, started 2m ago` stays red
+while a new execution runs, and a pipeline whose last execution succeeded stays green
+while it deploys. A pipeline whose failed stage is retried stays red as well, where the
+check keeps a series (below). An execution a newer one overtook is no verdict, so the
+line looks past it. What is in flight can make the line worse and never better: its
+status counts as `state_map` says — `InProgress` passes, `Stopping` is an error, and a
+deployment that writes `InProgress: WARN` has a yellow deployment — and an execution in
+flight for longer than `max_run_time` warns, the oldest of them deciding. That is
+**thirty minutes** unless the check says otherwise: `max_run_time_warn`,
+`max_run_time_error` and `max_run_time_reason` set it as `max_age`'s pair is set, a rule
+gives a set of pipelines its own, and `max_run_time: null` is for a pipeline that waits
+at an approval for as long as it takes. Of the `_warn` and `_error` pairs it is the one
+this type sets for you: `InProgress` used to warn from an execution's first second, and
+thirty minutes keeps that warning for an execution that is stuck. Why it is shaped this
 way is
+[ADR-0014](docs/adr/0014-a-pipelines-line-keeps-its-verdict-while-an-execution-is-in-flight.md).
+
+Where the check keeps a series, a poll reads more: out of the one page of executions the
+aspect already asks for, every execution the pipeline's history lacks or holds
+unfinished, as many as `series_keep` and no more than the hundred a page holds. So a
+pipeline's history is whole from its first poll, and an execution that a newer one
+overtook while it ran is read to its end. The one the line is written from is marked as
+the line stands, so a success past `max_age_warn` warns and one past `max_age_error`
+fails. Every other execution is marked by what its status means in `state_map`, one in
+flight warning past `max_run_time`, and the one the line was written from is read once
+more for that, by the poll that finds the line on another: a success is then a success,
+however stale it had grown. One that a newer execution overtook — `Superseded` — is
+marked as neither failed nor passed: it did not fail, and it did not deploy. Nothing
+more is asked of AWS for any of this. Why it is shaped this way is
 [ADR-0009](docs/adr/0009-a-job-name-and-a-pipeline-have-nodes.md).
+
+**A retried stage keeps its pipeline red.** A retry of a failed stage is the failed
+execution running again, under its own id and from the start it had, so while it runs no
+page of executions shows the failure. The history does: an execution it holds `Failed`
+or `Stopped` and that is in flight again is asked about, one page of its action
+executions at every poll while it runs, and the line keeps the status it had ended in —
+`Failed, started 2h ago · InProgress, retried 3m ago` stays red until the execution
+succeeds — with `max_run_time` counted from the retry's own start. That is the one call
+more, and it needs `codepipeline:ListActionExecutions` (*The IAM policy*); where the
+role is refused it, the line warns while the retry runs and says why. Without a series,
+and for a retry CodePipeline began before any poll saw its execution end, a retry is
+read as a first run: while it runs, the line is written from the execution before it.
+Why it is shaped this way is
+[ADR-0014](docs/adr/0014-a-pipelines-line-keeps-its-verdict-while-an-execution-is-in-flight.md) §5.
 
 ### How long a run and an execution took
 
@@ -268,6 +350,16 @@ reading: `name`, `at` — the minute's start — `invocations`, `errors`, and
 failed where it counted an error, at any age: `error_max_age` gates the function's
 line and never a run. A function's node draws its runs at the times they ran, and
 `lambda`'s Series view shows every function's on one time axis.
+
+**The line holds an error it saw.** A function's line says what its newest run did, and
+an error the function saw stays on it for `error_hold` — an hour unless the block or a
+rule says otherwise, and never longer than `error_max_age` where nobody does — once
+clean runs have followed:
+*1 error in the last 1h, 23m ago · 4 clean runs since, the last 2m ago*, at ERROR,
+instead of ERROR for one poll and *no errors* the next. The newest run being the error
+reads as it always did; `error_hold: 0s` is no hold; a hold written longer than
+`error_max_age` is refused. A run's own record keeps its own errors whatever the line
+holds.
 
 `duration_ms` is declared as a measure, in `ms`, so a function's runs are drawn as
 stems to their duration with no key of your own. little-sister's `measures:` block is
@@ -338,7 +430,7 @@ region the account is watched in:
 | `cloudwatch` | `cloudwatch:DescribeAlarms` |
 | `ec2` | `ec2:DescribeInstances` |
 | `lambda` | `lambda:ListFunctions`, `cloudwatch:GetMetricData`, `logs:DescribeLogStreams`, `logs:GetLogEvents` |
-| `codepipeline` | `codepipeline:ListPipelines`, `codepipeline:ListPipelineExecutions` |
+| `codepipeline` | `codepipeline:ListPipelines`, `codepipeline:ListPipelineExecutions`, and where the check keeps a series `codepipeline:ListActionExecutions`, asked only while a failed execution is retried |
 | `batch` | `batch:DescribeJobQueues`, `batch:ListJobs` |
 
 The deployment's own identity needs `sts:AssumeRole` on each role, and
@@ -595,7 +687,11 @@ session = open_session(Identity(
 `open_session` proves the credentials before it returns: assuming the role is that
 proof where there is a role, and one `sts:GetCallerIdentity` is spent where there is
 only a profile — so an expired login is one failure, at the moment the session is
-opened, rather than the same news in the words of whatever was read first.
+opened, rather than the same news in the words of whatever was read first. A session
+opened here is built on the process's one loader of service models, as every session
+of the check's is: the models are parsed once in a process and not once a session,
+which is why a deployment's own code opens its sessions here rather than through
+`boto3.Session` directly.
 
 Renewing an expired login is a **separate call**, because what a login may cost
 belongs to whoever is waiting for it:
@@ -616,6 +712,54 @@ defeat exactly that, which is why this is exported rather than left to be rewrit
 `timeout` is an argument rather than a setting: a check spends its own timeout on an
 engine worker thread, while an application resolving secrets during its import is
 holding a worker that has not finished booting, and wants a much smaller number.
+
+## What the SDK writes into your log
+
+boto3 logs through Python's `logging`, into whatever log your instance keeps. Importing
+this package **declares four noise caps** for it, through `little_sister.noise.cap`
+(little-sister `architecture.md` §11), and sets no level itself:
+
+| Logger | Capped at | What the cap hides |
+|---|---|---|
+| `botocore` | `INFO` | a `DEBUG` line for each step of every call, a session's token and what a call answered among them, a secret's value where one is read |
+| `botocore.credentials` | `WARNING` | where each new session found its credentials, a line a run |
+| `botocore.tokens` | `WARNING` | which cached SSO token each new session loaded, a line a run, and each refresh of one unless the attempt failed |
+| `urllib3` | `INFO` | a `DEBUG` line for each connection opened and each request sent |
+
+The third column is each cap's own sentence, as little-sister prints it. It sets the
+caps once, where your `wsgi.py` imports `little_sister.app`, says so in the log's first
+lines, and lists them on `/system/installed` under *Logging*: the caps that stand, and
+those that do not with the reason. Nothing the SDK says as a warning or as an error is
+taken out.
+
+**To read what a cap hides, name its logger in `LOG_LEVEL`**, in `.env` or in the
+environment, and restart:
+
+```
+LOG_LEVEL=INFO,botocore.credentials=DEBUG
+```
+
+An entry speaks for its name and for every name beneath it, so `botocore=DEBUG` has
+everything the SDK writes back, the token and the answers with it. Name the narrowest
+logger that answers your question.
+
+**A level your own startup file sets stands.** A `setLevel` on one of these loggers, or
+on `botocore` for the two beneath it, written before your `wsgi.py` imports the
+application, is yours: no cap is set there, and the page says so.
+
+**A cap holds from where the application is imported, and not before.** What your
+startup file reads from AWS ahead of that import — the secret provider resolving the
+credential of a login, say — is written at the root's level alone. With a bare
+`LOG_LEVEL=DEBUG` the SDK's `DEBUG` lines of that read are in your log, the value among
+them. An entry of the variable holds from the first line, so this is a `DEBUG` session
+without the SDK:
+
+```
+LOG_LEVEL=DEBUG,botocore=WARNING,urllib3=WARNING
+```
+
+The design record is
+[`docs/adr/0010-the-package-declares-what-its-sdk-writes.md`](docs/adr/0010-the-package-declares-what-its-sdk-writes.md).
 
 ## Develop
 
@@ -639,47 +783,19 @@ git config core.hooksPath hooks
 
 [`hooks/pre-commit`](hooks/pre-commit) runs exactly the five commands under that
 comment and is **byte-identical in every Python project of the family**, so a fix to the gate is a fix everywhere. The tests
-never call AWS: every boto3 client is built behind one seam per service, and the
-suite replaces it.
+never call AWS: every boto3 client the package builds is built behind one seam per
+service, and the suite replaces it. One test file has the SDK itself write its lines,
+in an interpreter of its own: it sends nothing through boto3, and refuses a connection
+to anywhere but its own machine.
 
 ## Documentation
 
 - [`docs/architecture.md`](docs/architecture.md) — what is built: the surfaces above
   and the rules that bind them, with the record named beside each. Written for
   somebody working **in** this package rather than installing it.
-- [`docs/adr/0001-the-aws-check-type.md`](docs/adr/0001-the-aws-check-type.md) — why
-  one type with aspects rather than one type per service, why the tree is account
-  first, and why this package uses boto3 where the rest of the family uses stdlib
-  `urllib`.
-- [`docs/adr/0002-aws-secret-references.md`](docs/adr/0002-aws-secret-references.md) —
-  the secret-reference grammar: the strict stores, JSON Pointer selection, and why
-  a reading identity is a scheme rather than part of the address.
-- [`docs/adr/0003-a-graded-threshold-is-a-pair-and-a-rule-owns-names.md`](docs/adr/0003-a-graded-threshold-is-a-pair-and-a-rule-owns-names.md)
-  — how this type grades: a threshold is a warn/error pair with a sentence, a rule
-  owns a set of names and overrides the block's limits for them, and the package
-  ships no thresholds of its own.
-- [`docs/adr/0004-the-s3-keeper.md`](docs/adr/0004-the-s3-keeper.md) — the keeper: its
-  own configuration aspect, why every write is conditional and a refused one is
-  reported rather than merged away, and why the session is re-opened at call time
-  instead of the frozen identity seam growing a refresh.
-- [`docs/adr/0005-a-run-is-its-readings-and-the-runs-keep-a-history.md`](docs/adr/0005-a-run-is-its-readings-and-the-runs-keep-a-history.md)
-  — how a run measures and then grades: one reading per thing it read, which of them
-  keep a history (a Batch job's runs, a pipeline's executions, a function's runs, the
-  accounts' own), and why a history names an account by its configured name.
-- [`docs/adr/0006-a-functions-runs-are-kept-and-a-function-has-a-node.md`](docs/adr/0006-a-functions-runs-are-kept-and-a-function-has-a-node.md)
-  — a Lambda function's runs: why a run is a one-minute bucket, what a poll asks of
-  CloudWatch and what that costs, and why a function has a node of its own.
-- [`docs/adr/0007-a-level-stands-only-where-the-configuration-names-several.md`](docs/adr/0007-a-level-stands-only-where-the-configuration-names-several.md)
-  — the tree's shape: why a check that names one account has no account level, where
-  a region is a level, and what moves the day a configuration names a second.
-- [`docs/adr/0008-a-run-and-an-execution-say-how-long-they-took.md`](docs/adr/0008-a-run-and-an-execution-say-how-long-they-took.md)
-  — the two numbers a kept Batch run carries and the one a pipeline's execution does:
-  when each stands, why none is counted to a poll's clock, and why they are whole
-  seconds.
-- [`docs/adr/0009-a-job-name-and-a-pipeline-have-nodes.md`](docs/adr/0009-a-job-name-and-a-pipeline-have-nodes.md)
-  — a pipeline's node and a job name's: why a queue is a level in every Batch path,
-  what a job name's line says and what is said of each run, which of a pipeline's
-  executions a poll reads, and why nothing is said of one that was superseded.
+- [`docs/decisions.md`](docs/decisions.md) — why it is built that way: each decision
+  record in [`docs/adr/`](docs/adr/) digested in a few lines, with a link to the record,
+  which keeps the argument and what was rejected.
 
 ## License
 
